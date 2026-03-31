@@ -3,6 +3,8 @@
 Kangaroo is a local-first TextBundle editor for writing, note-taking, attachments, and workspace-based organization.  
 Kangaroo 是一款本地优先的 TextBundle 编辑器，适合写作、笔记、附件管理和基于工作空间的文档组织。
 
+![软件界面](./README.assets/软件界面.png)
+
 It is designed for people who want the portability of Markdown, the safety of plain files, and the convenience of a polished desktop note app.  
 它面向希望同时获得 Markdown 可移植性、纯文件安全性，以及桌面笔记软件使用体验的用户。
 
