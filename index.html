@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <title>Kangaroo</title>
+    <link rel="stylesheet" href="node_modules/@fortawesome/fontawesome-free/css/all.min.css">
     <script>
         try {
             document.documentElement.dataset.platform = require('process').platform || '';
@@ -93,9 +94,9 @@
             --preview-font-size: 17px;
             --shadow-lg: 0 22px 60px rgba(0, 0, 0, 0.34);
             --shadow-md: 0 16px 34px rgba(0, 0, 0, 0.2);
-            --radius-xl: 22px;
-            --radius-lg: 16px;
-            --radius-md: 12px;
+            --radius-xl: 11px;
+            --radius-lg: 8px;
+            --radius-md: 6px;
             --sidebar-width: 18%;
             --editor-width: 36%;
             --preview-width: 46%;
@@ -914,7 +915,7 @@
             position: relative;
             z-index: 4200;
             background: linear-gradient(180deg, color-mix(in srgb, var(--chrome) 94%, white 6%), color-mix(in srgb, var(--chrome) 98%, transparent 2%));
-            border-bottom: 1px solid color-mix(in srgb, var(--chrome-border) 72%, transparent 28%);
+            border-bottom: 1px solid color-mix(in srgb, var(--chrome-border) 56%, transparent 44%);
             box-shadow: 0 1px 0 var(--surface-sheen) inset;
             -webkit-app-region: drag;
         }
@@ -971,7 +972,7 @@
             flex-shrink: 0;
             min-height: 30px;
             padding: 6px 12px 6px 14px;
-            border-radius: 10px 10px 0 0;
+            border-radius: 7px 7px 0 0;
             border: 1px solid transparent;
             border-bottom: none;
             background:
@@ -1009,7 +1010,7 @@
         }
         .editor-tab.active {
             background:
-                linear-gradient(180deg, color-mix(in srgb, var(--panel) 70%, white 30%), color-mix(in srgb, var(--panel-strong) 98%, transparent 2%));
+                linear-gradient(180deg, color-mix(in srgb, var(--panel) 62%, white 38%), color-mix(in srgb, var(--editor-bg-start) 88%, var(--panel-strong) 12%));
             border-color: color-mix(in srgb, white 12%, var(--button-border) 88%);
             color: var(--text);
             box-shadow:
@@ -1021,11 +1022,11 @@
             position: absolute;
             left: 0;
             right: 0;
-            bottom: -1px;
-            height: 9px;
-            background: linear-gradient(180deg, color-mix(in srgb, var(--panel-strong) 98%, transparent 2%), color-mix(in srgb, var(--editor-bg-start) 94%, transparent 6%));
-            border-bottom-left-radius: 10px;
-            border-bottom-right-radius: 10px;
+            bottom: -2px;
+            height: 10px;
+            background: linear-gradient(180deg, color-mix(in srgb, var(--panel-strong) 92%, transparent 8%), color-mix(in srgb, var(--editor-bg-start) 96%, transparent 4%));
+            border-bottom-left-radius: 7px;
+            border-bottom-right-radius: 7px;
             opacity: 0;
             pointer-events: none;
         }
@@ -1034,9 +1035,9 @@
         }
         .editor-tab-curve {
             position: absolute;
-            bottom: -1px;
-            width: 12px;
-            height: 12px;
+            bottom: -2px;
+            width: 10px;
+            height: 10px;
             opacity: 0;
             pointer-events: none;
         }
@@ -1044,14 +1045,14 @@
             opacity: 1;
         }
         .editor-tab-curve-left {
-            left: -12px;
-            border-bottom-right-radius: 12px;
-            box-shadow: 6px 6px 0 0 color-mix(in srgb, var(--editor-bg-start) 96%, transparent 4%);
+            left: -10px;
+            border-bottom-right-radius: 10px;
+            box-shadow: 5px 5px 0 0 color-mix(in srgb, var(--editor-bg-start) 96%, transparent 4%);
         }
         .editor-tab-curve-right {
-            right: -12px;
-            border-bottom-left-radius: 12px;
-            box-shadow: -6px 6px 0 0 color-mix(in srgb, var(--editor-bg-start) 96%, transparent 4%);
+            right: -10px;
+            border-bottom-left-radius: 10px;
+            box-shadow: -5px 5px 0 0 color-mix(in srgb, var(--editor-bg-start) 96%, transparent 4%);
         }
         .editor-tab-label {
             min-width: 0;
@@ -1094,7 +1095,7 @@
             min-height: 0;
             overflow: hidden;
             gap: 8px;
-            padding: 8px 10px 6px;
+            padding: 4px 10px 6px;
             box-sizing: border-box;
         }
         #sidebar {
@@ -1113,6 +1114,10 @@
             display: flex;
             flex-direction: column;
             overflow: hidden;
+        }
+        body.sidebar-collapsed #sidebar,
+        body.sidebar-collapsed #sidebar-resizer {
+            display: none;
         }
         #sidebar-resizer {
             position: relative;
@@ -1160,16 +1165,7 @@
             align-items: center;
             gap: 8px;
         }
-        .sidebar-search-row .toolbar-search {
-            flex: 1;
-            min-width: 0;
-        }
-        .sidebar-search .toolbar-search-input {
-            padding: 6px 11px;
-            font-size: calc(var(--ui-font-size) - 1px);
-            border-radius: 11px;
-        }
-        .toolbar-search-scope {
+        .sidebar-search-action {
             flex: 0 0 auto;
             width: 34px;
             height: 34px;
@@ -1181,18 +1177,31 @@
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            font-size: 15px;
-            font-weight: 700;
-            line-height: 1;
+            position: relative;
+            transition: background 120ms ease, border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
         }
-        .toolbar-search-scope:hover {
+        .sidebar-search-action:hover {
             background: var(--button-hover);
+            transform: translateY(-1px);
         }
-        .toolbar-search-scope.active {
+        .sidebar-search-action.active {
             color: var(--accent-contrast);
             background: linear-gradient(135deg, var(--sidebar-tab-active-start), var(--sidebar-tab-active-end));
             border-color: color-mix(in srgb, var(--accent) 45%, white 10%);
             box-shadow: 0 8px 18px color-mix(in srgb, var(--accent-strong) 20%, transparent 80%);
+        }
+        .sidebar-search-action i {
+            font-size: 14px;
+            line-height: 1;
+        }
+        .sidebar-search-row .toolbar-search {
+            flex: 1;
+            min-width: 0;
+        }
+        .sidebar-search .toolbar-search-input {
+            padding: 6px 11px;
+            font-size: calc(var(--ui-font-size) - 1px);
+            border-radius: 11px;
         }
         .sidebar-search .toolbar-search-results {
             top: calc(100% + 6px);
@@ -1240,10 +1249,18 @@
             flex: 1 1 auto;
             min-width: 0;
             min-height: 0;
-            display: flex;
-            flex-direction: column;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr);
+            grid-template-rows: auto minmax(0, 1fr);
             gap: 8px;
             position: relative;
+        }
+        body[data-toolbar-position="bottom"] #editor-shell {
+            grid-template-rows: minmax(0, 1fr) auto;
+        }
+        body[data-toolbar-position="right"] #editor-shell {
+            grid-template-columns: minmax(0, 1fr) auto;
+            grid-template-rows: minmax(0, 1fr);
         }
         #preview-container {
             display: none !important;
@@ -1254,6 +1271,19 @@
             align-items: center;
             padding: 0 6px;
         }
+        body[data-toolbar-position="bottom"] .editor-toolbar-wrap {
+            grid-row: 2;
+        }
+        body[data-toolbar-position="right"] .editor-toolbar-wrap {
+            grid-column: 2;
+            grid-row: 1;
+            align-items: stretch;
+            justify-content: stretch;
+            padding: 0 0 0 4px;
+            align-self: stretch;
+            min-height: 0;
+            box-sizing: border-box;
+        }
         .editor-toolbar {
             display: inline-flex;
             align-items: center;
@@ -1261,11 +1291,24 @@
             flex-wrap: wrap;
             gap: 6px;
             padding: 6px 10px;
-            border-radius: 14px;
+            border-radius: 8px;
             border: 1px solid var(--button-border);
             background: linear-gradient(180deg, color-mix(in srgb, var(--editor-bg-start) 96%, white 4%), color-mix(in srgb, var(--editor-bg-end) 96%, transparent 4%));
             box-shadow: var(--shadow-md);
             backdrop-filter: blur(18px);
+        }
+        body[data-toolbar-position="right"] .editor-toolbar {
+            width: 38px;
+            height: 100%;
+            max-height: 100%;
+            box-sizing: border-box;
+            flex-direction: column;
+            flex-wrap: nowrap;
+            align-items: stretch;
+            justify-content: flex-start;
+            padding: 4px 2px;
+            gap: 5px;
+            border-radius: 8px;
         }
         .editor-toolbar-group {
             display: inline-flex;
@@ -1280,11 +1323,61 @@
             padding-right: 0;
             margin-right: 0;
         }
+        .editor-toolbar-button.sidebar-toggle-button {
+            width: 34px;
+            min-width: 34px;
+            padding: 0;
+            position: relative;
+        }
+        .sidebar-toggle-button i {
+            font-size: 14px;
+            line-height: 1;
+        }
+        .toolbar-glyph {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            line-height: 1;
+            font-size: 13px;
+        }
+        .toolbar-glyph i {
+            font-size: 14px;
+            line-height: 1;
+        }
+        .toolbar-glyph-list {
+            font-size: 0;
+            letter-spacing: 0;
+        }
+        .toolbar-glyph-task {
+            font-size: 0;
+        }
+        .toolbar-glyph-list i,
+        .toolbar-glyph-task i {
+            font-size: 16px;
+        }
+        .toolbar-glyph-date i {
+            font-size: 15px;
+        }
+        body[data-toolbar-position="right"] .editor-toolbar-group {
+            flex-direction: column;
+            gap: 4px;
+            padding-right: 0;
+            margin-right: 0;
+            padding-bottom: 5px;
+            margin-bottom: 1px;
+            border-right: none;
+            border-bottom: 1px solid color-mix(in srgb, var(--button-border) 70%, transparent 30%);
+        }
+        body[data-toolbar-position="right"] .editor-toolbar-group:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+            margin-bottom: 0;
+        }
         .editor-toolbar-button {
             min-width: 34px;
             height: 28px;
             padding: 0 9px;
-            border-radius: 9px;
+            border-radius: 5px;
             border: 1px solid var(--button-border);
             background: var(--panel-soft);
             color: var(--text-soft);
@@ -1293,6 +1386,21 @@
             font-weight: 700;
             cursor: pointer;
             transition: background 120ms ease, color 120ms ease, border-color 120ms ease, transform 120ms ease;
+        }
+        body[data-toolbar-position="right"] .editor-toolbar-button {
+            width: 100%;
+            min-width: 26px;
+            min-height: 24px;
+            height: 26px;
+            padding: 0;
+            border-radius: 4px;
+        }
+        body[data-toolbar-position="right"] .editor-toolbar-button.sidebar-toggle-button {
+            min-width: 26px;
+            width: 100%;
+        }
+        body[data-toolbar-position="right"] .editor-toolbar-button[data-tool^="heading"] {
+            padding: 0 1px;
         }
         .editor-toolbar-button:hover {
             background: var(--panel-hover);
@@ -1323,7 +1431,7 @@
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
-            border-radius: 12px;
+            border-radius: 6px;
             color: var(--text-soft);
             transition: background 140ms ease, color 140ms ease, transform 140ms ease;
         }
@@ -1544,6 +1652,19 @@
             font-size: calc(var(--ui-font-size) - 3px);
             line-height: 1.45;
             word-break: break-all;
+        }
+        .workspace-busy-indicator {
+            margin: 8px 10px 2px;
+            padding: 8px 10px;
+            border-radius: var(--radius-md);
+            border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--button-border) 72%);
+            background: color-mix(in srgb, var(--accent) 10%, var(--panel-soft) 90%);
+            color: var(--text-soft);
+            font-size: 12px;
+            line-height: 1.35;
+        }
+        body.workspace-busy {
+            cursor: progress;
         }
         .workspace-tree {
             padding: 8px 8px 14px;
@@ -1810,6 +1931,20 @@
             gap: 10px;
             margin-top: 20px;
         }
+        #editor-main {
+            grid-row: 2;
+            min-width: 0;
+            min-height: 0;
+            position: relative;
+            display: flex;
+        }
+        body[data-toolbar-position="bottom"] #editor-main {
+            grid-row: 1;
+        }
+        body[data-toolbar-position="right"] #editor-main {
+            grid-column: 1;
+            grid-row: 1;
+        }
         #editor-container {
             flex: 1 1 auto;
             min-height: 0;
@@ -1823,7 +1958,7 @@
 
         #editor-empty-state {
             position: absolute;
-            inset: 48px 0 0;
+            inset: 0;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -2312,6 +2447,7 @@
             white-space: normal;
             word-break: break-word;
             line-height: var(--editor-line-height, 1.3);
+            caret-color: color-mix(in srgb, var(--accent) 88%, white 12%);
         }
 
         .kangaroo-prosemirror > *:first-child {
@@ -2327,6 +2463,22 @@
         .kangaroo-prosemirror ol,
         .kangaroo-prosemirror pre,
         .kangaroo-prosemirror blockquote {
+            margin: 0 0 var(--editor-paragraph-spacing, 4px);
+        }
+
+        .kangaroo-prosemirror p:has(> br.ProseMirror-trailingBreak:only-child) {
+            min-height: calc(1em * var(--editor-line-height, 1.3));
+        }
+
+        .kangaroo-prosemirror p:has(> [data-resize-container][data-node="image"]) {
+            margin: 0 0 var(--editor-paragraph-spacing, 4px);
+        }
+
+        .kangaroo-prosemirror p:has(> [data-kangaroo-video]) {
+            margin: 0 0 var(--editor-paragraph-spacing, 4px);
+        }
+
+        .kangaroo-prosemirror p:has(> [data-kangaroo-pdf]) {
             margin: 0 0 var(--editor-paragraph-spacing, 4px);
         }
 
@@ -2391,6 +2543,12 @@
             background: color-mix(in srgb, var(--accent) 10%, transparent 90%);
         }
 
+        .kangaroo-prosemirror a.kangaroo-link.is-range-selected {
+            outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent 58%);
+            outline-offset: 2px;
+            background: color-mix(in srgb, var(--accent) 12%, transparent 88%);
+        }
+
         .wysiwyg-link-selection {
             position: absolute;
             display: none;
@@ -2428,84 +2586,413 @@
         .kangaroo-prosemirror a.kangaroo-link-attachment-file,
         .kangaroo-prosemirror a.kangaroo-link-attachment-folder,
         .kangaroo-prosemirror a.kangaroo-link-attachment-missing {
-            display: inline-flex;
-            align-items: center;
-            gap: 7px;
-            padding: 0.18em 0.68em;
-            margin: 0 0.1em;
-            border-radius: 999px;
-            background: color-mix(in srgb, var(--preview-inline-code-bg) 52%, transparent 48%);
-            box-shadow: 0 1px 0 color-mix(in srgb, var(--surface-sheen) 70%, transparent 30%) inset;
-            line-height: 1.45;
+            display: inline;
+            padding: 0;
+            margin: 0;
+            border-radius: 0;
+            background: transparent;
+            box-shadow: none;
+            line-height: inherit;
             vertical-align: baseline;
-            border-bottom: none;
-            max-width: 100%;
+            border-bottom-width: 1px;
+            border-bottom-style: solid;
+            max-width: none;
         }
 
         .kangaroo-prosemirror a.kangaroo-link-attachment-file::before,
         .kangaroo-prosemirror a.kangaroo-link-attachment-folder::before,
-        .kangaroo-prosemirror a.kangaroo-link-attachment-missing::before {
-            content: attr(data-link-icon);
+        .kangaroo-prosemirror a.kangaroo-link-attachment-missing::before,
+        .kangaroo-prosemirror a.kangaroo-link-attachment-file::after,
+        .kangaroo-prosemirror a.kangaroo-link-attachment-folder::after,
+        .kangaroo-prosemirror a.kangaroo-link-attachment-missing::after {
+            content: none;
+            display: none;
+        }
+
+        .kangaroo-prosemirror a.kangaroo-link-attachment-folder {
+            color: color-mix(in srgb, var(--accent-warm) 80%, var(--text) 20%);
+            border-bottom-color: color-mix(in srgb, var(--accent-warm) 34%, transparent 66%);
+        }
+
+        .kangaroo-prosemirror a.kangaroo-link-attachment-file {
+            color: var(--syntax-link);
+            border-bottom-color: color-mix(in srgb, var(--syntax-link) 34%, transparent 66%);
+        }
+
+        .kangaroo-prosemirror a.kangaroo-link-attachment-missing {
+            color: var(--danger);
+            border-bottom-color: color-mix(in srgb, var(--danger) 46%, transparent 54%);
+        }
+
+        .kangaroo-prosemirror .kangaroo-attachment-card {
+            display: inline-flex;
+            align-items: stretch;
+            margin: 0 0.16em;
+            line-height: inherit;
+            vertical-align: baseline;
+            box-shadow: none;
+            user-select: none;
+            -webkit-user-select: none;
+            position: relative;
+            contain: none;
+        }
+
+        .kangaroo-prosemirror .kangaroo-attachment-card,
+        .kangaroo-prosemirror .kangaroo-attachment-card * {
+            user-select: none;
+            -webkit-user-select: none;
+            caret-color: transparent;
+        }
+
+        .kangaroo-prosemirror .kangaroo-attachment-card [data-kangaroo-attachment-wrapper] {
+            display: inline-flex;
+            align-items: stretch;
+            border-radius: 12px;
+            box-sizing: border-box;
+        }
+
+        .kangaroo-prosemirror .kangaroo-attachment-shell {
+            border: 1px solid transparent;
+            background: color-mix(in srgb, var(--panel-soft) 76%, transparent 24%);
+            box-shadow:
+                0 1px 0 color-mix(in srgb, var(--surface-sheen) 62%, transparent 38%) inset,
+                0 1px 2px color-mix(in srgb, black 4%, transparent 96%);
+        }
+
+        .kangaroo-prosemirror .kangaroo-attachment-inner {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 0.32em 0.72em;
+            border-radius: inherit;
+            max-width: 100%;
+            white-space: nowrap;
+            line-height: 1.2;
+        }
+
+        .kangaroo-prosemirror .kangaroo-attachment-card.is-selected [data-kangaroo-attachment-wrapper],
+        .kangaroo-prosemirror .kangaroo-attachment-card.ProseMirror-selectednode [data-kangaroo-attachment-wrapper],
+        .kangaroo-prosemirror .kangaroo-attachment-card.is-range-selected [data-kangaroo-attachment-wrapper] {
+            outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent 45%);
+            outline-offset: 2px;
+            box-shadow:
+                0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent 82%);
+        }
+
+        .kangaroo-prosemirror .kangaroo-attachment-icon {
             font-size: 0.96em;
             line-height: 1;
             flex-shrink: 0;
         }
 
-        .kangaroo-prosemirror a.kangaroo-link-attachment-file::after,
-        .kangaroo-prosemirror a.kangaroo-link-attachment-folder::after,
-        .kangaroo-prosemirror a.kangaroo-link-attachment-missing::after {
-            content: attr(data-link-badge);
+        .kangaroo-prosemirror .kangaroo-attachment-badge {
             display: inline-flex;
             align-items: center;
             justify-content: center;
             padding: 0.08em 0.52em;
             border-radius: 999px;
-            background: color-mix(in srgb, var(--button-bg) 64%, transparent 36%);
-            color: var(--text-muted);
             font-size: 0.72em;
             font-weight: 700;
             letter-spacing: 0.02em;
             flex-shrink: 0;
         }
 
-        .kangaroo-prosemirror a.kangaroo-link-attachment-file:hover,
-        .kangaroo-prosemirror a.kangaroo-link-attachment-folder:hover,
-        .kangaroo-prosemirror a.kangaroo-link-attachment-missing:hover {
-            border-bottom: none;
-            transform: translateY(-1px);
+        .kangaroo-prosemirror .kangaroo-attachment-label {
+            min-width: 0;
+            line-height: 1.2;
         }
 
-        .kangaroo-prosemirror a.kangaroo-link-attachment-folder {
+        .kangaroo-prosemirror .attachment-inline-rename-input {
+            min-width: 120px;
+            width: 100%;
+            padding: 0;
+            border: none;
+            outline: none;
+            background: transparent;
+            color: inherit;
+            font: inherit;
+            line-height: 1.2;
+        }
+
+        .kangaroo-prosemirror .kangaroo-attachment-attachment-folder {
             color: color-mix(in srgb, var(--accent-warm) 80%, var(--text) 20%);
-            border: 1px solid color-mix(in srgb, var(--accent-warm) 28%, transparent 72%);
+        }
+
+        .kangaroo-prosemirror .kangaroo-attachment-attachment-folder .kangaroo-attachment-shell {
+            border-color: color-mix(in srgb, var(--accent-warm) 28%, transparent 72%);
             background: color-mix(in srgb, var(--accent-warm) 10%, var(--preview-inline-code-bg) 90%);
         }
 
-        .kangaroo-prosemirror a.kangaroo-link-attachment-folder::after {
+        .kangaroo-prosemirror .kangaroo-attachment-attachment-folder .kangaroo-attachment-badge {
             background: color-mix(in srgb, var(--accent-warm) 18%, transparent 82%);
             color: color-mix(in srgb, var(--accent-warm) 78%, var(--text) 22%);
         }
 
-        .kangaroo-prosemirror a.kangaroo-link-attachment-file {
+        .kangaroo-prosemirror .kangaroo-attachment-attachment-file {
             color: var(--syntax-link);
-            border: 1px solid color-mix(in srgb, var(--syntax-link) 26%, transparent 74%);
+        }
+
+        .kangaroo-prosemirror .kangaroo-attachment-attachment-file .kangaroo-attachment-shell {
+            border-color: color-mix(in srgb, var(--syntax-link) 26%, transparent 74%);
             background: color-mix(in srgb, var(--syntax-link) 8%, var(--preview-inline-code-bg) 92%);
         }
 
-        .kangaroo-prosemirror a.kangaroo-link-attachment-file::after {
+        .kangaroo-prosemirror .kangaroo-attachment-attachment-file .kangaroo-attachment-badge {
             background: color-mix(in srgb, var(--syntax-link) 14%, transparent 86%);
             color: color-mix(in srgb, var(--syntax-link) 86%, var(--text) 14%);
         }
 
-        .kangaroo-prosemirror a.kangaroo-link-attachment-missing {
+        .kangaroo-prosemirror .kangaroo-attachment-attachment-missing {
             color: var(--danger);
-            border: 1px solid color-mix(in srgb, var(--danger) 34%, transparent 66%);
+        }
+
+        .kangaroo-prosemirror .kangaroo-attachment-attachment-missing .kangaroo-attachment-shell {
+            border-color: color-mix(in srgb, var(--danger) 34%, transparent 66%);
             background: color-mix(in srgb, var(--danger) 10%, var(--preview-inline-code-bg) 90%);
         }
 
-        .kangaroo-prosemirror a.kangaroo-link-attachment-missing::after {
+        .kangaroo-prosemirror .kangaroo-attachment-attachment-missing .kangaroo-attachment-badge {
             background: color-mix(in srgb, var(--danger) 16%, transparent 84%);
             color: var(--danger);
+        }
+
+        .kangaroo-prosemirror .kangaroo-video-card {
+            display: inline-block;
+            width: min(100%, 720px);
+            margin: 0.2em 0 0.45em;
+            user-select: none;
+            -webkit-user-select: none;
+            caret-color: transparent;
+            vertical-align: top;
+        }
+
+        .kangaroo-prosemirror .kangaroo-video-card,
+        .kangaroo-prosemirror .kangaroo-video-card * {
+            box-sizing: border-box;
+        }
+
+        .kangaroo-prosemirror .kangaroo-video-shell {
+            display: block;
+            border: 1px solid color-mix(in srgb, var(--syntax-link) 22%, transparent 78%);
+            background: color-mix(in srgb, var(--panel-soft) 82%, transparent 18%);
+            border-radius: 14px;
+            overflow: hidden;
+            box-shadow:
+                0 1px 0 color-mix(in srgb, var(--surface-sheen) 62%, transparent 38%) inset,
+                0 2px 6px color-mix(in srgb, black 4%, transparent 96%);
+        }
+
+        .kangaroo-prosemirror .kangaroo-video-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 0.54em 0.78em;
+            border-bottom: 1px solid color-mix(in srgb, var(--button-border) 58%, transparent 42%);
+            background: color-mix(in srgb, var(--panel-soft) 90%, transparent 10%);
+            user-select: none;
+            -webkit-user-select: none;
+            cursor: default;
+        }
+
+        .kangaroo-prosemirror .kangaroo-video-icon {
+            flex-shrink: 0;
+            line-height: 1;
+        }
+
+        .kangaroo-prosemirror .kangaroo-video-label {
+            min-width: 0;
+            flex: 1;
+            font-weight: 600;
+            line-height: 1.2;
+        }
+
+        .kangaroo-prosemirror .kangaroo-video-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.1em 0.52em;
+            border-radius: 999px;
+            font-size: 0.72em;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            background: color-mix(in srgb, var(--syntax-link) 14%, transparent 86%);
+            color: color-mix(in srgb, var(--syntax-link) 86%, var(--text) 14%);
+            flex-shrink: 0;
+        }
+
+        .kangaroo-prosemirror .kangaroo-video-player {
+            display: block;
+            padding: 0.7em 0.78em 0.78em;
+            background: color-mix(in srgb, var(--preview-inline-code-bg) 92%, transparent 8%);
+        }
+
+        .kangaroo-prosemirror .kangaroo-video-player video {
+            display: block;
+            width: 100%;
+            max-height: 420px;
+            border-radius: 12px;
+            background: #000;
+            outline: none;
+            overflow: hidden;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-user-drag: none;
+        }
+
+        .kangaroo-prosemirror .kangaroo-video-card.is-selected .kangaroo-video-shell,
+        .kangaroo-prosemirror .kangaroo-video-card.ProseMirror-selectednode .kangaroo-video-shell,
+        .kangaroo-prosemirror .kangaroo-video-card.is-range-selected .kangaroo-video-shell {
+            outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent 45%);
+            outline-offset: 2px;
+            box-shadow:
+                0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent 82%);
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-card {
+            display: inline-block;
+            width: var(--kangaroo-pdf-width, 560px);
+            max-width: 100%;
+            margin: 0.2em 0 0.45em;
+            position: relative;
+            user-select: none;
+            -webkit-user-select: none;
+            caret-color: transparent;
+            vertical-align: top;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-card,
+        .kangaroo-prosemirror .kangaroo-pdf-card * {
+            box-sizing: border-box;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-shell {
+            display: block;
+            border: 1px solid color-mix(in srgb, var(--accent-warm) 22%, transparent 78%);
+            background: color-mix(in srgb, var(--panel-soft) 82%, transparent 18%);
+            border-radius: 14px;
+            overflow: hidden;
+            box-shadow:
+                0 1px 0 color-mix(in srgb, var(--surface-sheen) 62%, transparent 38%) inset,
+                0 2px 6px color-mix(in srgb, black 4%, transparent 96%);
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 0.54em 0.78em;
+            border-bottom: 1px solid color-mix(in srgb, var(--button-border) 58%, transparent 42%);
+            background: color-mix(in srgb, var(--panel-soft) 90%, transparent 10%);
+            user-select: none;
+            -webkit-user-select: none;
+            cursor: default;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-icon {
+            flex-shrink: 0;
+            line-height: 1;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-label {
+            min-width: 0;
+            flex: 1;
+            font-weight: 600;
+            line-height: 1.2;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.1em 0.52em;
+            border-radius: 999px;
+            font-size: 0.72em;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            background: color-mix(in srgb, var(--accent-warm) 16%, transparent 84%);
+            color: color-mix(in srgb, var(--accent-warm) 88%, var(--text) 12%);
+            flex-shrink: 0;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-viewer {
+            display: block;
+            padding: 0.7em 0.78em 0.78em;
+            background: color-mix(in srgb, var(--preview-inline-code-bg) 92%, transparent 8%);
+            position: relative;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-viewer::before {
+            content: attr(data-pdf-fallback);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            aspect-ratio: 1 / 1.4142;
+            border-radius: 12px;
+            border: 1px dashed color-mix(in srgb, var(--button-border) 65%, transparent 35%);
+            background: color-mix(in srgb, white 76%, var(--panel-soft) 24%);
+            color: color-mix(in srgb, var(--text) 72%, var(--muted) 28%);
+            font-size: 0.92em;
+            font-weight: 600;
+            text-align: center;
+            padding: 1.2em;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-viewer[data-pdf-fallback]::before {
+            display: flex;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-viewer img[data-kangaroo-pdf-element] {
+            display: block;
+            width: 100%;
+            aspect-ratio: 1 / 1.4142;
+            height: auto;
+            border-radius: 12px;
+            background: color-mix(in srgb, white 70%, var(--panel-soft) 30%);
+            overflow: hidden;
+            object-fit: cover;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-user-drag: none;
+            pointer-events: none;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-resize-handle {
+            position: absolute;
+            right: -8px;
+            bottom: -8px;
+            width: 22px;
+            height: 22px;
+            border-radius: 999px;
+            background: color-mix(in srgb, var(--accent) 82%, white 18%);
+            box-shadow:
+                0 0 0 2px color-mix(in srgb, var(--surface) 88%, transparent 12%),
+                0 2px 8px color-mix(in srgb, black 14%, transparent 86%);
+            cursor: nwse-resize;
+            z-index: 3;
+            opacity: 0;
+            transform: scale(0.92);
+            pointer-events: none;
+            transition:
+                opacity 140ms ease,
+                transform 140ms ease;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-card.is-selected .kangaroo-pdf-resize-handle,
+        .kangaroo-prosemirror .kangaroo-pdf-card.ProseMirror-selectednode .kangaroo-pdf-resize-handle,
+        .kangaroo-prosemirror .kangaroo-pdf-card.is-range-selected .kangaroo-pdf-resize-handle {
+            opacity: 1;
+            transform: scale(1);
+            pointer-events: auto;
+        }
+
+        .kangaroo-prosemirror .kangaroo-pdf-card.is-selected .kangaroo-pdf-shell,
+        .kangaroo-prosemirror .kangaroo-pdf-card.ProseMirror-selectednode .kangaroo-pdf-shell,
+        .kangaroo-prosemirror .kangaroo-pdf-card.is-range-selected .kangaroo-pdf-shell {
+            outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent 45%);
+            outline-offset: 2px;
+            box-shadow:
+                0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent 82%);
         }
 
         .kangaroo-prosemirror code {
@@ -2542,15 +3029,17 @@
             display: block;
             max-width: 100%;
             height: auto;
-            margin: 1em 0;
-            border-radius: 16px;
+            margin: 0;
+            border-radius: 0;
             box-shadow: 0 14px 30px color-mix(in srgb, var(--preview-image-shadow) 72%, transparent 28%);
         }
 
         .kangaroo-prosemirror [data-resize-container][data-node="image"] {
+            display: inline-block;
             width: fit-content;
             max-width: 100%;
-            margin: 1em 0;
+            margin: 0;
+            vertical-align: baseline;
         }
 
         .kangaroo-prosemirror [data-resize-container][data-node="image"] img {
@@ -2558,9 +3047,16 @@
         }
 
         .kangaroo-prosemirror .ProseMirror-selectednode[data-resize-container][data-node="image"] [data-resize-wrapper] {
-            border-radius: 18px;
+            border-radius: 0;
             outline: 2px solid color-mix(in srgb, var(--accent) 72%, white 28%);
             outline-offset: 4px;
+        }
+
+        .kangaroo-prosemirror [data-resize-container][data-node="image"].is-range-selected [data-resize-wrapper] {
+            border-radius: 0;
+            outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent 58%);
+            outline-offset: 4px;
+            box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent 88%);
         }
 
         .kangaroo-prosemirror [data-resize-container][data-node="image"] [data-resize-handle] {
@@ -2611,11 +3107,51 @@
             margin: 0;
             accent-color: var(--accent-strong);
         }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level] > label {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            align-self: center;
+            padding-top: 0;
+        }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="1"] input[type="checkbox"] {
+            width: 24px;
+            height: 24px;
+        }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="2"] input[type="checkbox"] {
+            width: 22px;
+            height: 22px;
+        }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="3"] input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+        }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="4"] input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+        }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="5"] input[type="checkbox"],
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="6"] input[type="checkbox"] {
+            width: 17px;
+            height: 17px;
+        }
 
         .kangaroo-prosemirror ul[data-type="taskList"] li[data-checked="true"] > div {
             color: var(--text-muted);
             text-decoration: line-through;
         }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level] > div > p {
+            margin: 0;
+            line-height: 1.28;
+            color: var(--text);
+            font-weight: 700;
+        }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="1"] > div > p { font-size: 2em; }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="2"] > div > p { font-size: 1.55em; }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="3"] > div > p { font-size: 1.3em; }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="4"] > div > p { font-size: 1.12em; }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="5"] > div > p { font-size: 1em; letter-spacing: 0.01em; }
+        .kangaroo-prosemirror ul[data-type="taskList"] li[data-heading-level="6"] > div > p { font-size: 0.92em; letter-spacing: 0.03em; text-transform: uppercase; }
 
         .wysiwyg-active-block {
             background: var(--active-line-bg);
@@ -2708,19 +3244,21 @@
                         <input id="toolbar-search-input" class="toolbar-search-input" type="text" placeholder="搜索标题、正文、待办、附件">
                         <div id="toolbar-search-results" class="toolbar-search-results"></div>
                     </div>
-                    <button id="toolbar-search-scope" class="toolbar-search-scope" type="button" title="当前文档搜索" aria-label="切换搜索范围">文</button>
+                    <button id="toolbar-search-scope" class="sidebar-search-action toolbar-search-scope" type="button" title="当前文档搜索" aria-label="切换搜索范围">
+                        <i id="toolbar-search-scope-icon" class="fa-regular fa-file-lines" aria-hidden="true"></i>
+                    </button>
                 </div>
             </div>
         <div class="sidebar-tabs">
-            <button id="sidebar-tab-workspace" class="sidebar-tab" type="button">目录</button>
-            <button id="sidebar-tab-outline" class="sidebar-tab active" type="button">大纲</button>
+            <button id="sidebar-tab-workspace" class="sidebar-tab active" type="button">目录</button>
+            <button id="sidebar-tab-outline" class="sidebar-tab" type="button">大纲</button>
             <button id="sidebar-tab-todo" class="sidebar-tab" type="button">待办</button>
             <button id="sidebar-tab-attachment" class="sidebar-tab" type="button">附件</button>
         </div>
-        <div id="workspace-panel" class="sidebar-panel">
+        <div id="workspace-panel" class="sidebar-panel active">
             <div id="workspace-container"></div>
         </div>
-        <div id="outline-panel" class="sidebar-panel active">
+        <div id="outline-panel" class="sidebar-panel">
             <div id="outline-container"></div>
         </div>
         <div id="todo-panel" class="sidebar-panel">
@@ -2747,9 +3285,20 @@
         </div>
     </div>
     <div id="sidebar-resizer" title="拖拽调整侧边栏宽度"></div>
-    <div id="editor-shell">
+        <div id="editor-shell">
         <div class="editor-toolbar-wrap">
             <div id="editor-toolbar" class="editor-toolbar">
+                <div class="editor-toolbar-group">
+                    <button id="sidebar-toggle-button" class="editor-toolbar-button sidebar-toggle-button" data-tool="toggle-sidebar" type="button" title="隐藏侧边栏" aria-label="切换侧边栏">
+                        <i id="sidebar-toggle-icon" class="fa-solid fa-table-columns" aria-hidden="true"></i>
+                    </button>
+                    <button class="editor-toolbar-button" data-tool="undo" type="button" title="撤回">
+                        <span class="toolbar-glyph" aria-hidden="true"><i class="fa-solid fa-arrow-rotate-left"></i></span>
+                    </button>
+                    <button class="editor-toolbar-button" data-tool="redo" type="button" title="前进">
+                        <span class="toolbar-glyph" aria-hidden="true"><i class="fa-solid fa-arrow-rotate-right"></i></span>
+                    </button>
+                </div>
                 <div class="editor-toolbar-group">
                     <button class="editor-toolbar-button" data-tool="heading" data-level="1" type="button" title="一级标题 (Cmd+1)">H1</button>
                     <button class="editor-toolbar-button" data-tool="heading" data-level="2" type="button" title="二级标题 (Cmd+2)">H2</button>
@@ -2759,28 +3308,30 @@
                     <button class="editor-toolbar-button" data-tool="heading" data-level="6" type="button" title="六级标题 (Cmd+6)">H6</button>
                 </div>
                 <div class="editor-toolbar-group">
-                    <button class="editor-toolbar-button" data-tool="bullet-list" type="button" title="无序列表">• 列表</button>
-                    <button class="editor-toolbar-button" data-tool="ordered-list" type="button" title="有序列表">1. 列表</button>
-                    <button class="editor-toolbar-button" data-tool="task-list" type="button" title="待办事项">待办</button>
+                    <button class="editor-toolbar-button" data-tool="bullet-list" type="button" title="无序列表"><span class="toolbar-glyph toolbar-glyph-list" aria-hidden="true"><i class="fa-solid fa-list"></i></span></button>
+                    <button class="editor-toolbar-button" data-tool="ordered-list" type="button" title="有序列表"><span class="toolbar-glyph toolbar-glyph-list" aria-hidden="true"><i class="fa-solid fa-list-ol"></i></span></button>
+                    <button class="editor-toolbar-button" data-tool="task-list" type="button" title="待办事项"><span class="toolbar-glyph toolbar-glyph-task" aria-hidden="true"><i class="fa-regular fa-square-check"></i></span></button>
                 </div>
                 <div class="editor-toolbar-group">
-                    <button class="editor-toolbar-button" data-tool="insert-date" type="button" title="插入当前日期">日期</button>
+                    <button class="editor-toolbar-button" data-tool="insert-date" type="button" title="插入当前日期"><span class="toolbar-glyph toolbar-glyph-date" aria-hidden="true"><i class="fa-regular fa-calendar-days"></i></span></button>
                 </div>
                 <div class="editor-toolbar-group">
-                    <button class="editor-toolbar-button" data-tool="bold" type="button" title="加粗">B</button>
-                    <button class="editor-toolbar-button" data-tool="underline" type="button" title="下划线">U</button>
-                    <button class="editor-toolbar-button" data-tool="strike" type="button" title="删除线">S</button>
+                    <button class="editor-toolbar-button" data-tool="bold" type="button" title="加粗"><span class="toolbar-glyph" aria-hidden="true"><i class="fa-solid fa-bold"></i></span></button>
+                    <button class="editor-toolbar-button" data-tool="underline" type="button" title="下划线"><span class="toolbar-glyph" aria-hidden="true"><i class="fa-solid fa-underline"></i></span></button>
+                    <button class="editor-toolbar-button" data-tool="strike" type="button" title="删除线"><span class="toolbar-glyph" aria-hidden="true"><i class="fa-solid fa-strikethrough"></i></span></button>
                 </div>
             </div>
         </div>
-        <div id="editor-container"></div>
-        <div id="editor-empty-state">
-            <div class="editor-empty-card">
-                <div class="editor-empty-title">还没有打开文档</div>
-                <div class="editor-empty-hint">点击标签栏右侧的 + 新建文档，或使用 File 菜单打开 / 新建文档后再开始编辑。</div>
+        <div id="editor-main">
+            <div id="editor-container"></div>
+            <div id="editor-empty-state">
+                <div class="editor-empty-card">
+                    <div class="editor-empty-title">还没有打开文档</div>
+                    <div class="editor-empty-hint">点击标签栏右侧的 + 新建文档，或使用 File 菜单打开 / 新建文档后再开始编辑。</div>
+                </div>
             </div>
         </div>
-    </div>
+        </div>
     <div id="preview-container">渲染中...</div>
 </div>
 <div class="bottom-bar">
@@ -2845,6 +3396,14 @@
                     <label for="settings-editor-paragraph-spacing">编辑区段间距</label>
                     <input id="settings-editor-paragraph-spacing" type="number" min="0" max="20" step="1">
                 </div>
+                <div class="settings-field">
+                    <label for="settings-toolbar-position">工具栏位置</label>
+                    <select id="settings-toolbar-position">
+                        <option value="top">顶部</option>
+                        <option value="bottom">底部</option>
+                        <option value="right">右侧</option>
+                    </select>
+                </div>
             </div>
             <div class="settings-hint">保存后会立即生效，并记住你当前的主题、字体和编辑区排版设置。</div>
         </div>
@@ -2858,11 +3417,13 @@
 <div id="attachment-context-menu" class="attachment-context-menu">
     <button id="attachment-menu-open" type="button">打开</button>
     <button id="attachment-menu-reveal" type="button">打开所在目录</button>
+    <button id="attachment-menu-rename" type="button">重命名</button>
 </div>
 <div id="editor-link-context-menu" class="attachment-context-menu">
     <button id="editor-link-menu-open" type="button">打开</button>
     <button id="editor-link-menu-open-with" type="button">选择应用打开</button>
     <button id="editor-link-menu-reveal" type="button">打开所在目录</button>
+    <button id="editor-link-menu-rename" type="button">重命名</button>
     <button id="editor-link-menu-delete" type="button">删除</button>
 </div>
 <div id="preview-image-context-menu" class="preview-image-context-menu">

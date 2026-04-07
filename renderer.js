@@ -6,9 +6,11 @@ const processRef = window.nodeRequire('process');
 const { ipcRenderer, clipboard, webUtils, nativeImage } = window.nodeRequire('electron');
 const https = window.nodeRequire('https');
 const http = window.nodeRequire('http');
+const { DOMSerializer } = window.nodeRequire('@tiptap/pm/model');
 const { createWysiwygEditor } = window.nodeRequire(path.join(__dirname, 'wysiwyg-editor.js'));
 let markdownRenderer = null;
 const IS_MACOS = processRef.platform === 'darwin';
+const KANGAROO_INTERNAL_SLICE_MIME = 'application/x-kangaroo-slice+json';
 
 const previewLineTokenTypes = new Set([
     'paragraph_open',
@@ -188,7 +190,7 @@ let autoSaveTimer = null;
 let editorTabs = [];
 let activeTabId = null;
 let nextEditorTabId = 1;
-let currentSidebarTab = 'outline';
+let currentSidebarTab = 'workspace';
 let expandedAttachmentEntries = new Set();
 let attachmentContextTarget = null;
 let previewImageContextTarget = null;
@@ -210,10 +212,19 @@ let workspaceContextTarget = null;
 let draggedWorkspaceEntry = null;
 let workspaceRenameTargetPath = null;
 let suppressNextWorkspaceRenameBlurCommit = false;
+let workspaceWatchers = [];
+let workspaceRefreshTimer = null;
+let workspaceBusyMessage = '';
+let workspaceRefreshSuspended = 0;
+let workspaceRefreshPending = false;
+let suppressWorkspaceWatcherUntil = 0;
+let attachmentInlineRenameState = null;
+let pendingAttachmentDeleteSnapshot = null;
 
 const AUTO_SAVE_DELAY = 0;
 const RECOVERY_DIR_NAME = '.kangaroo-recovery';
 const LAYOUT_SETTINGS_KEY = 'codex.layout.settings.v1';
+const SIDEBAR_VISIBILITY_SETTINGS_KEY = 'codex.sidebar.visibility.v1';
 const VIEW_MODE_SETTINGS_KEY = 'codex.view.mode.v1';
 const THEME_SETTINGS_KEY = 'codex.theme.settings.v1';
 const TYPOGRAPHY_SETTINGS_KEY = 'codex.typography.settings.v1';
@@ -249,7 +260,8 @@ const DEFAULT_TYPOGRAPHY_SETTINGS = {
     uiFontSize: 14,
     editorFontSize: 16,
     editorLineHeight: 1.3,
-    editorParagraphSpacing: 4
+    editorParagraphSpacing: 4,
+    toolbarPosition: 'top'
 };
 const MONACO_THEME_MAP = {
     'dark-ocean': { name: 'codex-dark-ocean', base: 'vs-dark', background: '#141a26', foreground: '#d9e0ea', lineHighlight: '#1b2331', selection: '#26455f' },
@@ -273,6 +285,7 @@ const editorReadyPromise = new Promise((resolve, reject) => {
 applyTheme(loadThemePreference());
 applyTypographySettings(loadTypographySettings());
 applyLayoutSettings(loadLayoutSettings());
+applySidebarVisibility(loadSidebarVisibilityPreference());
 applyViewMode(loadViewModePreference());
 restoreWorkspaceRootPreference();
 renderWorkspaceTree();
@@ -359,19 +372,125 @@ function isDisposableWelcomeTab(tab) {
     return normalized === DEFAULT_UNTITLED_CONTENT.trim();
 }
 
-function persistActiveTabState() {
+function persistActiveTabState(markdownOverride = null) {
     if (suppressDocumentStateSync || !window.editor) return;
 
     const tab = getActiveTab();
     if (!tab) return;
 
+    const liveMarkdown = typeof markdownOverride === 'string'
+        ? markdownOverride
+        : (typeof window.editor.getValue === 'function'
+            ? window.editor.getValue()
+            : (typeof window.editor.getLiveMarkdownSnapshot === 'function'
+                ? window.editor.getLiveMarkdownSnapshot()
+                : ''));
+
     tab.previousContent = tab.content;
     tab.previousIsDirty = tab.isDirty;
     tab.path = window.currentPath || null;
-    tab.content = window.editor.getValue();
+    tab.content = liveMarkdown;
     tab.isDirty = isDirty;
     tab.searchQuery = currentSearchQuery;
     tab.preservedEntries = Array.from(preservedUnusedAttachmentEntries);
+}
+
+window.__kangarooPersistActiveTabState = persistActiveTabState;
+
+function capturePendingAttachmentDeleteSnapshot(deleteMeta = null) {
+    const activeTab = getActiveTab();
+    if (!activeTab || !window.editor) return;
+
+    const liveMarkdown = typeof window.editor.getLiveMarkdownSnapshot === 'function'
+        ? window.editor.getLiveMarkdownSnapshot()
+        : window.editor.getValue();
+
+    pendingAttachmentDeleteSnapshot = {
+        tabId: activeTab.id,
+        path: window.currentPath || null,
+        content: liveMarkdown,
+        isDirty,
+        preservedEntries: Array.from(preservedUnusedAttachmentEntries),
+        searchQuery: currentSearchQuery,
+        selection: typeof window.editor.getSelectionSnapshot === 'function'
+            ? window.editor.getSelectionSnapshot()
+            : null,
+        deletedAsset: deleteMeta?.info?.node
+            ? {
+                type: deleteMeta.type || '',
+                pos: typeof deleteMeta.info?.pos === 'number' ? deleteMeta.info.pos : null,
+                nodeJSON: typeof deleteMeta.info.node?.toJSON === 'function'
+                    ? deleteMeta.info.node.toJSON()
+                    : null
+            }
+            : null
+    };
+}
+
+function clearPendingAttachmentDeleteSnapshot() {
+    pendingAttachmentDeleteSnapshot = null;
+}
+
+function applyPendingAttachmentDeleteSnapshot() {
+    const activeTab = getActiveTab();
+    const deleteSnapshot = pendingAttachmentDeleteSnapshot;
+    if (!activeTab || !window.editor || !deleteSnapshot || deleteSnapshot.tabId !== activeTab.id) {
+        return false;
+    }
+
+    suppressDocumentStateSync = true;
+    window.currentPath = deleteSnapshot.path || window.currentPath;
+    if (typeof window.editor.setBundlePath === 'function') {
+        window.editor.setBundlePath(window.currentPath || null);
+    }
+    if (typeof window.editor.setValue === 'function') {
+        window.editor.setValue(deleteSnapshot.content, { emitChange: false });
+    }
+    suppressDocumentStateSync = false;
+
+    activeTab.path = deleteSnapshot.path;
+    activeTab.content = deleteSnapshot.content;
+    activeTab.previousContent = deleteSnapshot.content;
+    activeTab.isDirty = Boolean(deleteSnapshot.isDirty);
+    activeTab.previousIsDirty = Boolean(deleteSnapshot.isDirty);
+    activeTab.searchQuery = deleteSnapshot.searchQuery || '';
+    activeTab.preservedEntries = [...(deleteSnapshot.preservedEntries || [])];
+    preservedUnusedAttachmentEntries = new Set(deleteSnapshot.preservedEntries || []);
+    currentSearchQuery = deleteSnapshot.searchQuery || '';
+
+    const searchInput = document.getElementById('toolbar-search-input');
+    if (searchInput) {
+        searchInput.value = currentSearchQuery;
+    }
+
+    updateBundleStatus(activeTab.path || null);
+    renderToolbarSearchResults(currentSearchQuery);
+    updatePreview({ preserveViewport: true, preserveMode: 'anchor' });
+    updateOutline();
+    if (window.editor && typeof window.editor.refreshDisplayState === 'function') {
+        window.editor.refreshDisplayState();
+    }
+    if (window.editor && typeof window.editor.restoreSelectionSnapshot === 'function') {
+        window.editor.restoreSelectionSnapshot(deleteSnapshot.selection, { scrollIntoView: false });
+    }
+    if (window.editor && typeof window.editor.focus === 'function') {
+        window.editor.focus();
+    }
+    setDirty(Boolean(deleteSnapshot.isDirty));
+    renderEditorTabs();
+    clearPendingAttachmentDeleteSnapshot();
+    return true;
+}
+
+function restorePendingAttachmentDeleteSnapshotForCancel() {
+    const activeTab = getActiveTab();
+    const deleteSnapshot = pendingAttachmentDeleteSnapshot;
+    if (!activeTab || !window.editor || !deleteSnapshot || deleteSnapshot.tabId !== activeTab.id) {
+        return false;
+    }
+    clearPendingAutoSave();
+    suppressWorkspaceWatcherUntil = Math.max(suppressWorkspaceWatcherUntil, Date.now() + 1500);
+    return applyPendingAttachmentDeleteSnapshot();
 }
 
 function clearPendingAutoSave() {
@@ -474,6 +593,7 @@ function syncGlobalsFromTab(tab) {
 
 function applyTabToEditor(tab) {
     if (!tab || !window.editor) return;
+    const targetTabId = tab.id;
 
     suppressDocumentStateSync = true;
     syncGlobalsFromTab(tab);
@@ -484,7 +604,30 @@ function applyTabToEditor(tab) {
         window.editor.setBundlePath(tab.path || null);
     }
     window.editor.setValue(tab.content || '');
+    if (typeof window.editor.refreshDisplayState === 'function') {
+        window.editor.refreshDisplayState();
+        if (typeof window.editor.getLiveMarkdownSnapshot === 'function') {
+            const refreshedContent = window.editor.getLiveMarkdownSnapshot();
+            tab.content = refreshedContent;
+            tab.previousContent = refreshedContent;
+        }
+    }
     suppressDocumentStateSync = false;
+
+    window.requestAnimationFrame(() => {
+        if (activeTabId !== targetTabId) return;
+        if (!window.editor || typeof window.editor.refreshDisplayState !== 'function') return;
+
+        const didRepair = window.editor.refreshDisplayState();
+        if (didRepair && typeof window.editor.getLiveMarkdownSnapshot === 'function') {
+            const activeTab = getTabById(targetTabId);
+            if (activeTab) {
+                const refreshedContent = window.editor.getLiveMarkdownSnapshot();
+                activeTab.content = refreshedContent;
+                activeTab.previousContent = refreshedContent;
+            }
+        }
+    });
 
     const searchInput = document.getElementById('toolbar-search-input');
     if (searchInput) {
@@ -657,10 +800,38 @@ function isValidTextBundlePath(folderPath) {
     if (!folderPath) return false;
 
     try {
-        return fs.existsSync(path.join(folderPath, 'text.markdown'));
+        return Boolean(resolveBundleMarkdownFilePath(folderPath));
     } catch {
         return false;
     }
+}
+
+function resolveBundleMarkdownFilePath(folderPath, options = {}) {
+    if (!folderPath) return '';
+
+    const candidates = [];
+    if (options.preferredName) {
+        candidates.push(options.preferredName);
+    }
+    candidates.push('text.markdown', 'text.md');
+
+    for (const fileName of candidates) {
+        const fullPath = path.join(folderPath, fileName);
+        if (fs.existsSync(fullPath)) {
+            return fullPath;
+        }
+    }
+
+    if (options.createIfMissing) {
+        return path.join(folderPath, options.preferredName || 'text.markdown');
+    }
+
+    return '';
+}
+
+function getBundleMarkdownFileName(folderPath, options = {}) {
+    const fullPath = resolveBundleMarkdownFilePath(folderPath, options);
+    return fullPath ? path.basename(fullPath) : (options.preferredName || 'text.markdown');
 }
 
 function loadWorkspaceRootPreference() {
@@ -703,6 +874,157 @@ function restoreWorkspaceRootPreference() {
     return true;
 }
 
+function clearWorkspaceWatchers() {
+    for (const watcher of workspaceWatchers) {
+        try {
+            watcher.close();
+        } catch {
+            // ignore
+        }
+    }
+    workspaceWatchers = [];
+}
+
+function updateWorkspaceBusyIndicator() {
+    const container = document.getElementById('workspace-container');
+    if (!container) return;
+
+    let indicator = container.querySelector('.workspace-busy-indicator');
+    if (!workspaceBusyMessage) {
+        if (indicator) {
+            indicator.remove();
+        }
+        return;
+    }
+
+    if (!indicator) {
+        indicator = document.createElement('div');
+        indicator.className = 'workspace-busy-indicator';
+    }
+
+    indicator.textContent = workspaceBusyMessage;
+    const rootHeader = container.querySelector('.workspace-root');
+    if (rootHeader && rootHeader.parentNode === container) {
+        container.insertBefore(indicator, rootHeader.nextSibling);
+    } else if (!indicator.parentNode) {
+        container.appendChild(indicator);
+    }
+}
+
+function setWorkspaceBusy(message = '') {
+    workspaceBusyMessage = String(message || '').trim();
+    document.body.classList.toggle('workspace-busy', Boolean(workspaceBusyMessage));
+    updateWorkspaceBusyIndicator();
+}
+
+function clearWorkspaceBusy() {
+    setWorkspaceBusy('');
+}
+
+function yieldToUiFrame() {
+    return new Promise((resolve) => {
+        window.requestAnimationFrame(() => {
+            window.setTimeout(resolve, 0);
+        });
+    });
+}
+
+function suspendWorkspaceRefresh() {
+    workspaceRefreshSuspended += 1;
+}
+
+function resumeWorkspaceRefresh(options = {}) {
+    workspaceRefreshSuspended = Math.max(0, workspaceRefreshSuspended - 1);
+    if (workspaceRefreshSuspended > 0) {
+        return;
+    }
+
+    const shouldRefresh = workspaceRefreshPending || options.force;
+    workspaceRefreshPending = false;
+    if (shouldRefresh) {
+        if (options.immediate) {
+            renderWorkspaceTree();
+            registerWorkspaceWatchers();
+        } else {
+            scheduleWorkspaceTreeRefresh();
+        }
+    }
+}
+
+function scheduleWorkspaceTreeRefresh() {
+    if (workspaceRefreshSuspended > 0) {
+        workspaceRefreshPending = true;
+        return;
+    }
+
+    if (workspaceRefreshTimer) {
+        window.clearTimeout(workspaceRefreshTimer);
+    }
+
+    workspaceRefreshTimer = window.setTimeout(() => {
+        workspaceRefreshTimer = null;
+        renderWorkspaceTree();
+        registerWorkspaceWatchers();
+        if (window.currentPath && window.editor && typeof window.editor.refreshDisplayState === 'function') {
+            const didRepairDocument = window.editor.refreshDisplayState();
+            if (didRepairDocument) {
+                suppressWorkspaceWatcherUntil = Date.now() + 1500;
+                void saveFile({ silent: true });
+            }
+        }
+    }, 120);
+}
+
+function registerWorkspaceWatchers() {
+    clearWorkspaceWatchers();
+
+    if (!workspaceRootPath || !fs.existsSync(workspaceRootPath)) {
+        return;
+    }
+
+    const visited = new Set();
+    const rootPath = path.resolve(workspaceRootPath);
+    const supportsRecursiveWatch = process.platform === 'darwin' || process.platform === 'win32';
+
+    if (supportsRecursiveWatch) {
+        try {
+            const watcher = fs.watch(rootPath, { recursive: true }, () => {
+                if (Date.now() < suppressWorkspaceWatcherUntil) return;
+                scheduleWorkspaceTreeRefresh();
+            });
+            workspaceWatchers.push(watcher);
+            return;
+        } catch {
+            // Fallback to manual recursive watchers below.
+        }
+    }
+
+    const watchDirectory = (dirPath) => {
+        const normalizedDir = path.resolve(dirPath);
+        if (visited.has(normalizedDir)) return;
+        visited.add(normalizedDir);
+
+        try {
+            const watcher = fs.watch(normalizedDir, () => {
+                if (Date.now() < suppressWorkspaceWatcherUntil) return;
+                scheduleWorkspaceTreeRefresh();
+            });
+            workspaceWatchers.push(watcher);
+        } catch {
+            return;
+        }
+
+        for (const entry of fs.readdirSync(normalizedDir, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue;
+            const fullPath = path.join(normalizedDir, entry.name);
+            if (isValidTextBundlePath(fullPath)) continue;
+            watchDirectory(fullPath);
+        }
+    };
+
+    watchDirectory(rootPath);
+}
+
 function normalizeTodoPanelSettings(settings = {}) {
     return {
         scope: settings.scope === 'workspace' ? 'workspace' : 'document',
@@ -735,6 +1057,7 @@ function setWorkspaceRoot(folderPath) {
     expandedWorkspaceEntries = workspaceRootPath ? new Set([workspaceRootPath]) : new Set();
     saveWorkspaceRootPreference(workspaceRootPath);
     renderWorkspaceTree();
+    registerWorkspaceWatchers();
 }
 
 function getWorkspaceChildren(folderPath) {
@@ -785,6 +1108,7 @@ function clearWorkspaceDropIndicators() {
 }
 
 function beginWorkspaceInlineRename(targetPath) {
+    suspendWorkspaceRefresh();
     workspaceRenameTargetPath = targetPath ? path.resolve(targetPath) : null;
     renderWorkspaceTree();
 }
@@ -793,6 +1117,7 @@ function cancelWorkspaceInlineRename() {
     if (!workspaceRenameTargetPath) return;
     workspaceRenameTargetPath = null;
     renderWorkspaceTree();
+    resumeWorkspaceRefresh({ immediate: true });
 }
 
 async function commitWorkspaceInlineRename(targetPath, input, options = {}) {
@@ -807,6 +1132,8 @@ async function commitWorkspaceInlineRename(targetPath, input, options = {}) {
             input.focus();
             input.select();
         });
+    } else {
+        resumeWorkspaceRefresh({ immediate: true });
     }
 
     return didRename;
@@ -905,6 +1232,17 @@ async function renameWorkspaceEntry(targetPath, nextDisplayName, options = {}) {
     }
 
     try {
+        if (isBundle) {
+            const markdownPath = resolveBundleMarkdownFilePath(normalizedSource, { createIfMissing: true });
+            if (markdownPath && fs.existsSync(markdownPath)) {
+                const currentContent = fs.readFileSync(markdownPath, 'utf-8');
+                const currentDefaultContent = buildDefaultBundleContent(getDefaultBundleTitleFromPath(normalizedSource));
+                if (String(currentContent || '').trim() === currentDefaultContent.trim()) {
+                    fs.writeFileSync(markdownPath, buildDefaultBundleContent(trimmedName), 'utf-8');
+                }
+            }
+        }
+
         fs.renameSync(normalizedSource, normalizedTarget);
         updateExpandedWorkspaceEntriesAfterMove(normalizedSource, normalizedTarget);
         updateWorkspaceTabPathsAfterMove(normalizedSource, normalizedTarget);
@@ -963,6 +1301,93 @@ async function moveWorkspaceEntry(sourcePath, targetDir) {
     } catch (error) {
         alert(`移动失败: ${error.message}`);
         return false;
+    }
+}
+
+function getExternalBundlePathsFromDataTransfer(dataTransfer) {
+    const bundlePaths = [];
+    if (!dataTransfer) return bundlePaths;
+
+    for (const file of Array.from(dataTransfer.files || [])) {
+        const filePath = getDroppedFilePath(file);
+        if (!filePath) continue;
+
+        const normalizedPath = path.resolve(filePath);
+        if (isValidTextBundlePath(normalizedPath)) {
+            bundlePaths.push(normalizedPath);
+        }
+    }
+
+    return Array.from(new Set(bundlePaths));
+}
+
+function isExternalFileDrag(dataTransfer) {
+    return Boolean(dataTransfer && Array.from(dataTransfer.types || []).includes('Files'));
+}
+
+async function copyPathRecursiveAsync(sourcePath, targetPath) {
+    if (fs.promises?.cp) {
+        await fs.promises.cp(sourcePath, targetPath, { recursive: true });
+        return;
+    }
+
+    const sourceStat = await fs.promises.stat(sourcePath);
+    if (sourceStat.isDirectory()) {
+        await fs.promises.mkdir(targetPath, { recursive: true });
+        const entries = await fs.promises.readdir(sourcePath);
+        for (const entryName of entries) {
+            await copyPathRecursiveAsync(
+                path.join(sourcePath, entryName),
+                path.join(targetPath, entryName)
+            );
+        }
+        return;
+    }
+
+    await fs.promises.copyFile(sourcePath, targetPath);
+}
+
+async function importExternalBundlesIntoWorkspace(bundlePaths, targetDir) {
+    const normalizedTargetDir = path.resolve(targetDir);
+    if (!bundlePaths?.length || !fs.existsSync(normalizedTargetDir)) {
+        return false;
+    }
+
+    let importedCount = 0;
+
+    setWorkspaceBusy('正在导入并整理 TextBundle…');
+    suspendWorkspaceRefresh();
+    await yieldToUiFrame();
+
+    try {
+        for (const sourceBundlePath of bundlePaths) {
+            const normalizedSource = path.resolve(sourceBundlePath);
+            if (!fs.existsSync(normalizedSource)) continue;
+
+            const targetBundlePath = generateUniqueBundlePathInDirectory(
+                normalizedTargetDir,
+                path.basename(normalizedSource, path.extname(normalizedSource))
+            );
+
+            await copyPathRecursiveAsync(normalizedSource, targetBundlePath);
+            await normalizeBundleToKangarooFormatAsync(targetBundlePath);
+            expandedWorkspaceEntries.add(normalizedTargetDir);
+            importedCount += 1;
+            await yieldToUiFrame();
+        }
+
+        if (importedCount > 0) {
+            workspaceRefreshPending = true;
+            resumeWorkspaceRefresh({ immediate: true });
+            return true;
+        }
+
+        return false;
+    } finally {
+        if (workspaceRefreshSuspended > 0) {
+            resumeWorkspaceRefresh({ immediate: true });
+        }
+        clearWorkspaceBusy();
     }
 }
 
@@ -1064,8 +1489,14 @@ async function deleteWorkspaceEntry(target) {
         return false;
     }
 
+    setWorkspaceBusy(isFolder ? '正在删除文件夹…' : '正在删除文档…');
+    suspendWorkspaceRefresh();
+    await yieldToUiFrame();
+
     const canDelete = await closeWorkspaceEntryTabs(normalizedPath);
     if (!canDelete) {
+        resumeWorkspaceRefresh();
+        clearWorkspaceBusy();
         return false;
     }
 
@@ -1075,6 +1506,8 @@ async function deleteWorkspaceEntry(target) {
     });
 
     if (!trashResult || !trashResult.ok) {
+        resumeWorkspaceRefresh();
+        clearWorkspaceBusy();
         alert(`删除失败: ${(trashResult && trashResult.error) || normalizedPath}`);
         return false;
     }
@@ -1084,6 +1517,8 @@ async function deleteWorkspaceEntry(target) {
         if (normalizedPath === currentRoot) {
             setWorkspaceRoot(null);
             setSidebarTab('outline');
+            resumeWorkspaceRefresh();
+            clearWorkspaceBusy();
             return true;
         }
 
@@ -1092,12 +1527,23 @@ async function deleteWorkspaceEntry(target) {
         }
     }
 
-    renderWorkspaceTree();
+    workspaceRefreshPending = true;
+    resumeWorkspaceRefresh({ immediate: true });
+    clearWorkspaceBusy();
     return true;
 }
 
 function getDefaultWorkspaceNewBundlePath(parentDir) {
     return path.join(parentDir, '未命名文档.textbundle');
+}
+
+function getDefaultBundleTitleFromPath(bundlePath) {
+    return path.basename(String(bundlePath || ''), '.textbundle') || '未命名文档';
+}
+
+function buildDefaultBundleContent(title) {
+    const normalizedTitle = String(title || '').trim() || '未命名文档';
+    return `# ${normalizedTitle}`;
 }
 
 function getWorkspaceCreateTarget(entryPath, isDirectory) {
@@ -1147,8 +1593,7 @@ async function createFolderInWorkspace(targetDir = workspaceRootPath) {
         if (workspaceRootPath && normalizedFolderPath.startsWith(path.resolve(workspaceRootPath))) {
             expandedWorkspaceEntries.add(path.resolve(targetDir));
         }
-        workspaceRenameTargetPath = normalizedFolderPath;
-        renderWorkspaceTree();
+        beginWorkspaceInlineRename(normalizedFolderPath);
         return true;
     } catch (error) {
         alert(`创建文件夹失败: ${error.message}`);
@@ -1175,13 +1620,12 @@ async function createBundleInWorkspace(targetDir = workspaceRootPath) {
         await waitForEditorReady();
         ensureBundleStructure(folderPath);
 
-        const initialContent = '# 新建文档\n\n在此开始编写内容...';
+        const initialContent = buildDefaultBundleContent(getDefaultBundleTitleFromPath(folderPath));
         fs.writeFileSync(path.join(folderPath, 'text.markdown'), initialContent, 'utf-8');
         if (workspaceRootPath && path.resolve(folderPath).startsWith(path.resolve(workspaceRootPath))) {
             expandedWorkspaceEntries.add(path.dirname(path.resolve(folderPath)));
         }
-        workspaceRenameTargetPath = path.resolve(folderPath);
-        renderWorkspaceTree();
+        beginWorkspaceInlineRename(path.resolve(folderPath));
         return true;
     } catch (error) {
         alert(`创建失败: ${error.message}`);
@@ -1331,16 +1775,20 @@ function renderWorkspaceNode(entry, container, depth = 0) {
 
     if (entry.isDirectory) {
         row.addEventListener('dragover', (event) => {
-            if (!draggedWorkspaceEntry || draggedWorkspaceEntry.path === normalizedEntryPath) return;
+            const canHandleInternalMove = draggedWorkspaceEntry && draggedWorkspaceEntry.path !== normalizedEntryPath;
+            const canHandleExternalImport = isExternalFileDrag(event.dataTransfer);
+            if (!canHandleInternalMove && !canHandleExternalImport) return;
             event.preventDefault();
+            event.stopPropagation();
             clearWorkspaceDropIndicators();
             row.classList.add('drop-target');
             if (event.dataTransfer) {
-                event.dataTransfer.dropEffect = 'move';
+                event.dataTransfer.dropEffect = canHandleInternalMove ? 'move' : 'copy';
             }
         });
 
         row.addEventListener('dragleave', (event) => {
+            event.stopPropagation();
             if (event.currentTarget.contains(event.relatedTarget)) return;
             row.classList.remove('drop-target');
         });
@@ -1349,8 +1797,12 @@ function renderWorkspaceNode(entry, container, depth = 0) {
             event.preventDefault();
             event.stopPropagation();
             row.classList.remove('drop-target');
-            if (!draggedWorkspaceEntry) return;
-            await moveWorkspaceEntry(draggedWorkspaceEntry.path, normalizedEntryPath);
+            const externalBundlePaths = getExternalBundlePathsFromDataTransfer(event.dataTransfer);
+            if (draggedWorkspaceEntry) {
+                await moveWorkspaceEntry(draggedWorkspaceEntry.path, normalizedEntryPath);
+            } else if (externalBundlePaths.length) {
+                await importExternalBundlesIntoWorkspace(externalBundlePaths, normalizedEntryPath);
+            }
             draggedWorkspaceEntry = null;
             clearWorkspaceDropIndicators();
         });
@@ -1372,7 +1824,8 @@ function renderWorkspaceNode(entry, container, depth = 0) {
 
 function renderWorkspaceTree() {
     const container = document.getElementById('workspace-container');
-    if (!container) return;
+    const panel = document.getElementById('workspace-panel');
+    if (!container || !panel) return;
 
     container.innerHTML = '';
 
@@ -1383,6 +1836,37 @@ function renderWorkspaceTree() {
         container.appendChild(emptyState);
         return;
     }
+
+    const handleWorkspaceRootDrop = async (event, dropTarget) => {
+        const canHandleInternalMove = draggedWorkspaceEntry && workspaceRootPath;
+        const canHandleExternalImport = isExternalFileDrag(event.dataTransfer) && workspaceRootPath;
+        if (!canHandleInternalMove && !canHandleExternalImport) return;
+
+        event.preventDefault();
+        if (dropTarget) {
+            clearWorkspaceDropIndicators();
+            dropTarget.classList.add('drop-target');
+        }
+        if (event.dataTransfer) {
+            event.dataTransfer.dropEffect = draggedWorkspaceEntry ? 'move' : 'copy';
+        }
+    };
+
+    const commitWorkspaceRootDrop = async (event, dropTarget) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (dropTarget) {
+            dropTarget.classList.remove('drop-target');
+        }
+        const externalBundlePaths = getExternalBundlePathsFromDataTransfer(event.dataTransfer);
+        if (draggedWorkspaceEntry && workspaceRootPath) {
+            await moveWorkspaceEntry(draggedWorkspaceEntry.path, workspaceRootPath);
+        } else if (externalBundlePaths.length && workspaceRootPath) {
+            await importExternalBundlesIntoWorkspace(externalBundlePaths, workspaceRootPath);
+        }
+        draggedWorkspaceEntry = null;
+        clearWorkspaceDropIndicators();
+    };
 
     const header = document.createElement('div');
     header.className = 'workspace-root';
@@ -1410,31 +1894,39 @@ function renderWorkspaceTree() {
         });
     });
     header.addEventListener('dragover', (event) => {
-        if (!draggedWorkspaceEntry || !workspaceRootPath) return;
-        event.preventDefault();
-        clearWorkspaceDropIndicators();
-        header.classList.add('drop-target');
-        if (event.dataTransfer) {
-            event.dataTransfer.dropEffect = 'move';
-        }
+        handleWorkspaceRootDrop(event, header);
     });
     header.addEventListener('dragleave', (event) => {
         if (event.currentTarget.contains(event.relatedTarget)) return;
         header.classList.remove('drop-target');
     });
     header.addEventListener('drop', async (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        header.classList.remove('drop-target');
-        if (!draggedWorkspaceEntry || !workspaceRootPath) return;
-        await moveWorkspaceEntry(draggedWorkspaceEntry.path, workspaceRootPath);
-        draggedWorkspaceEntry = null;
-        clearWorkspaceDropIndicators();
+        await commitWorkspaceRootDrop(event, header);
     });
     container.appendChild(header);
 
     const tree = document.createElement('div');
     tree.className = 'workspace-tree';
+    panel.ondragover = (event) => {
+        handleWorkspaceRootDrop(event, tree);
+    };
+    panel.ondragleave = (event) => {
+        if (event.currentTarget.contains(event.relatedTarget)) return;
+        tree.classList.remove('drop-target');
+    };
+    panel.ondrop = async (event) => {
+        await commitWorkspaceRootDrop(event, tree);
+    };
+    tree.addEventListener('dragover', (event) => {
+        handleWorkspaceRootDrop(event, tree);
+    });
+    tree.addEventListener('dragleave', (event) => {
+        if (event.currentTarget.contains(event.relatedTarget)) return;
+        tree.classList.remove('drop-target');
+    });
+    tree.addEventListener('drop', async (event) => {
+        await commitWorkspaceRootDrop(event, tree);
+    });
     container.appendChild(tree);
 
     const children = getWorkspaceChildren(workspaceRootPath);
@@ -1449,6 +1941,8 @@ function renderWorkspaceTree() {
     for (const child of children) {
         renderWorkspaceNode(child, tree);
     }
+
+    updateWorkspaceBusyIndicator();
 }
 
 function clearTabDragIndicators() {
@@ -1500,15 +1994,33 @@ function refreshEditorToolbarState() {
                 isActive = Boolean(state.orderedList);
             } else if (tool === 'task-list') {
                 isActive = Boolean(state.taskList);
+            } else if (tool === 'toggle-sidebar') {
+                isActive = document.body.classList.contains('sidebar-collapsed');
             }
+        } else if (tool === 'toggle-sidebar') {
+            isActive = document.body.classList.contains('sidebar-collapsed');
         }
 
         button.classList.toggle('active', isActive);
-        button.disabled = !hasActiveTab;
+        if (tool === 'toggle-sidebar') {
+            button.disabled = false;
+        } else if (tool === 'undo') {
+            button.disabled = !hasActiveTab || !Boolean(state?.canUndo);
+        } else if (tool === 'redo') {
+            button.disabled = !hasActiveTab || !Boolean(state?.canRedo);
+        } else {
+            button.disabled = !hasActiveTab;
+        }
     }
 }
 
 function runEditorToolbarCommand(tool, options = {}) {
+    if (tool === 'toggle-sidebar') {
+        toggleSidebarVisibility();
+        refreshEditorToolbarState();
+        return true;
+    }
+
     if (!window.editor || !getActiveTab()) return false;
 
     if (tool === 'heading' && typeof window.editor.toggleHeading === 'function') {
@@ -1533,6 +2045,18 @@ function runEditorToolbarCommand(tool, options = {}) {
         toggleSelectedLinesAsTodo();
         refreshEditorToolbarState();
         return true;
+    }
+
+    if (tool === 'undo' && typeof window.editor.undo === 'function') {
+        const didRun = window.editor.undo();
+        refreshEditorToolbarState();
+        return didRun;
+    }
+
+    if (tool === 'redo' && typeof window.editor.redo === 'function') {
+        const didRun = window.editor.redo();
+        refreshEditorToolbarState();
+        return didRun;
     }
 
     if (tool === 'insert-date' && typeof window.editor.insertText === 'function') {
@@ -1575,6 +2099,7 @@ function updateEditorEmptyState() {
     const emptyState = document.getElementById('editor-empty-state');
     const searchInput = document.getElementById('toolbar-search-input');
     const searchScope = document.getElementById('toolbar-search-scope');
+    const searchScopeIcon = document.getElementById('toolbar-search-scope-icon');
     const hasActiveTab = Boolean(getActiveTab());
     const canSearch = hasActiveTab || Boolean(workspaceRootPath);
 
@@ -1598,10 +2123,15 @@ function updateEditorEmptyState() {
         if (!workspaceRootPath && currentSearchScope === 'workspace') {
             currentSearchScope = 'document';
         }
-        searchScope.textContent = currentSearchScope === 'workspace' ? '空' : '文';
         searchScope.title = currentSearchScope === 'workspace' ? '工作空间搜索' : '当前文档搜索';
         searchScope.setAttribute('aria-label', searchScope.title);
         searchScope.classList.toggle('active', currentSearchScope === 'workspace');
+        searchScope.setAttribute('data-scope', currentSearchScope);
+        if (searchScopeIcon) {
+            searchScopeIcon.className = currentSearchScope === 'workspace'
+                ? 'fa-solid fa-folder-open'
+                : 'fa-regular fa-file-lines';
+        }
     }
 }
 
@@ -1667,6 +2197,9 @@ function normalizeTypographySettings(settings = {}) {
     const editorFontSize = clamp(Number(settings.editorFontSize) || DEFAULT_TYPOGRAPHY_SETTINGS.editorFontSize, 12, 24);
     const editorLineHeight = clamp(Number(settings.editorLineHeight) || DEFAULT_TYPOGRAPHY_SETTINGS.editorLineHeight, 1, 2);
     const editorParagraphSpacing = clamp(Number(settings.editorParagraphSpacing) || DEFAULT_TYPOGRAPHY_SETTINGS.editorParagraphSpacing, 0, 20);
+    const toolbarPosition = ['top', 'bottom', 'right'].includes(settings.toolbarPosition)
+        ? settings.toolbarPosition
+        : DEFAULT_TYPOGRAPHY_SETTINGS.toolbarPosition;
 
     return {
         uiFont,
@@ -1674,7 +2207,8 @@ function normalizeTypographySettings(settings = {}) {
         uiFontSize: Math.round(uiFontSize),
         editorFontSize: Math.round(editorFontSize),
         editorLineHeight: Math.round(editorLineHeight * 100) / 100,
-        editorParagraphSpacing: Math.round(editorParagraphSpacing * 10) / 10
+        editorParagraphSpacing: Math.round(editorParagraphSpacing * 10) / 10,
+        toolbarPosition
     };
 }
 
@@ -1697,6 +2231,7 @@ function applyTypographySettings(settings) {
     root.style.setProperty('--editor-font-size', `${normalized.editorFontSize}px`);
     root.style.setProperty('--editor-line-height', String(normalized.editorLineHeight));
     root.style.setProperty('--editor-paragraph-spacing', `${normalized.editorParagraphSpacing}px`);
+    document.body.setAttribute('data-toolbar-position', normalized.toolbarPosition);
 
     fallbackCharWidth = null;
 
@@ -1741,6 +2276,43 @@ function loadLayoutSettings() {
     } catch {
         return { ...DEFAULT_LAYOUT_SETTINGS };
     }
+}
+
+function loadSidebarVisibilityPreference() {
+    return true;
+}
+
+function updateSidebarToggleButton() {
+    const button = document.getElementById('sidebar-toggle-button');
+    const icon = document.getElementById('sidebar-toggle-icon');
+    if (!button) return;
+    const isVisible = !document.body.classList.contains('sidebar-collapsed');
+    button.classList.toggle('active', !isVisible);
+    button.title = isVisible ? '隐藏侧边栏' : '显示侧边栏';
+    button.setAttribute('aria-label', button.title);
+    if (icon) icon.className = 'fa-solid fa-table-columns';
+}
+
+function applySidebarVisibility(visible) {
+    const isVisible = Boolean(visible);
+    document.body.classList.toggle('sidebar-collapsed', !isVisible);
+    updateSidebarToggleButton();
+    return isVisible;
+}
+
+function saveSidebarVisibilityPreference(visible) {
+    const normalized = applySidebarVisibility(visible);
+    try {
+        window.localStorage.setItem(SIDEBAR_VISIBILITY_SETTINGS_KEY, normalized ? 'visible' : 'hidden');
+    } catch {
+        // ignore persistence failures
+    }
+}
+
+function toggleSidebarVisibility() {
+    const nextVisible = document.body.classList.contains('sidebar-collapsed');
+    saveSidebarVisibilityPreference(nextVisible);
+    return nextVisible;
 }
 
 function applyLayoutSettings(settings) {
@@ -1855,6 +2427,7 @@ function openSettingsModal() {
     document.getElementById('settings-editor-font-size').value = typography.editorFontSize;
     document.getElementById('settings-editor-line-height').value = typography.editorLineHeight;
     document.getElementById('settings-editor-paragraph-spacing').value = typography.editorParagraphSpacing;
+    document.getElementById('settings-toolbar-position').value = typography.toolbarPosition;
 
     setSettingsTab(currentSettingsTab);
     modal.classList.add('show');
@@ -1885,7 +2458,8 @@ function handleSaveSettings() {
         uiFontSize: document.getElementById('settings-ui-font-size').value,
         editorFontSize: document.getElementById('settings-editor-font-size').value,
         editorLineHeight: document.getElementById('settings-editor-line-height').value,
-        editorParagraphSpacing: document.getElementById('settings-editor-paragraph-spacing').value
+        editorParagraphSpacing: document.getElementById('settings-editor-paragraph-spacing').value,
+        toolbarPosition: document.getElementById('settings-toolbar-position').value
     });
     closeSettingsModal();
 }
@@ -1900,6 +2474,7 @@ function resetLayoutSettings() {
     document.getElementById('settings-editor-font-size').value = DEFAULT_TYPOGRAPHY_SETTINGS.editorFontSize;
     document.getElementById('settings-editor-line-height').value = DEFAULT_TYPOGRAPHY_SETTINGS.editorLineHeight;
     document.getElementById('settings-editor-paragraph-spacing').value = DEFAULT_TYPOGRAPHY_SETTINGS.editorParagraphSpacing;
+    document.getElementById('settings-toolbar-position').value = DEFAULT_TYPOGRAPHY_SETTINGS.toolbarPosition;
 }
 
 function initializeEditor() {
@@ -1942,13 +2517,35 @@ function bindWysiwygEditorEvents(editorInstance) {
     };
 
     const handleEditorShortcut = (event) => {
+        const isPrimaryModifier = event.metaKey || event.ctrlKey;
+        const key = event.key.toLowerCase();
+
+        if (
+            !event.defaultPrevented
+            && pendingAttachmentDeleteSnapshot
+            && isPrimaryModifier
+            && !event.shiftKey
+            && !event.altKey
+            && key === 'z'
+        ) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            applyPendingAttachmentDeleteSnapshot();
+            return;
+        }
+
         if (event.defaultPrevented) return;
         if (!isEventInsideEditorRoot(event, root)) return;
 
-        const isPrimaryModifier = event.metaKey || event.ctrlKey;
-        if (!isPrimaryModifier) return;
+        if (event.key === 'Backspace' && editorInstance.preventImageBackspaceFromTrailingEmptyLine?.()) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            return;
+        }
 
-        const key = event.key.toLowerCase();
+        if (!isPrimaryModifier) return;
 
         if (!event.shiftKey && !event.altKey && /^[1-6]$/.test(key)) {
             event.preventDefault();
@@ -1971,6 +2568,14 @@ function bindWysiwygEditorEvents(editorInstance) {
         if (key === 'f') {
             event.preventDefault();
             focusToolbarSearch();
+            return;
+        }
+
+        if (key === 'z' && !event.shiftKey && pendingAttachmentDeleteSnapshot) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            applyPendingAttachmentDeleteSnapshot();
         }
     };
 
@@ -1981,9 +2586,60 @@ function bindWysiwygEditorEvents(editorInstance) {
     root.addEventListener('focusin', scheduleToolbarRefresh, true);
     root.addEventListener('click', scheduleToolbarRefresh, true);
 
+    root.addEventListener('mousedown', (event) => {
+        if (!isEventInsideEditorRoot(event, root)) return;
+
+        const targetElement = getEventTargetElement(event.target);
+        const attachmentElement = targetElement?.closest?.('[data-kangaroo-attachment]') || null;
+        if (attachmentElement) {
+            const attachmentInfo = typeof editorInstance.getAttachmentInfoFromElement === 'function'
+                ? editorInstance.getAttachmentInfoFromElement(attachmentElement)
+                : null;
+            if (attachmentInfo) {
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                editorInstance.selectAttachment?.(attachmentInfo);
+                return;
+            }
+        }
+
+        editorInstance.beginPointerInteraction?.(event.clientX, event.clientY);
+
+        if (
+            targetElement?.closest?.('[data-kangaroo-attachment]') ||
+            targetElement?.closest?.('[data-resize-container][data-node="image"]') ||
+            targetElement?.closest?.('a.kangaroo-link')
+        ) {
+            return;
+        }
+
+        editorInstance.clearCustomSelections?.();
+    }, true);
+    window.addEventListener('mousemove', (event) => {
+        editorInstance.trackPointerInteraction?.(event.clientX, event.clientY);
+    }, true);
+    window.addEventListener('mouseup', () => {
+        editorInstance.endPointerInteraction?.();
+    }, true);
+
     root.addEventListener('paste', (event) => {
+        const internalSlicePayload = event.clipboardData?.getData?.(KANGAROO_INTERNAL_SLICE_MIME) || '';
+        const transformedInternalSlice = internalSlicePayload
+            ? transformClipboardSlicePayloadForCurrentBundle(internalSlicePayload)
+            : null;
+        if (transformedInternalSlice && window.editor && typeof window.editor.insertSliceJson === 'function') {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            window.editor.insertSliceJson(transformedInternalSlice);
+            return;
+        }
+
         const clipboardPathEntries = getClipboardPathEntries(event);
         const pastedAbsolutePath = clipboardPathEntries.length ? '' : getPastedAbsolutePath(event);
+        const html = event.clipboardData?.getData('text/html') || '';
+        const transformedBundleHtml = html ? transformPastedHtmlForCurrentBundle(html) : '';
         if (pastedAbsolutePath) {
             event.preventDefault();
             event.stopPropagation();
@@ -1992,9 +2648,16 @@ function bindWysiwygEditorEvents(editorInstance) {
             return;
         }
 
+        if (transformedBundleHtml && window.editor && typeof window.editor.insertHtml === 'function') {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            window.editor.insertHtml(transformedBundleHtml);
+            return;
+        }
+
         const items = Array.from(event.clipboardData?.items || []);
         const hasImage = items.some((item) => item.type.startsWith('image/'));
-        const html = event.clipboardData?.getData('text/html') || '';
         const hasRemoteImage = /<img.*?src=["']https?:/i.test(html);
         const hasClipboardImage = !clipboard.readImage().isEmpty();
         const hasClipboardPaths = clipboardPathEntries.length > 0;
@@ -2009,119 +2672,127 @@ function bindWysiwygEditorEvents(editorInstance) {
         handleClipboardPaste(event);
     }, true);
 
-    const handleLinkContextTrigger = (event) => {
-        if (!isEventInsideEditorRoot(event, root)) return false;
+    root.addEventListener('copy', (event) => {
+        if (!isEventInsideEditorRoot(event, root)) return;
 
-        const isSecondaryClick = event.button === 2 || (event.ctrlKey && event.button === 0);
-        if (!isSecondaryClick) return false;
-
-        const linkInfo = editorInstance.getLinkInfoAtPoint(event.clientX, event.clientY);
-        if (!linkInfo) return false;
+        const slicePayload = buildEditorClipboardSlicePayload(editorInstance);
+        const html = buildEditorClipboardHtml(editorInstance);
+        if ((!html && !slicePayload) || !event.clipboardData) return;
 
         event.preventDefault();
         event.stopPropagation();
-
-        editorInstance.selectLink(linkInfo);
-        hideEditorLinkContextMenu();
-        showEditorLinkContextMenu(event, linkInfo);
-        return true;
-    };
-
-    const handleImageContextTrigger = (event) => {
-        if (!isEventInsideEditorRoot(event, root)) return false;
-
-        const isSecondaryClick = event.button === 2 || (event.ctrlKey && event.button === 0);
-        if (!isSecondaryClick) return false;
-
-        const imageInfo = editorInstance.getImageInfoAtPoint(event.clientX, event.clientY);
-        if (!imageInfo?.imagePath) return false;
-
-        event.preventDefault();
-        event.stopPropagation();
-
-        editorInstance.selectImage(imageInfo);
-        hideEditorLinkContextMenu();
-        showPreviewImageContextMenu(event, imageInfo.imagePath);
-        return true;
-    };
+        if (slicePayload) {
+            event.clipboardData.setData(KANGAROO_INTERNAL_SLICE_MIME, slicePayload);
+        }
+        if (html) {
+            event.clipboardData.setData('text/html', html);
+        }
+        event.clipboardData.setData('text/plain', String(window.getSelection?.() || ''));
+    }, true);
 
     root.addEventListener('mousedown', (event) => {
-        if (handleImageContextTrigger(event)) {
-            return;
-        }
+    }, true);
 
-        if (handleLinkContextTrigger(event)) {
-            return;
-        }
-
-        const targetElement = getEventTargetElement(event.target);
-        if (targetElement?.closest?.('[data-resize-handle]')) {
-            return;
-        }
-
-        const imageInfo = editorInstance.getImageInfoAtPoint(event.clientX, event.clientY);
-        if (imageInfo) {
-            event.preventDefault();
-            event.stopPropagation();
-            hidePreviewImageContextMenu();
-            editorInstance.selectImage(imageInfo);
-            return;
-        }
-
-        const linkInfo = editorInstance.getLinkInfoAtPoint(event.clientX, event.clientY);
-        if (!linkInfo) return;
-
-        const kind = String(linkInfo.displayMeta?.kind || '');
-        const isAttachmentCard = kind === 'attachment-file' || kind === 'attachment-folder' || kind === 'attachment-missing';
-        if (!isAttachmentCard) return;
-
-        event.preventDefault();
-        event.stopPropagation();
-        editorInstance.selectLink(linkInfo);
+    root.addEventListener('click', (event) => {
+        if (!isEventInsideEditorRoot(event, root)) return;
+        if (event.button !== 0) return;
+        if (editorInstance.shouldSuppressClickSelection?.()) return;
     }, true);
 
     root.addEventListener('dblclick', async (event) => {
-        const imageInfo = editorInstance.getImageInfoAtPoint(event.clientX, event.clientY);
-        if (imageInfo?.imagePath) {
-            event.preventDefault();
-            event.stopPropagation();
-            editorInstance.selectImage(imageInfo);
-            await openPreviewImageWithSystem(imageInfo.imagePath);
-            return;
-        }
+        if (event.defaultPrevented) return;
+        if (!isEventInsideEditorRoot(event, root)) return;
 
-        const linkInfo = editorInstance.getLinkInfoAtPoint(event.clientX, event.clientY);
-        if (!linkInfo) return;
+        const targetElement = getEventTargetElement(event.target);
+        const attachmentElement = targetElement?.closest?.('[data-kangaroo-attachment]') || null;
+        if (!attachmentElement) return;
+
+        const attachmentInfo = typeof editorInstance.getAttachmentInfoFromElement === 'function'
+            ? editorInstance.getAttachmentInfoFromElement(attachmentElement)
+            : null;
+        if (!attachmentInfo) return;
 
         event.preventDefault();
         event.stopPropagation();
-
-        editorInstance.selectLink(linkInfo);
-        await openEditorLinkTarget(linkInfo);
+        event.stopImmediatePropagation?.();
+        editorInstance.selectAttachment?.(attachmentInfo);
+        await openEditorLinkTarget(attachmentInfo);
     });
 
     document.addEventListener('contextmenu', (event) => {
+        if (event.defaultPrevented) return;
         if (!isEventInsideEditorRoot(event, root)) return;
 
-        const imageInfo = editorInstance.getImageInfoAtPoint(event.clientX, event.clientY);
-        if (imageInfo?.imagePath) {
-            event.preventDefault();
-            event.stopPropagation();
-            editorInstance.selectImage(imageInfo);
-            hideEditorLinkContextMenu();
-            showPreviewImageContextMenu(event, imageInfo.imagePath);
-            return;
-        }
+        const targetElement = getEventTargetElement(event.target);
+        const attachmentElement = targetElement?.closest?.('[data-kangaroo-attachment]') || null;
+        if (!attachmentElement) return;
 
-        const linkInfo = editorInstance.getLinkInfoAtPoint(event.clientX, event.clientY);
-        if (!linkInfo) return;
+        const attachmentInfo = typeof editorInstance.getAttachmentInfoFromElement === 'function'
+            ? editorInstance.getAttachmentInfoFromElement(attachmentElement)
+            : null;
+        if (!attachmentInfo) return;
+        const attachmentReference = buildAttachmentContextReference(attachmentInfo);
+        if (!attachmentReference) return;
 
         event.preventDefault();
         event.stopPropagation();
-
-        editorInstance.selectLink(linkInfo);
-        showEditorLinkContextMenu(event, linkInfo);
+        event.stopImmediatePropagation?.();
+        editorInstance.selectAttachment?.(attachmentInfo);
+        hideEditorLinkContextMenu();
+        hideAttachmentContextMenu();
+        showAttachmentContextMenu(event, attachmentReference);
     }, true);
+
+    if (typeof editorInstance.setAttachmentInteractionHandlers === 'function') {
+        editorInstance.setAttachmentInteractionHandlers({
+            onOpen: async (linkInfo) => {
+                await openEditorLinkTarget(linkInfo);
+            },
+            onContextMenu: (event, linkInfo) => {
+                const attachmentReference = buildAttachmentContextReference(linkInfo);
+                if (!attachmentReference) return;
+                hideEditorLinkContextMenu();
+                hideAttachmentContextMenu();
+                showAttachmentContextMenu(event, attachmentReference);
+            }
+        });
+    }
+
+    if (typeof editorInstance.setImageInteractionHandlers === 'function') {
+        editorInstance.setImageInteractionHandlers({
+            onSelect: () => {
+                hidePreviewImageContextMenu();
+            },
+            onOpen: async (imageInfo) => {
+                await openPreviewImageWithSystem(imageInfo.imagePath);
+            },
+            onContextMenu: (event, imageInfo) => {
+                hideEditorLinkContextMenu();
+                showPreviewImageContextMenu(event, imageInfo.imagePath);
+            }
+        });
+    }
+
+    if (typeof editorInstance.setLinkInteractionHandlers === 'function') {
+        editorInstance.setLinkInteractionHandlers({
+            onOpen: async (linkInfo) => {
+                await openEditorLinkTarget(linkInfo);
+            },
+            onContextMenu: (event, linkInfo) => {
+                hideEditorLinkContextMenu();
+                showEditorLinkContextMenu(event, linkInfo);
+            }
+        });
+    }
+
+    if (typeof editorInstance.setDeleteInteractionHandlers === 'function') {
+        editorInstance.setDeleteInteractionHandlers({
+            onBeforeDelete: (deleteMeta) => {
+                capturePendingAttachmentDeleteSnapshot(deleteMeta);
+                persistActiveTabState();
+            }
+        });
+    }
 
     scheduleToolbarRefresh();
 }
@@ -3124,6 +3795,20 @@ function safeDecodeUri(value) {
     }
 }
 
+function decodeRelativePathSegments(value) {
+    return String(value || '')
+        .replace(/\\/g, '/')
+        .split('/')
+        .map((segment) => {
+            try {
+                return decodeURIComponent(segment);
+            } catch {
+                return segment;
+            }
+        })
+        .join('/');
+}
+
 function escapeHtmlAttribute(value) {
     return String(value)
         .replace(/&/g, '&amp;')
@@ -3317,6 +4002,14 @@ function isImageFilePath(filePath) {
     return /\.(png|jpe?g|gif|webp|bmp|svg|tiff?|ico|heic)$/i.test(filePath);
 }
 
+function isVideoFilePath(filePath) {
+    return /\.(mp4|mov|m4v|webm|ogv|avi|mkv)$/i.test(filePath);
+}
+
+function isPdfFilePath(filePath) {
+    return /\.pdf$/i.test(filePath);
+}
+
 function getDroppedFilePath(file) {
     if (!file) return '';
 
@@ -3377,6 +4070,7 @@ async function saveFile(options = {}) {
     const markdown = window.editor.getValue();
 
     try {
+        suppressWorkspaceWatcherUntil = Math.max(suppressWorkspaceWatcherUntil, Date.now() + 1500);
         const restoredEntries = restoreRecoveredEntries(markdown);
         cleanUnusedImages(markdown);
         const canContinueSave = await cleanUnusedAttachments(markdown);
@@ -3385,7 +4079,7 @@ async function saveFile(options = {}) {
         }
 
         fs.writeFileSync(
-            path.join(window.currentPath, 'text.markdown'),
+            resolveBundleMarkdownFilePath(window.currentPath, { createIfMissing: true }),
             markdown,
             'utf-8'
         );
@@ -3573,6 +4267,10 @@ function restoreActiveTabFromPreviousSnapshot() {
     const activeTab = getActiveTab();
     if (!activeTab || !window.editor) return false;
 
+    if (applyPendingAttachmentDeleteSnapshot()) {
+        return true;
+    }
+
     const previousContent = typeof activeTab.previousContent === 'string'
         ? activeTab.previousContent
         : activeTab.content;
@@ -3668,10 +4366,87 @@ function toMarkdownRelativeLink(relativePath) {
         .join('/');
 }
 
-function insertAttachmentLink(relativePath) {
-    const label = path.basename(relativePath);
-    const href = toMarkdownRelativeLink(relativePath);
+function fromMarkdownRelativeLink(relativePath) {
+    return String(relativePath || '')
+        .split('/')
+        .map((segment) => safeDecodeUri(segment))
+        .join(path.sep);
+}
 
+function parseMarkdownLinkDestinationForImport(rawDestination) {
+    const trimmed = String(rawDestination || '').trim();
+    if (!trimmed) return null;
+
+    const angleMatch = trimmed.match(/^<([^>]+)>(?:\s+"([^"]*)")?$/);
+    if (angleMatch) {
+        return {
+            href: angleMatch[1].trim(),
+            title: angleMatch[2] ? angleMatch[2].trim() : ''
+        };
+    }
+
+    const titleMatch = trimmed.match(/^(\S+)\s+"([^"]*)"$/);
+    if (titleMatch) {
+        return {
+            href: titleMatch[1].trim(),
+            title: titleMatch[2].trim()
+        };
+    }
+
+    return {
+        href: trimmed,
+        title: ''
+    };
+}
+
+function composeMarkdownLinkDestinationForImport(href, title = '') {
+    const normalizedHref = String(href || '').trim();
+    if (!normalizedHref) return '';
+
+    const hrefPart = /\s/.test(normalizedHref) ? `<${normalizedHref}>` : normalizedHref;
+    const normalizedTitle = String(title || '').trim();
+    return normalizedTitle
+        ? `${hrefPart} "${normalizedTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+        : hrefPart;
+}
+
+function getAttachmentIdentityForAbsolutePath(absolutePath) {
+    const normalizedPath = String(absolutePath || '').trim();
+    if (!normalizedPath || !fs.existsSync(normalizedPath)) {
+        return null;
+    }
+
+    try {
+        const stat = fs.statSync(normalizedPath);
+        if (typeof stat.dev === 'number' && typeof stat.ino === 'number') {
+            return `${stat.dev}:${stat.ino}`;
+        }
+    } catch {
+        return null;
+    }
+
+    return null;
+}
+
+function getAttachmentIdentityForRelativePath(relativePath) {
+    if (!window.currentPath || !relativePath) {
+        return null;
+    }
+
+    const absolutePath = path.resolve(window.currentPath, fromMarkdownRelativeLink(relativePath));
+    return getAttachmentIdentityForAbsolutePath(absolutePath);
+}
+
+function insertAttachmentLink(relativePath) {
+    const href = toMarkdownRelativeLink(relativePath);
+    const identity = getAttachmentIdentityForRelativePath(relativePath);
+
+    if (window.editor && typeof window.editor.insertAttachmentLink === 'function') {
+        window.editor.insertAttachmentLink(href, { insertTrailingParagraph: true, identity });
+        return;
+    }
+
+    const label = path.basename(relativePath);
     if (window.editor && typeof window.editor.insertLink === 'function') {
         window.editor.insertLink(label, href, { insertTrailingParagraph: true });
         return;
@@ -3679,6 +4454,22 @@ function insertAttachmentLink(relativePath) {
 
     const safeLabel = escapeMarkdownLinkLabel(label);
     insertMarkdown(`[${safeLabel}](${href})\n`);
+}
+
+function insertVideoAttachment(relativePath) {
+    insertAttachmentLink(relativePath);
+}
+
+function insertPdfAttachment(relativePath) {
+    const href = toMarkdownRelativeLink(relativePath);
+    const identity = getAttachmentIdentityForRelativePath(relativePath);
+
+    if (window.editor && typeof window.editor.insertPdfAttachment === 'function') {
+        window.editor.insertPdfAttachment(href, { insertTrailingParagraph: true, identity });
+        return;
+    }
+
+    insertAttachmentLink(relativePath);
 }
 
 function handleAttachmentPath(sourcePath, stat = null) {
@@ -3693,7 +4484,16 @@ function handleAttachmentPath(sourcePath, stat = null) {
     const relativeToAttachments = path.relative(attachmentsDir, normalizedSourcePath);
 
     if (relativeToAttachments && !relativeToAttachments.startsWith('..') && !path.isAbsolute(relativeToAttachments)) {
-        insertAttachmentLink(path.join('attachments', relativeToAttachments));
+        const relativePath = path.join('attachments', relativeToAttachments);
+        if (!sourceStat.isDirectory() && isVideoFilePath(normalizedSourcePath)) {
+            insertVideoAttachment(relativePath);
+            return;
+        }
+        if (!sourceStat.isDirectory() && isPdfFilePath(normalizedSourcePath)) {
+            insertPdfAttachment(relativePath);
+            return;
+        }
+        insertAttachmentLink(relativePath);
         return;
     }
 
@@ -3706,7 +4506,17 @@ function handleAttachmentPath(sourcePath, stat = null) {
         fs.copyFileSync(normalizedSourcePath, targetPath);
     }
 
-    insertAttachmentLink(path.join('attachments', entryName));
+    const insertedRelativePath = path.join('attachments', entryName);
+    if (!sourceStat.isDirectory() && isVideoFilePath(normalizedSourcePath)) {
+        insertVideoAttachment(insertedRelativePath);
+        return;
+    }
+    if (!sourceStat.isDirectory() && isPdfFilePath(normalizedSourcePath)) {
+        insertPdfAttachment(insertedRelativePath);
+        return;
+    }
+
+    insertAttachmentLink(insertedRelativePath);
 }
 
 
@@ -3721,8 +4531,13 @@ function saveImage(buffer) {
     const filePath = path.join(assetsDir, filename);
 
     fs.writeFileSync(filePath, buffer);
+    const relativePath = `assets/${filename}`;
+    if (window.editor && typeof window.editor.insertImage === 'function') {
+        window.editor.insertImage(relativePath, { alt: filename });
+        return;
+    }
 
-    insertMarkdown(`![image](assets/${filename})\n`);
+    insertMarkdown(`![image](${relativePath})\n`);
 }
 
 
@@ -3808,6 +4623,11 @@ function insertAbsolutePathLink(absolutePath) {
     if (!normalizedPath) return;
 
     const href = normalizedPath.replace(/>/g, '%3E');
+    if (window.editor && typeof window.editor.insertAbsolutePathLink === 'function') {
+        window.editor.insertAbsolutePathLink(normalizedPath, { insertTrailingParagraph: false });
+        return;
+    }
+
     if (window.editor && typeof window.editor.insertLink === 'function') {
         window.editor.insertLink(normalizedPath, href, { insertTrailingParagraph: false });
         return;
@@ -3815,6 +4635,529 @@ function insertAbsolutePathLink(absolutePath) {
 
     const label = escapeMarkdownLinkLabel(normalizedPath);
     insertMarkdown(`[${label}](<${href}>)`);
+}
+
+function findContainingTextBundlePath(targetPath) {
+    if (!targetPath) return '';
+
+    let currentPath = path.resolve(String(targetPath));
+    try {
+        if (fs.existsSync(currentPath) && !fs.statSync(currentPath).isDirectory()) {
+            currentPath = path.dirname(currentPath);
+        }
+    } catch {
+        currentPath = path.dirname(currentPath);
+    }
+
+    while (currentPath && currentPath !== path.dirname(currentPath)) {
+        if (currentPath.toLowerCase().endsWith('.textbundle') && fs.existsSync(currentPath)) {
+            return currentPath;
+        }
+        currentPath = path.dirname(currentPath);
+    }
+
+    return '';
+}
+
+function resolveClipboardLocalPath(rawValue) {
+    const normalizedValue = String(rawValue || '').trim();
+    if (!normalizedValue) return '';
+
+    const unwrappedValue = normalizedValue.replace(/^<|>$/g, '');
+
+    if (/^file:/i.test(unwrappedValue)) {
+        try {
+            return path.resolve(url.fileURLToPath(unwrappedValue));
+        } catch {
+            return '';
+        }
+    }
+
+    if (path.isAbsolute(unwrappedValue)) {
+        return path.resolve(safeDecodeUri(unwrappedValue));
+    }
+
+    return '';
+}
+
+function importReferencedEntryIntoCurrentBundle(absolutePath) {
+    if (!window.currentPath || !absolutePath) {
+        return null;
+    }
+
+    const normalizedSourcePath = path.resolve(absolutePath);
+    if (!fs.existsSync(normalizedSourcePath)) {
+        return null;
+    }
+
+    const currentBundlePath = path.resolve(window.currentPath);
+    const sourceBundlePath = findContainingTextBundlePath(normalizedSourcePath);
+    if (!sourceBundlePath) {
+        return null;
+    }
+
+    const relativeInsideBundle = path.relative(sourceBundlePath, normalizedSourcePath).replace(/\\/g, '/');
+    if (!relativeInsideBundle || relativeInsideBundle.startsWith('..')) {
+        return null;
+    }
+
+    const topLevelDir = relativeInsideBundle.split('/')[0];
+    const sourceStat = fs.statSync(normalizedSourcePath);
+    const shouldTreatAsImage = (
+        topLevelDir === 'assets'
+        && !sourceStat.isDirectory()
+        && isImageFilePath(normalizedSourcePath)
+    );
+
+    if (path.resolve(sourceBundlePath) === currentBundlePath) {
+        return {
+            relativePath: shouldTreatAsImage
+                ? toMarkdownRelativeLink(relativeInsideBundle)
+                : toMarkdownRelativeLink(relativeInsideBundle),
+            kind: shouldTreatAsImage ? 'image' : 'attachment',
+            absolutePath: normalizedSourcePath
+        };
+    }
+
+    const targetRootDir = shouldTreatAsImage
+        ? path.join(currentBundlePath, 'assets')
+        : path.join(currentBundlePath, 'attachments');
+    ensureDirectory(targetRootDir);
+
+    const entryName = generateUniqueEntryName(targetRootDir, path.basename(normalizedSourcePath));
+    const targetPath = path.join(targetRootDir, entryName);
+
+    if (sourceStat.isDirectory()) {
+        copyPathRecursive(normalizedSourcePath, targetPath, sourceStat);
+    } else {
+        fs.copyFileSync(normalizedSourcePath, targetPath);
+    }
+
+    return {
+        relativePath: toMarkdownRelativeLink(path.join(shouldTreatAsImage ? 'assets' : 'attachments', entryName)),
+        kind: shouldTreatAsImage ? 'image' : 'attachment',
+        absolutePath: targetPath
+    };
+}
+
+function transformPastedHtmlForCurrentBundle(html) {
+    if (!window.currentPath || !html || typeof DOMParser === 'undefined') {
+        return '';
+    }
+
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(String(html), 'text/html');
+    let didChange = false;
+
+    for (const image of Array.from(doc.querySelectorAll('img[src]'))) {
+        const sourcePath = resolveClipboardLocalPath(
+            image.getAttribute('data-kangaroo-path') || image.getAttribute('src')
+        );
+        if (!sourcePath) continue;
+
+        const imported = importReferencedEntryIntoCurrentBundle(sourcePath);
+        if (!imported || imported.kind !== 'image') continue;
+
+        image.setAttribute('src', imported.relativePath);
+        didChange = true;
+    }
+
+    for (const attachment of Array.from(doc.querySelectorAll('[data-kangaroo-attachment][data-href]'))) {
+        const sourcePath = resolveClipboardLocalPath(
+            attachment.getAttribute('data-kangaroo-path') || attachment.getAttribute('data-href')
+        );
+        if (!sourcePath) continue;
+
+        const imported = importReferencedEntryIntoCurrentBundle(sourcePath);
+        if (!imported || imported.kind !== 'attachment') continue;
+
+        const existingLabel = String(attachment.getAttribute('data-label') || attachment.textContent || '').trim();
+        const nextLabel = existingLabel || safeDecodeUri(path.basename(imported.relativePath));
+        attachment.setAttribute('data-href', imported.relativePath);
+        attachment.setAttribute('data-label', nextLabel);
+        attachment.setAttribute('data-kangaroo-path', resolvePreviewLinkTarget(imported.relativePath)?.value || '');
+        attachment.textContent = nextLabel;
+        didChange = true;
+    }
+
+    for (const video of Array.from(doc.querySelectorAll('[data-kangaroo-video][data-href]'))) {
+        const sourcePath = resolveClipboardLocalPath(
+            video.getAttribute('data-kangaroo-path') || video.getAttribute('data-href')
+        );
+        if (!sourcePath) continue;
+
+        const imported = importReferencedEntryIntoCurrentBundle(sourcePath);
+        if (!imported || imported.kind !== 'attachment') continue;
+
+        const existingLabel = String(video.getAttribute('data-label') || '').trim();
+        const nextLabel = existingLabel || safeDecodeUri(path.basename(imported.relativePath));
+        video.setAttribute('data-href', imported.relativePath);
+        video.setAttribute('data-label', nextLabel);
+        video.setAttribute('data-kangaroo-path', resolvePreviewLinkTarget(imported.relativePath)?.value || '');
+        didChange = true;
+    }
+
+    for (const pdf of Array.from(doc.querySelectorAll('[data-kangaroo-pdf][data-href]'))) {
+        const sourcePath = resolveClipboardLocalPath(
+            pdf.getAttribute('data-kangaroo-path') || pdf.getAttribute('data-href')
+        );
+        if (!sourcePath) continue;
+
+        const imported = importReferencedEntryIntoCurrentBundle(sourcePath);
+        if (!imported || imported.kind !== 'attachment') continue;
+
+        const existingLabel = String(pdf.getAttribute('data-label') || '').trim();
+        const nextLabel = existingLabel || safeDecodeUri(path.basename(imported.relativePath));
+        pdf.setAttribute('data-href', imported.relativePath);
+        pdf.setAttribute('data-label', nextLabel);
+        pdf.setAttribute('data-kangaroo-path', resolvePreviewLinkTarget(imported.relativePath)?.value || '');
+        didChange = true;
+    }
+
+    for (const link of Array.from(doc.querySelectorAll('a[href]'))) {
+        const sourcePath = resolveClipboardLocalPath(
+            link.getAttribute('data-kangaroo-path') || link.getAttribute('href')
+        );
+        if (!sourcePath) continue;
+
+        const imported = importReferencedEntryIntoCurrentBundle(sourcePath);
+        if (!imported) continue;
+
+        link.setAttribute('href', imported.relativePath);
+        if (!String(link.textContent || '').trim()) {
+            link.textContent = path.basename(imported.relativePath);
+        }
+        didChange = true;
+    }
+
+    return didChange ? doc.body.innerHTML : '';
+}
+
+function buildEditorClipboardHtml(editorInstance) {
+    const state = editorInstance?.editor?.state;
+    const selection = state?.selection;
+    if (!state || !selection || selection.empty) {
+        return '';
+    }
+
+    const slice = selection.content();
+    const container = document.createElement('div');
+    const serializer = DOMSerializer.fromSchema(state.schema);
+    const fragment = serializer.serializeFragment(slice.content, {
+        document
+    });
+    container.appendChild(fragment);
+
+    let hasBundleResources = false;
+
+    for (const image of Array.from(container.querySelectorAll('img'))) {
+        let absolutePath = String(image.getAttribute('data-kangaroo-path') || '').trim();
+        const src = String(image.getAttribute('src') || '').trim();
+
+        if (!absolutePath && /^file:/i.test(src)) {
+            try {
+                absolutePath = url.fileURLToPath(src);
+            } catch {
+                absolutePath = '';
+            }
+        }
+
+        if (!absolutePath) continue;
+        hasBundleResources = true;
+        image.setAttribute('data-kangaroo-path', absolutePath);
+        image.setAttribute('src', url.pathToFileURL(absolutePath).href);
+    }
+
+    for (const attachment of Array.from(container.querySelectorAll('[data-kangaroo-attachment][data-href]'))) {
+        let absolutePath = String(attachment.getAttribute('data-kangaroo-path') || '').trim();
+        const href = String(attachment.getAttribute('data-href') || '').trim();
+
+        if (!absolutePath && editorInstance && typeof editorInstance.resolveAttachmentAbsolutePath === 'function') {
+            absolutePath = String(editorInstance.resolveAttachmentAbsolutePath(href) || '').trim();
+        }
+
+        if (!absolutePath) continue;
+        hasBundleResources = true;
+        attachment.setAttribute('data-kangaroo-path', absolutePath);
+    }
+
+    for (const pdf of Array.from(container.querySelectorAll('[data-kangaroo-pdf][data-href]'))) {
+        let absolutePath = String(pdf.getAttribute('data-kangaroo-path') || '').trim();
+        const href = String(pdf.getAttribute('data-href') || '').trim();
+
+        if (!absolutePath && editorInstance && typeof editorInstance.resolveAttachmentAbsolutePath === 'function') {
+            absolutePath = String(editorInstance.resolveAttachmentAbsolutePath(href) || '').trim();
+        }
+
+        if (!absolutePath) continue;
+        hasBundleResources = true;
+        pdf.setAttribute('data-kangaroo-path', absolutePath);
+    }
+
+    for (const link of Array.from(container.querySelectorAll('a.kangaroo-link'))) {
+        let absolutePath = String(link.getAttribute('data-kangaroo-path') || '').trim();
+        const href = String(link.getAttribute('href') || '').trim();
+
+        if (!absolutePath && editorInstance && typeof editorInstance.resolveLinkDisplayMeta === 'function') {
+            absolutePath = String(editorInstance.resolveLinkDisplayMeta(href)?.absolutePath || '').trim();
+        }
+
+        if (!absolutePath) continue;
+        hasBundleResources = true;
+        link.setAttribute('data-kangaroo-path', absolutePath);
+        link.setAttribute('href', url.pathToFileURL(absolutePath).href);
+    }
+
+    return hasBundleResources ? container.innerHTML : '';
+}
+
+function buildEditorClipboardSlicePayload(editorInstance) {
+    const state = editorInstance?.editor?.state;
+    const selection = state?.selection;
+    if (!state || !selection || selection.empty) {
+        return '';
+    }
+
+    const slice = selection.content();
+    const payload = {
+        slice: slice.toJSON(),
+        links: {},
+        images: {},
+        attachments: {}
+    };
+
+    const walk = (nodes = []) => {
+        for (const node of nodes) {
+            if (!node || typeof node !== 'object') continue;
+
+            if (node.type === 'image') {
+                const src = String(node.attrs?.src || '').trim();
+                const absolutePath = src && typeof editorInstance.resolveImagePath === 'function'
+                    ? String(editorInstance.resolveImagePath(src) || '').trim()
+                    : '';
+                if (src && absolutePath) {
+                    payload.images[src] = absolutePath;
+                }
+            }
+
+            if (node.type === 'kangarooAttachment') {
+                const href = String(node.attrs?.href || '').trim();
+                const absolutePath = href && typeof editorInstance.resolveAttachmentAbsolutePath === 'function'
+                    ? String(editorInstance.resolveAttachmentAbsolutePath(href) || '').trim()
+                    : '';
+                if (href && absolutePath) {
+                    payload.attachments[href] = {
+                        absolutePath,
+                        label: String(node.attrs?.label || '').trim(),
+                        title: node.attrs?.title || null,
+                        nodeType: 'kangarooAttachment'
+                    };
+                }
+            }
+
+            if (node.type === 'kangarooVideo') {
+                const href = String(node.attrs?.href || '').trim();
+                const absolutePath = href && typeof editorInstance.resolveAttachmentAbsolutePath === 'function'
+                    ? String(editorInstance.resolveAttachmentAbsolutePath(href) || '').trim()
+                    : '';
+                if (href && absolutePath) {
+                    payload.attachments[href] = {
+                        absolutePath,
+                        label: String(node.attrs?.label || '').trim(),
+                        title: node.attrs?.title || null,
+                        nodeType: 'kangarooAttachment'
+                    };
+                }
+            }
+
+            if (node.type === 'kangarooPdf') {
+                const href = String(node.attrs?.href || '').trim();
+                const absolutePath = href && typeof editorInstance.resolveAttachmentAbsolutePath === 'function'
+                    ? String(editorInstance.resolveAttachmentAbsolutePath(href) || '').trim()
+                    : '';
+                if (href && absolutePath) {
+                    payload.attachments[href] = {
+                        absolutePath,
+                        label: String(node.attrs?.label || '').trim(),
+                        nodeType: 'kangarooPdf',
+                        title: node.attrs?.title || null,
+                        width: node.attrs?.width || null
+                    };
+                }
+            }
+
+            for (const mark of Array.isArray(node.marks) ? node.marks : []) {
+                if (mark?.type !== 'link') continue;
+                const href = String(mark.attrs?.href || '').trim();
+                const absolutePath = href && typeof editorInstance.resolveLinkDisplayMeta === 'function'
+                    ? String(editorInstance.resolveLinkDisplayMeta(href)?.absolutePath || '').trim()
+                    : '';
+                if (href && absolutePath) {
+                    payload.links[href] = absolutePath;
+                }
+            }
+
+            if (Array.isArray(node.content)) {
+                walk(node.content);
+            }
+        }
+    };
+
+    walk(payload.slice?.content || []);
+
+    if (!Object.keys(payload.links).length && !Object.keys(payload.images).length && !Object.keys(payload.attachments).length) {
+        return '';
+    }
+
+    return JSON.stringify(payload);
+}
+
+function transformClipboardSlicePayloadForCurrentBundle(payloadText) {
+    if (!window.currentPath || !payloadText) {
+        return null;
+    }
+
+    let payload;
+    try {
+        payload = JSON.parse(payloadText);
+    } catch {
+        return null;
+    }
+
+    if (!payload?.slice?.content) {
+        return null;
+    }
+
+    const nextSlice = JSON.parse(JSON.stringify(payload.slice));
+    let didChange = false;
+
+    const walk = (nodes = []) => {
+        for (const node of nodes) {
+            if (!node || typeof node !== 'object') continue;
+
+            if (node.type === 'image') {
+                const src = String(node.attrs?.src || '').trim();
+                const sourcePath = String(payload.images?.[src] || '').trim();
+                if (sourcePath) {
+                    const imported = importReferencedEntryIntoCurrentBundle(sourcePath);
+                    if (imported?.kind === 'image') {
+                        node.attrs = {
+                            ...node.attrs,
+                            src: imported.relativePath
+                        };
+                        didChange = true;
+                    }
+                }
+            }
+
+            if (node.type === 'kangarooAttachment') {
+                const href = String(node.attrs?.href || '').trim();
+                const attachmentPayload = payload.attachments?.[href];
+                const sourcePath = typeof attachmentPayload === 'string'
+                    ? String(attachmentPayload || '').trim()
+                    : String(attachmentPayload?.absolutePath || '').trim();
+                const originalLabel = typeof attachmentPayload === 'string'
+                    ? ''
+                    : String(attachmentPayload?.label || '').trim();
+                const targetNodeType = typeof attachmentPayload === 'string'
+                    ? 'kangarooAttachment'
+                    : String(attachmentPayload?.nodeType || 'kangarooAttachment').trim() || 'kangarooAttachment';
+                if (sourcePath) {
+                    const imported = importReferencedEntryIntoCurrentBundle(sourcePath);
+                    if (imported?.kind === 'attachment') {
+                        const identity = getAttachmentIdentityForAbsolutePath(imported.absolutePath);
+                        node.type = targetNodeType;
+                        node.attrs = {
+                            ...node.attrs,
+                            href: imported.relativePath,
+                            label: originalLabel || String(node.attrs?.label || '').trim() || safeDecodeUri(path.basename(imported.relativePath)),
+                            title: typeof attachmentPayload === 'string' ? node.attrs?.title || null : attachmentPayload?.title || node.attrs?.title || null,
+                            identity
+                        };
+                        if (targetNodeType === 'kangarooPdf') {
+                            node.attrs.width = typeof attachmentPayload === 'string' ? 560 : attachmentPayload?.width || node.attrs?.width || 560;
+                        }
+                        didChange = true;
+                    }
+                }
+            }
+
+            if (node.type === 'kangarooVideo') {
+                const href = String(node.attrs?.href || '').trim();
+                const attachmentPayload = payload.attachments?.[href];
+                const sourcePath = typeof attachmentPayload === 'string'
+                    ? String(attachmentPayload || '').trim()
+                    : String(attachmentPayload?.absolutePath || '').trim();
+                const originalLabel = typeof attachmentPayload === 'string'
+                    ? ''
+                    : String(attachmentPayload?.label || '').trim();
+                if (sourcePath) {
+                    const imported = importReferencedEntryIntoCurrentBundle(sourcePath);
+                    if (imported?.kind === 'attachment') {
+                        const identity = getAttachmentIdentityForAbsolutePath(imported.absolutePath);
+                        node.type = 'kangarooAttachment';
+                        node.attrs = {
+                            ...node.attrs,
+                            href: imported.relativePath,
+                            label: originalLabel || String(node.attrs?.label || '').trim() || safeDecodeUri(path.basename(imported.relativePath)),
+                            title: typeof attachmentPayload === 'string' ? node.attrs?.title || null : attachmentPayload?.title || node.attrs?.title || null,
+                            identity
+                        };
+                        didChange = true;
+                    }
+                }
+            }
+
+            if (node.type === 'kangarooPdf') {
+                const href = String(node.attrs?.href || '').trim();
+                const attachmentPayload = payload.attachments?.[href];
+                const sourcePath = typeof attachmentPayload === 'string'
+                    ? String(attachmentPayload || '').trim()
+                    : String(attachmentPayload?.absolutePath || '').trim();
+                const originalLabel = typeof attachmentPayload === 'string'
+                    ? ''
+                    : String(attachmentPayload?.label || '').trim();
+                if (sourcePath) {
+                    const imported = importReferencedEntryIntoCurrentBundle(sourcePath);
+                    if (imported?.kind === 'attachment') {
+                        const identity = getAttachmentIdentityForAbsolutePath(imported.absolutePath);
+                        node.attrs = {
+                            ...node.attrs,
+                            href: imported.relativePath,
+                            label: originalLabel || String(node.attrs?.label || '').trim() || safeDecodeUri(path.basename(imported.relativePath)),
+                            title: typeof attachmentPayload === 'string' ? node.attrs?.title || null : attachmentPayload?.title || node.attrs?.title || null,
+                            width: typeof attachmentPayload === 'string' ? node.attrs?.width || 560 : attachmentPayload?.width || node.attrs?.width || 560,
+                            identity
+                        };
+                        didChange = true;
+                    }
+                }
+            }
+
+            for (const mark of Array.isArray(node.marks) ? node.marks : []) {
+                if (mark?.type !== 'link') continue;
+                const href = String(mark.attrs?.href || '').trim();
+                const sourcePath = String(payload.links?.[href] || '').trim();
+                if (!sourcePath) continue;
+
+                const imported = importReferencedEntryIntoCurrentBundle(sourcePath);
+                if (!imported) continue;
+
+                mark.attrs = {
+                    ...mark.attrs,
+                    href: imported.relativePath
+                };
+                didChange = true;
+            }
+
+            if (Array.isArray(node.content)) {
+                walk(node.content);
+            }
+        }
+    };
+
+    walk(nextSlice.content || []);
+    return didChange ? nextSlice : null;
 }
 
 function getClipboardPathEntries(event = null) {
@@ -3867,7 +5210,13 @@ function downloadImage(imageUrl) {
 
         stream.on('finish', () => {
             stream.close();
-            insertMarkdown(`![image](assets/${filename})\n`);
+            const relativePath = `assets/${filename}`;
+            if (window.editor && typeof window.editor.insertImage === 'function') {
+                window.editor.insertImage(relativePath, { alt: filename });
+                return;
+            }
+
+            insertMarkdown(`![image](${relativePath})\n`);
         });
     });
 }
@@ -3912,7 +5261,7 @@ function getUsedImageEntries(markdown) {
 
     let match;
     while ((match = markdownRegex.exec(markdown))) {
-        const decodedPath = safeDecodeUri(match[1] || '');
+        const decodedPath = decodeRelativePathSegments(match[1] || '');
         const normalized = decodedPath.replace(/\\/g, '/').replace(/^\/+/, '');
         const topLevelEntry = normalized.split('/')[0];
 
@@ -3923,7 +5272,7 @@ function getUsedImageEntries(markdown) {
 
     while ((match = htmlRegex.exec(markdown))) {
         const src = match[1] || match[2] || match[3] || '';
-        const decodedPath = normalizePreviewImageSourceRef(src).replace(/^assets\//, '');
+        const decodedPath = decodeRelativePathSegments(normalizePreviewImageSourceRef(src).replace(/^assets\//, ''));
         const normalized = decodedPath.replace(/\\/g, '/').replace(/^\/+/, '');
         const topLevelEntry = normalized.split('/')[0];
 
@@ -4128,7 +5477,12 @@ function saveBundleSnapshotToPath(folderPath, markdown, sourceBundlePath = windo
         );
     }
 
-    fs.writeFileSync(path.join(folderPath, 'text.markdown'), markdown, 'utf-8');
+    const preferredFileName = sourceBundlePath ? getBundleMarkdownFileName(sourceBundlePath) : 'text.markdown';
+    const markdownFilePath = resolveBundleMarkdownFilePath(folderPath, {
+        preferredName: preferredFileName,
+        createIfMissing: true
+    });
+    fs.writeFileSync(markdownFilePath, markdown, 'utf-8');
 }
 
 function getDefaultSaveAsPath() {
@@ -4139,18 +5493,463 @@ function getDefaultSaveAsPath() {
     return '我的文档.textbundle';
 }
 
+function isMarkdownFilePath(filePath) {
+    return /\.(md|markdown|mdown|mkd)$/i.test(String(filePath || ''));
+}
+
+function listMarkdownFilesRecursively(folderPath, results = []) {
+    if (!fs.existsSync(folderPath)) return results;
+
+    for (const entry of fs.readdirSync(folderPath, { withFileTypes: true })) {
+        if (entry.name.startsWith('.')) continue;
+
+        const fullPath = path.join(folderPath, entry.name);
+        if (entry.isDirectory()) {
+            listMarkdownFilesRecursively(fullPath, results);
+            continue;
+        }
+
+        if (entry.isFile() && isMarkdownFilePath(entry.name)) {
+            results.push(fullPath);
+        }
+    }
+
+    return results;
+}
+
+function generateUniqueBundlePathInDirectory(targetDir, baseName, reservedPaths = null) {
+    const sanitizedBaseName = (baseName || '未命名文档').replace(/\.textbundle$/i, '');
+    let candidateName = `${sanitizedBaseName}.textbundle`;
+    let counter = 2;
+    let candidatePath = path.join(targetDir, candidateName);
+
+    while (fs.existsSync(candidatePath) || (reservedPaths && reservedPaths.has(path.resolve(candidatePath)))) {
+        candidateName = `${sanitizedBaseName} ${counter}.textbundle`;
+        candidatePath = path.join(targetDir, candidateName);
+        counter++;
+    }
+
+    return candidatePath;
+}
+
+function isExternalHref(href) {
+    return /^(?:[a-zA-Z][a-zA-Z\d+.-]*:|#|\/\/)/.test(String(href || '').trim());
+}
+
+function stripMarkdownAngleBrackets(href) {
+    const value = String(href || '').trim();
+    if (value.startsWith('<') && value.endsWith('>')) {
+        return value.slice(1, -1).trim();
+    }
+    return value;
+}
+
+function normalizeImportSourceRef(href) {
+    const parsed = parseMarkdownLinkDestinationForImport(href);
+    const rawHref = stripMarkdownAngleBrackets(parsed?.href || href);
+    if (!rawHref || isExternalHref(rawHref)) {
+        return null;
+    }
+
+    const decoded = safeDecodeUri(rawHref);
+    if (!decoded || path.isAbsolute(decoded)) {
+        return null;
+    }
+
+    return decoded.replace(/\\/g, '/');
+}
+
+function ensureImportedEntryCopy(sourcePath, targetRootDir, relativeSubPath, copiedEntries, options = {}) {
+    const normalizedSourcePath = path.resolve(sourcePath);
+    const normalizedRelativeSubPath = relativeSubPath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const { flatten = false } = options;
+
+    if (!copiedEntries.has(normalizedSourcePath)) {
+        const targetRelativePath = flatten
+            ? generateUniqueEntryName(targetRootDir, path.basename(normalizedRelativeSubPath))
+            : normalizedRelativeSubPath;
+        const targetPath = path.join(targetRootDir, targetRelativePath);
+        ensureDirectory(path.dirname(targetPath));
+        copyPathRecursive(normalizedSourcePath, targetPath);
+        copiedEntries.set(normalizedSourcePath, targetRelativePath);
+    }
+
+    return copiedEntries.get(normalizedSourcePath);
+}
+
+function transformImportedMarkdown(content, context) {
+    const {
+        sourceFilePath,
+        sourceRootPath,
+        bundlePath,
+        bundlePathMap,
+        copiedAssets,
+        copiedAttachments
+    } = context;
+
+    const sourceDir = path.dirname(sourceFilePath);
+    const bundleAssetsDir = path.join(bundlePath, 'assets');
+    const bundleAttachmentsDir = path.join(bundlePath, 'attachments');
+
+    const rewriteLocalHref = (href, options = {}) => {
+        const normalizedRef = normalizeImportSourceRef(href);
+        if (!normalizedRef) {
+            return href;
+        }
+
+        const resolvedSourcePath = path.resolve(sourceDir, normalizedRef);
+        if (!resolvedSourcePath.startsWith(path.resolve(sourceRootPath)) || !fs.existsSync(resolvedSourcePath)) {
+            return href;
+        }
+
+        const stat = fs.statSync(resolvedSourcePath);
+        if (!stat.isDirectory() && isMarkdownFilePath(resolvedSourcePath)) {
+            const linkedBundlePath = bundlePathMap.get(path.resolve(resolvedSourcePath));
+            if (!linkedBundlePath) {
+                return href;
+            }
+
+            return toMarkdownRelativeLink(path.relative(bundlePath, linkedBundlePath));
+        }
+
+        const normalizedRefPath = normalizedRef.replace(/^\.?\//, '').replace(/^\/+/, '');
+        if (!stat.isDirectory() && isImageFilePath(resolvedSourcePath)) {
+            const targetRelativePath = ensureImportedEntryCopy(
+                resolvedSourcePath,
+                bundleAssetsDir,
+                normalizedRefPath,
+                copiedAssets,
+                { flatten: true }
+            );
+            return toMarkdownRelativeLink(path.join('assets', targetRelativePath));
+        }
+
+        const targetRelativePath = ensureImportedEntryCopy(
+            resolvedSourcePath,
+            bundleAttachmentsDir,
+            normalizedRefPath,
+            copiedAttachments,
+            { flatten: true }
+        );
+        return toMarkdownRelativeLink(path.join('attachments', targetRelativePath));
+    };
+
+    let nextContent = String(content || '');
+    const markdownImageRegex = /!\[([^\]]*)\]\(((?:<[^>]+>|[^()\s]+)(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))?)\)/g;
+    const markdownLinkRegex = /(^|[^!])\[([^\]]*)\]\(((?:<[^>]+>|[^()\s]+)(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))?)\)/g;
+
+    nextContent = nextContent.replace(markdownImageRegex, (match, alt, destination) => {
+        const parsed = parseMarkdownLinkDestinationForImport(destination);
+        const nextHref = rewriteLocalHref(parsed?.href || destination, { image: true });
+        const nextDestination = composeMarkdownLinkDestinationForImport(nextHref, parsed?.title || '');
+        return `![${alt}](${nextDestination})`;
+    });
+
+    nextContent = nextContent.replace(/<img\b([^>]*?)\bsrc\s*=\s*(["'])(.*?)\2([^>]*)>/gi, (match, before, quote, src, after) => {
+        const nextSrc = rewriteLocalHref(src, { image: true });
+        return `<img${before}src=${quote}${nextSrc}${quote}${after}>`;
+    });
+
+    nextContent = nextContent.replace(markdownLinkRegex, (match, prefix, label, destination) => {
+        const parsed = parseMarkdownLinkDestinationForImport(destination);
+        const nextHref = rewriteLocalHref(parsed?.href || destination);
+        const nextDestination = composeMarkdownLinkDestinationForImport(nextHref, parsed?.title || '');
+        return `${prefix}[${label}](${nextDestination})`;
+    });
+
+    return nextContent;
+}
+
+function ensureNormalizedBundleEntry(sourcePath, targetDir, copiedEntries) {
+    const normalizedSourcePath = path.resolve(sourcePath);
+    const relativeToTargetDir = path.relative(targetDir, normalizedSourcePath);
+    const isAlreadyInTargetRoot = (
+        relativeToTargetDir
+        && !relativeToTargetDir.startsWith('..')
+        && !path.isAbsolute(relativeToTargetDir)
+        && !relativeToTargetDir.includes(path.sep)
+    );
+
+    if (copiedEntries.has(normalizedSourcePath)) {
+        return copiedEntries.get(normalizedSourcePath);
+    }
+
+    if (isAlreadyInTargetRoot) {
+        copiedEntries.set(normalizedSourcePath, relativeToTargetDir.replace(/\\/g, '/'));
+        return copiedEntries.get(normalizedSourcePath);
+    }
+
+    const targetEntryName = generateUniqueEntryName(targetDir, path.basename(normalizedSourcePath));
+    const targetPath = path.join(targetDir, targetEntryName);
+    ensureDirectory(path.dirname(targetPath));
+
+    if (normalizedSourcePath !== targetPath) {
+        fs.renameSync(normalizedSourcePath, targetPath);
+    }
+
+    copiedEntries.set(normalizedSourcePath, targetEntryName);
+    return targetEntryName;
+}
+
+async function ensureNormalizedBundleEntryAsync(sourcePath, targetDir, copiedEntries) {
+    const normalizedSourcePath = path.resolve(sourcePath);
+    const relativeToTargetDir = path.relative(targetDir, normalizedSourcePath);
+    const isAlreadyInTargetRoot = (
+        relativeToTargetDir
+        && !relativeToTargetDir.startsWith('..')
+        && !path.isAbsolute(relativeToTargetDir)
+        && !relativeToTargetDir.includes(path.sep)
+    );
+
+    if (copiedEntries.has(normalizedSourcePath)) {
+        return copiedEntries.get(normalizedSourcePath);
+    }
+
+    if (isAlreadyInTargetRoot) {
+        copiedEntries.set(normalizedSourcePath, relativeToTargetDir.replace(/\\/g, '/'));
+        return copiedEntries.get(normalizedSourcePath);
+    }
+
+    const targetEntryName = generateUniqueEntryName(targetDir, path.basename(normalizedSourcePath));
+    const targetPath = path.join(targetDir, targetEntryName);
+    ensureDirectory(path.dirname(targetPath));
+
+    if (normalizedSourcePath !== targetPath) {
+        await fs.promises.rename(normalizedSourcePath, targetPath);
+    }
+
+    copiedEntries.set(normalizedSourcePath, targetEntryName);
+    await yieldToUiFrame();
+    return targetEntryName;
+}
+
+async function replaceWithAsync(input, regex, replacer) {
+    const globalRegex = regex.global ? regex : new RegExp(regex.source, `${regex.flags}g`);
+    let lastIndex = 0;
+    let result = '';
+    let match;
+
+    while ((match = globalRegex.exec(input)) !== null) {
+        result += input.slice(lastIndex, match.index);
+        result += await replacer(...match);
+        lastIndex = globalRegex.lastIndex;
+    }
+
+    result += input.slice(lastIndex);
+    return result;
+}
+
+function normalizeBundleToKangarooFormat(bundlePath) {
+    const normalizedBundlePath = path.resolve(bundlePath);
+    ensureBundleStructure(normalizedBundlePath);
+
+    const resolvedMarkdownPath = resolveBundleMarkdownFilePath(normalizedBundlePath);
+    if (!resolvedMarkdownPath) {
+        throw new Error('所选文件夹缺少 text.markdown 或 text.md，不是有效的 TextBundle。');
+    }
+
+    const standardMarkdownPath = path.join(normalizedBundlePath, 'text.markdown');
+    if (path.resolve(resolvedMarkdownPath) !== path.resolve(standardMarkdownPath)) {
+        fs.renameSync(resolvedMarkdownPath, standardMarkdownPath);
+    }
+
+    const assetsDir = path.join(normalizedBundlePath, 'assets');
+    const attachmentsDir = path.join(normalizedBundlePath, 'attachments');
+    const movedAssets = new Map();
+    const movedAttachments = new Map();
+    const sourceDir = path.dirname(standardMarkdownPath);
+    const rawContent = fs.readFileSync(standardMarkdownPath, 'utf-8');
+
+    const rewriteLocalHref = (href) => {
+        const normalizedRef = normalizeImportSourceRef(href);
+        if (!normalizedRef) {
+            return href;
+        }
+
+        const resolvedSourcePath = path.resolve(sourceDir, normalizedRef);
+        if (!resolvedSourcePath.startsWith(normalizedBundlePath) || !fs.existsSync(resolvedSourcePath)) {
+            return href;
+        }
+
+        const stat = fs.statSync(resolvedSourcePath);
+        if (!stat.isDirectory() && isImageFilePath(resolvedSourcePath)) {
+            const targetEntryName = ensureNormalizedBundleEntry(resolvedSourcePath, assetsDir, movedAssets);
+            return toMarkdownRelativeLink(path.join('assets', targetEntryName));
+        }
+
+        const targetEntryName = ensureNormalizedBundleEntry(resolvedSourcePath, attachmentsDir, movedAttachments);
+        return toMarkdownRelativeLink(path.join('attachments', targetEntryName));
+    };
+
+    let nextContent = String(rawContent || '');
+    const markdownImageRegex = /!\[([^\]]*)\]\(((?:<[^>]+>|[^()\s]+)(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))?)\)/g;
+    const markdownLinkRegex = /(^|[^!])\[([^\]]*)\]\(((?:<[^>]+>|[^()\s]+)(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))?)\)/g;
+
+    nextContent = nextContent.replace(markdownImageRegex, (match, alt, destination) => {
+        const parsed = parseMarkdownLinkDestinationForImport(destination);
+        const nextHref = rewriteLocalHref(parsed?.href || destination);
+        const nextDestination = composeMarkdownLinkDestinationForImport(nextHref, parsed?.title || '');
+        return `![${alt}](${nextDestination})`;
+    });
+
+    nextContent = nextContent.replace(/<img\b([^>]*?)\bsrc\s*=\s*(["'])(.*?)\2([^>]*)>/gi, (match, before, quote, src, after) => {
+        const nextSrc = rewriteLocalHref(src);
+        return `<img${before}src=${quote}${nextSrc}${quote}${after}>`;
+    });
+
+    nextContent = nextContent.replace(markdownLinkRegex, (match, prefix, label, destination) => {
+        const parsed = parseMarkdownLinkDestinationForImport(destination);
+        const nextHref = rewriteLocalHref(parsed?.href || destination);
+        const nextDestination = composeMarkdownLinkDestinationForImport(nextHref, parsed?.title || '');
+        return `${prefix}[${label}](${nextDestination})`;
+    });
+
+    if (nextContent !== rawContent || path.resolve(resolvedMarkdownPath) !== path.resolve(standardMarkdownPath)) {
+        fs.writeFileSync(standardMarkdownPath, nextContent, 'utf-8');
+    }
+
+    return {
+        markdownPath: standardMarkdownPath,
+        content: nextContent
+    };
+}
+
+async function normalizeBundleToKangarooFormatAsync(bundlePath) {
+    const normalizedBundlePath = path.resolve(bundlePath);
+    ensureBundleStructure(normalizedBundlePath);
+    await yieldToUiFrame();
+
+    const resolvedMarkdownPath = resolveBundleMarkdownFilePath(normalizedBundlePath);
+    if (!resolvedMarkdownPath) {
+        throw new Error('所选文件夹缺少 text.markdown 或 text.md，不是有效的 TextBundle。');
+    }
+
+    const standardMarkdownPath = path.join(normalizedBundlePath, 'text.markdown');
+    if (path.resolve(resolvedMarkdownPath) !== path.resolve(standardMarkdownPath)) {
+        await fs.promises.rename(resolvedMarkdownPath, standardMarkdownPath);
+    }
+
+    const assetsDir = path.join(normalizedBundlePath, 'assets');
+    const attachmentsDir = path.join(normalizedBundlePath, 'attachments');
+    const movedAssets = new Map();
+    const movedAttachments = new Map();
+    const sourceDir = path.dirname(standardMarkdownPath);
+    const rawContent = await fs.promises.readFile(standardMarkdownPath, 'utf-8');
+
+    const rewriteLocalHref = async (href) => {
+        const normalizedRef = normalizeImportSourceRef(href);
+        if (!normalizedRef) {
+            return href;
+        }
+
+        const resolvedSourcePath = path.resolve(sourceDir, normalizedRef);
+        if (!resolvedSourcePath.startsWith(normalizedBundlePath) || !fs.existsSync(resolvedSourcePath)) {
+            return href;
+        }
+
+        const stat = await fs.promises.stat(resolvedSourcePath);
+        if (!stat.isDirectory() && isImageFilePath(resolvedSourcePath)) {
+            const targetEntryName = await ensureNormalizedBundleEntryAsync(resolvedSourcePath, assetsDir, movedAssets);
+            return toMarkdownRelativeLink(path.join('assets', targetEntryName));
+        }
+
+        const targetEntryName = await ensureNormalizedBundleEntryAsync(resolvedSourcePath, attachmentsDir, movedAttachments);
+        return toMarkdownRelativeLink(path.join('attachments', targetEntryName));
+    };
+
+    let nextContent = String(rawContent || '');
+
+    const markdownImageRegexAsync = /!\[([^\]]*)\]\(((?:<[^>]+>|[^()\s]+)(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))?)\)/g;
+    const markdownLinkRegexAsync = /(^|[^!])\[([^\]]*)\]\(((?:<[^>]+>|[^()\s]+)(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))?)\)/g;
+
+    nextContent = await replaceWithAsync(nextContent, markdownImageRegexAsync, async (match, alt, destination) => {
+        const parsed = parseMarkdownLinkDestinationForImport(destination);
+        const nextHref = await rewriteLocalHref(parsed?.href || destination);
+        const nextDestination = composeMarkdownLinkDestinationForImport(nextHref, parsed?.title || '');
+        return `![${alt}](${nextDestination})`;
+    });
+    await yieldToUiFrame();
+
+    nextContent = await replaceWithAsync(nextContent, /<img\b([^>]*?)\bsrc\s*=\s*(["'])(.*?)\2([^>]*)>/gi, async (match, before, quote, src, after) => {
+        const nextSrc = await rewriteLocalHref(src);
+        return `<img${before}src=${quote}${nextSrc}${quote}${after}>`;
+    });
+    await yieldToUiFrame();
+
+    nextContent = await replaceWithAsync(nextContent, markdownLinkRegexAsync, async (match, prefix, label, destination) => {
+        const parsed = parseMarkdownLinkDestinationForImport(destination);
+        const nextHref = await rewriteLocalHref(parsed?.href || destination);
+        const nextDestination = composeMarkdownLinkDestinationForImport(nextHref, parsed?.title || '');
+        return `${prefix}[${label}](${nextDestination})`;
+    });
+
+    if (nextContent !== rawContent || path.resolve(resolvedMarkdownPath) !== path.resolve(standardMarkdownPath)) {
+        await fs.promises.writeFile(standardMarkdownPath, nextContent, 'utf-8');
+    }
+
+    return {
+        markdownPath: standardMarkdownPath,
+        content: nextContent
+    };
+}
+
+async function importMarkdownFolderToTarget(sourceRootPath, targetRootPath) {
+    const normalizedSourceRoot = path.resolve(sourceRootPath);
+    const normalizedTargetRoot = path.resolve(targetRootPath);
+    const markdownFiles = listMarkdownFilesRecursively(normalizedSourceRoot);
+
+    if (!markdownFiles.length) {
+        throw new Error('所选文件夹中没有找到 Markdown 文件。');
+    }
+
+    ensureDirectory(normalizedTargetRoot);
+
+    const bundlePathMap = new Map();
+    const reservedBundlePaths = new Set();
+    for (const markdownFilePath of markdownFiles) {
+        const relativeDir = path.relative(normalizedSourceRoot, path.dirname(markdownFilePath));
+        const targetDir = path.join(normalizedTargetRoot, relativeDir);
+        ensureDirectory(targetDir);
+
+        const bundlePath = generateUniqueBundlePathInDirectory(
+            targetDir,
+            path.basename(markdownFilePath, path.extname(markdownFilePath)),
+            reservedBundlePaths
+        );
+        bundlePathMap.set(path.resolve(markdownFilePath), bundlePath);
+        reservedBundlePaths.add(path.resolve(bundlePath));
+    }
+
+    const importedBundlePaths = [];
+
+    for (const markdownFilePath of markdownFiles) {
+        const bundlePath = bundlePathMap.get(path.resolve(markdownFilePath));
+        const rawContent = fs.readFileSync(markdownFilePath, 'utf-8');
+        const transformedContent = transformImportedMarkdown(rawContent, {
+            sourceFilePath: markdownFilePath,
+            sourceRootPath: normalizedSourceRoot,
+            bundlePath,
+            bundlePathMap,
+            copiedAssets: new Map(),
+            copiedAttachments: new Map()
+        });
+
+        ensureBundleStructure(bundlePath);
+        fs.writeFileSync(path.join(bundlePath, 'text.markdown'), transformedContent, 'utf-8');
+        importedBundlePaths.push(bundlePath);
+    }
+
+    return importedBundlePaths;
+}
+
 async function handleOpenBundle() {
     try {
         const folderPath = await ipcRenderer.invoke('dialog:openBundle');
 
         if (folderPath) {
             await waitForEditorReady();
-            const content = fs.readFileSync(
-                path.join(folderPath, 'text.markdown'),
-                'utf-8'
-            );
-
-            loadBundleContent(folderPath, content);
+            const normalized = await normalizeBundleToKangarooFormatAsync(folderPath);
+            loadBundleContent(folderPath, normalized.content);
         }
     } catch (err) {
         alert("打开失败: " + err.message);
@@ -4169,6 +5968,41 @@ async function handleOpenWorkspaceFolder() {
     }
 }
 
+function handleCloseWorkspaceFolder() {
+    setWorkspaceRoot(null);
+    setSidebarTab('workspace');
+}
+
+async function handleImportMarkdownFolder() {
+    try {
+        const sourceFolderPath = await ipcRenderer.invoke('dialog:selectMarkdownImportSource');
+        if (!sourceFolderPath) return;
+
+        const targetFolderPath = await ipcRenderer.invoke('dialog:selectMarkdownImportTarget', {
+            defaultPath: workspaceRootPath || sourceFolderPath
+        });
+        if (!targetFolderPath) return;
+
+        const importedBundlePaths = await importMarkdownFolderToTarget(sourceFolderPath, targetFolderPath);
+
+        if (workspaceRootPath && path.resolve(targetFolderPath).startsWith(path.resolve(workspaceRootPath))) {
+            renderWorkspaceTree();
+            setSidebarTab('workspace');
+        }
+
+        if (importedBundlePaths.length === 1) {
+            const importedContent = fs.readFileSync(resolveBundleMarkdownFilePath(importedBundlePaths[0]), 'utf-8');
+            loadBundleContent(importedBundlePaths[0], importedContent);
+            alert(`导入完成：已导入 1 个 Markdown 文档。`);
+            return;
+        }
+
+        alert(`导入完成：已导入 ${importedBundlePaths.length} 个 Markdown 文档。`);
+    } catch (error) {
+        alert(`导入 Markdown 文件夹失败: ${error.message}`);
+    }
+}
+
 async function handleNewBundleInWorkspace() {
     await createBundleInWorkspace(workspaceRootPath);
 }
@@ -4177,12 +6011,8 @@ async function openBundleFromExternalPath(folderPath, options = {}) {
     try {
         const normalizedPath = path.resolve(folderPath);
         await waitForEditorReady();
-        const content = fs.readFileSync(
-            path.join(normalizedPath, 'text.markdown'),
-            'utf-8'
-        );
-
-        loadBundleContent(normalizedPath, content);
+        const normalized = await normalizeBundleToKangarooFormatAsync(normalizedPath);
+        loadBundleContent(normalizedPath, normalized.content);
         ipcRenderer.send('bundle:clearPendingOpen', normalizedPath);
     } catch (err) {
         alert(`打开失败: ${err.message}`);
@@ -4680,7 +6510,7 @@ function updateTaskLineCheckedState(lineNumber, checked) {
 }
 
 function setSidebarTab(tab) {
-    currentSidebarTab = ['workspace', 'outline', 'todo', 'attachment'].includes(tab) ? tab : 'outline';
+    currentSidebarTab = ['workspace', 'outline', 'todo', 'attachment'].includes(tab) ? tab : 'workspace';
 
     const workspaceTab = document.getElementById('sidebar-tab-workspace');
     const outlineTab = document.getElementById('sidebar-tab-outline');
@@ -4795,7 +6625,7 @@ function getMarkdownContentForBundlePath(bundlePath) {
         return openTab.content || '';
     }
 
-    const markdownPath = path.join(normalizedTarget, 'text.markdown');
+    const markdownPath = resolveBundleMarkdownFilePath(normalizedTarget);
     if (!fs.existsSync(markdownPath)) {
         return '';
     }
@@ -4989,7 +6819,7 @@ function updateTodoMarkdownByKindIndex(content, kindIndex, checked) {
 
 function saveMarkdownToBundlePath(bundlePath, content) {
     if (!bundlePath) return;
-    fs.writeFileSync(path.join(bundlePath, 'text.markdown'), content, 'utf-8');
+    fs.writeFileSync(resolveBundleMarkdownFilePath(bundlePath, { createIfMissing: true }), content, 'utf-8');
 }
 
 async function updateTodoCheckedState(todo, checked) {
@@ -5139,11 +6969,12 @@ function collectAttachmentMarkdownRefs(content) {
     const source = String(content || '');
     const patterns = [
         {
-            regex: /\[((?:\\.|[^\]])*)\]\((?:\.?\/)?attachments\/([^)]+)\)/g,
+            regex: /\[((?:\\.|[^\]])*)\]\((?:\.?\/)?attachments\/(<[^>]+>|[^)\s]+)(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))?\)/g,
             read(match) {
+                const rawRelativePath = String(match[2] || '').replace(/^<|>$/g, '');
                 return {
                     label: unescapeMarkdownLinkLabel(match[1] || ''),
-                    relativePath: match[2] || ''
+                    relativePath: rawRelativePath
                 };
             }
         },
@@ -5163,7 +6994,7 @@ function collectAttachmentMarkdownRefs(content) {
         let match;
         while ((match = pattern.regex.exec(source)) !== null) {
             const parsed = pattern.read(match);
-            const relativePath = safeDecodeUri(parsed.relativePath || '').replace(/^\/+/, '');
+            const relativePath = decodeRelativePathSegments(parsed.relativePath || '').replace(/^\/+/, '');
             if (!relativePath) continue;
 
             references.push({
@@ -5303,6 +7134,281 @@ function showAttachmentContextMenu(event, reference) {
     menu.style.top = `${Math.max(top, 8)}px`;
 }
 
+function buildAttachmentContextReference(reference) {
+    if (!reference) return null;
+
+    const absolutePath = String(
+        reference.absolutePath
+        || reference.pdfPath
+        || reference.videoPath
+        || reference.displayMeta?.absolutePath
+        || reference.element?.getAttribute?.('data-kangaroo-path')
+        || ''
+    ).trim();
+
+    if (!absolutePath) {
+        return null;
+    }
+
+    let isDirectory = false;
+    try {
+        isDirectory = fs.existsSync(absolutePath) && fs.statSync(absolutePath).isDirectory();
+    } catch {
+        isDirectory = false;
+    }
+
+    return {
+        ...reference,
+        absolutePath,
+        isDirectory
+    };
+}
+
+async function renameAttachmentTarget(reference) {
+    if (!reference?.absolutePath) return;
+    await renameBundleAttachmentAbsolutePath(reference.absolutePath);
+}
+
+async function renameBundleAttachmentAbsolutePath(absolutePath) {
+    const sourcePath = path.resolve(String(absolutePath || ''));
+    if (!sourcePath) return false;
+    if (!fs.existsSync(sourcePath)) {
+        alert(`重命名失败: 找不到附件 ${sourcePath}`);
+        return false;
+    }
+
+    let stat = null;
+    try {
+        stat = fs.statSync(sourcePath);
+    } catch (error) {
+        alert(`重命名失败: ${error.message}`);
+        return false;
+    }
+
+    const targetPath = await ipcRenderer.invoke('dialog:renameAttachmentPath', {
+        defaultPath: sourcePath,
+        isDirectory: Boolean(stat?.isDirectory?.())
+    });
+
+    if (!targetPath) return false;
+
+    const normalizedTargetPath = path.resolve(String(targetPath));
+    if (normalizedTargetPath === sourcePath) return false;
+
+    if (path.dirname(normalizedTargetPath) !== path.dirname(sourcePath)) {
+        alert('这里只支持重命名附件，不支持移动到别的目录。');
+        return false;
+    }
+
+    if (fs.existsSync(normalizedTargetPath)) {
+        alert(`已存在同名项目：${path.basename(normalizedTargetPath)}`);
+        return false;
+    }
+
+    try {
+        fs.renameSync(sourcePath, normalizedTargetPath);
+
+        let didRepairDocument = false;
+        if (window.editor && typeof window.editor.updateAttachmentReferencesAfterRename === 'function') {
+            didRepairDocument = Boolean(window.editor.updateAttachmentReferencesAfterRename(sourcePath, normalizedTargetPath));
+        } else if (window.editor && typeof window.editor.refreshDisplayState === 'function') {
+            didRepairDocument = Boolean(window.editor.refreshDisplayState());
+        }
+
+        updateOutline();
+        if (workspaceRootPath) {
+            scheduleWorkspaceTreeRefresh();
+        }
+
+        if (didRepairDocument) {
+            suppressWorkspaceWatcherUntil = Date.now() + 1500;
+            await saveFile({ silent: true });
+            updateOutline();
+        }
+
+        return true;
+    } catch (error) {
+        alert(`重命名失败: ${error.message}`);
+        return false;
+    }
+}
+
+async function renameBundleAttachmentAbsolutePathToName(absolutePath, nextName) {
+    const sourcePath = path.resolve(String(absolutePath || ''));
+    const trimmedName = String(nextName || '').trim();
+
+    if (!sourcePath || !trimmedName) {
+        return false;
+    }
+
+    if (!fs.existsSync(sourcePath)) {
+        alert(`重命名失败: 找不到附件 ${sourcePath}`);
+        return false;
+    }
+
+    if (/[\\/]/.test(trimmedName)) {
+        alert('名称不能包含斜杠。');
+        return false;
+    }
+
+    const normalizedTargetPath = path.join(path.dirname(sourcePath), trimmedName);
+    if (normalizedTargetPath === sourcePath) {
+        return true;
+    }
+
+    if (fs.existsSync(normalizedTargetPath)) {
+        alert(`已存在同名项目：${trimmedName}`);
+        return false;
+    }
+
+    try {
+        fs.renameSync(sourcePath, normalizedTargetPath);
+
+        let didRepairDocument = false;
+        if (window.editor && typeof window.editor.updateAttachmentReferencesAfterRename === 'function') {
+            didRepairDocument = Boolean(window.editor.updateAttachmentReferencesAfterRename(sourcePath, normalizedTargetPath));
+        } else if (window.editor && typeof window.editor.refreshDisplayState === 'function') {
+            didRepairDocument = Boolean(window.editor.refreshDisplayState());
+        }
+
+        updateOutline();
+        if (workspaceRootPath) {
+            scheduleWorkspaceTreeRefresh();
+        }
+
+        if (didRepairDocument) {
+            suppressWorkspaceWatcherUntil = Date.now() + 1500;
+            await saveFile({ silent: true });
+            updateOutline();
+        }
+
+        return true;
+    } catch (error) {
+        alert(`重命名失败: ${error.message}`);
+        return false;
+    }
+}
+
+function getAttachmentInlineRenameLabelElement(element) {
+    return element?.querySelector?.('.kangaroo-attachment-label, .kangaroo-video-label, .kangaroo-pdf-label') || null;
+}
+
+function clearAttachmentInlineRenameState() {
+    attachmentInlineRenameState = null;
+}
+
+function cancelAttachmentInlineRename() {
+    const state = attachmentInlineRenameState;
+    if (!state) return;
+    if (state.input?.parentNode) {
+        state.input.parentNode.removeChild(state.input);
+    }
+    if (state.labelElement) {
+        state.labelElement.style.display = '';
+    }
+    clearAttachmentInlineRenameState();
+    resumeWorkspaceRefresh({ immediate: true });
+}
+
+async function commitAttachmentInlineRename() {
+    const state = attachmentInlineRenameState;
+    if (!state) return false;
+
+    const nextName = String(state.input?.value || '').trim();
+    if (!nextName) {
+        alert('名称不能为空。');
+        state.input?.focus();
+        state.input?.select();
+        return false;
+    }
+
+    const didRename = await renameBundleAttachmentAbsolutePathToName(state.absolutePath, nextName);
+    if (!didRename) {
+        state.input?.focus();
+        state.input?.select();
+        return false;
+    }
+
+    if (state.input?.parentNode) {
+        state.input.parentNode.removeChild(state.input);
+    }
+    if (state.labelElement) {
+        state.labelElement.style.display = '';
+    }
+    clearAttachmentInlineRenameState();
+    resumeWorkspaceRefresh({ immediate: true });
+    return true;
+}
+
+function beginAttachmentInlineRename(linkInfo) {
+    const context = resolveEditorLinkContext(linkInfo);
+    if (!context?.isPath || !context.exists) return;
+    const normalizedHref = String(context.href || '').replace(/^\.?\//, '');
+    if (!/^attachments\//i.test(normalizedHref)) return;
+
+    cancelAttachmentInlineRename();
+
+    const hostElement = context.element?.closest?.('[data-kangaroo-attachment], [data-kangaroo-video], [data-kangaroo-pdf]') || null;
+    const labelElement = getAttachmentInlineRenameLabelElement(hostElement);
+    if (!hostElement || !labelElement) return;
+
+    suspendWorkspaceRefresh();
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'attachment-inline-rename-input';
+    input.value = path.basename(context.target.value || context.href || '');
+    input.setAttribute('aria-label', '重命名附件');
+
+    input.addEventListener('mousedown', (event) => {
+        event.stopPropagation();
+    });
+    input.addEventListener('click', (event) => {
+        event.stopPropagation();
+    });
+    input.addEventListener('dblclick', (event) => {
+        event.stopPropagation();
+    });
+    input.addEventListener('contextmenu', (event) => {
+        event.stopPropagation();
+    });
+    input.addEventListener('keydown', async (event) => {
+        event.stopPropagation();
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            await commitAttachmentInlineRename();
+        } else if (event.key === 'Escape') {
+            event.preventDefault();
+            cancelAttachmentInlineRename();
+        }
+    });
+    input.addEventListener('beforeinput', (event) => {
+        event.stopPropagation();
+    });
+    input.addEventListener('input', (event) => {
+        event.stopPropagation();
+    });
+    input.addEventListener('blur', () => {
+        if (attachmentInlineRenameState?.input !== input) return;
+        cancelAttachmentInlineRename();
+    });
+
+    labelElement.style.display = 'none';
+    labelElement.parentNode?.insertBefore(input, labelElement.nextSibling);
+
+    attachmentInlineRenameState = {
+        absolutePath: context.target.value,
+        hostElement,
+        labelElement,
+        input
+    };
+
+    window.requestAnimationFrame(() => {
+        input.focus();
+        input.select();
+    });
+}
+
 function showPreviewImageContextMenu(event, imagePath) {
     const menu = document.getElementById('preview-image-context-menu');
     if (!menu) return;
@@ -5367,10 +7473,41 @@ function showEditorLinkContextMenu(event, linkInfo) {
     const context = resolveEditorLinkContext(linkInfo);
     if (!context) return;
 
-    editorLinkContextTarget = context;
+    const contextElement = linkInfo?.element
+        || linkInfo?.nodeView?.getDom?.()
+        || getEventTargetElement(event.target)?.closest?.('[data-kangaroo-attachment], [data-kangaroo-video], [data-kangaroo-pdf], a.kangaroo-link')
+        || null;
+    const cardElement = contextElement?.closest?.('[data-kangaroo-attachment], [data-kangaroo-video], [data-kangaroo-pdf]') || null;
+    const cardKind = String(linkInfo?.cardKind || '').trim() || (
+        cardElement?.matches?.('[data-kangaroo-pdf]')
+            ? 'pdf'
+            : cardElement?.matches?.('[data-kangaroo-video]')
+                ? 'video'
+                : cardElement?.matches?.('[data-kangaroo-attachment]')
+                    ? 'attachment'
+                    : 'link'
+    );
+    const absolutePath = String(
+        linkInfo?.absolutePath
+        || cardElement?.getAttribute?.('data-kangaroo-path')
+        || contextElement?.getAttribute?.('data-kangaroo-path')
+        || linkInfo?.displayMeta?.absolutePath
+        || (context.target?.type === 'path' ? context.target.value : '')
+        || ''
+    ).trim();
+    editorLinkContextTarget = {
+        ...context,
+        element: contextElement,
+        cardElement,
+        cardKind,
+        absolutePath
+    };
 
     const openWithButton = document.getElementById('editor-link-menu-open-with');
     const revealButton = document.getElementById('editor-link-menu-reveal');
+    const renameButton = document.getElementById('editor-link-menu-rename');
+    const isAttachmentTarget = /^attachments\//i.test(String(context.href || '').replace(/^\.?\//, ''));
+    const canRenameTarget = ['attachment', 'pdf', 'video'].includes(cardKind) && Boolean(absolutePath) && fs.existsSync(absolutePath);
 
     if (openWithButton) {
         openWithButton.style.display = IS_MACOS && context.isPath && context.exists ? '' : 'none';
@@ -5378,6 +7515,10 @@ function showEditorLinkContextMenu(event, linkInfo) {
 
     if (revealButton) {
         revealButton.style.display = context.isPath && context.exists ? '' : 'none';
+    }
+
+    if (renameButton) {
+        renameButton.style.display = (isAttachmentTarget && canRenameTarget) ? '' : 'none';
     }
 
     menu.classList.add('show');
@@ -5415,6 +7556,22 @@ async function openAttachmentTarget(reference) {
     if (!result || !result.ok) {
         alert(`打开附件失败: ${(result && result.error) || reference.absolutePath}`);
     }
+}
+
+async function renameEditorLinkTarget(linkInfo) {
+    const context = resolveEditorLinkContext(linkInfo);
+    const absolutePath = String(
+        linkInfo?.absolutePath
+        || linkInfo?.cardElement?.getAttribute?.('data-kangaroo-path')
+        || linkInfo?.element?.getAttribute?.('data-kangaroo-path')
+        || (context?.target?.type === 'path' ? context.target.value : '')
+        || ''
+    ).trim();
+    if (!absolutePath) {
+        return;
+    }
+
+    await renameAttachmentAbsolutePath(absolutePath);
 }
 
 async function openEditorLinkTarget(linkInfo) {
@@ -5457,6 +7614,8 @@ function deleteSelectedEditorLink() {
         return;
     }
 
+    capturePendingAttachmentDeleteSnapshot();
+    persistActiveTabState();
     const didDelete = window.editor.deleteSelectedLink();
     if (didDelete) {
         hideEditorLinkContextMenu();
@@ -5989,7 +8148,8 @@ function getBundleMarkdownForSearch(bundlePath) {
     }
 
     try {
-        return fs.readFileSync(path.join(normalizedPath, 'text.markdown'), 'utf8');
+        const markdownPath = resolveBundleMarkdownFilePath(normalizedPath);
+        return markdownPath ? fs.readFileSync(markdownPath, 'utf8') : '';
     } catch {
         return '';
     }
@@ -6041,7 +8201,7 @@ function getSearchJumpTarget(line) {
         return { preferredText: '', preferredKind: '' };
     }
 
-    const headingMatch = rawLine.match(/^(#{1,6})\s+(.+)$/);
+    const headingMatch = rawLine.match(/^(?:[-+*]|\d+\.)\s+\[[ xX]\]\s+(#{1,6})\s+(.+)$/) || rawLine.match(/^(#{1,6})\s+(.+)$/);
     if (headingMatch) {
         return {
             preferredText: headingMatch[2].trim(),
@@ -6273,8 +8433,6 @@ function getUsedAttachmentEntries(markdown, options = {}) {
                 used.add(topLevelEntry);
             }
         }
-
-        return used;
     }
 
     for (const ref of collectAttachmentMarkdownRefs(markdown)) {
@@ -6303,17 +8461,10 @@ async function cleanUnusedAttachments(markdown) {
         if (used.has(entryName)) continue;
 
         const entryPath = path.join(attachmentsDir, entryName);
+        if (!fs.existsSync(entryPath)) continue;
+
         const stat = fs.statSync(entryPath);
         const isDirectory = stat.isDirectory();
-        const decision = await ipcRenderer.invoke('dialog:confirmDeleteAttachmentEntry', {
-            entryName,
-            isDirectory
-        });
-
-        if (decision !== 'delete') {
-            restoreActiveTabFromPreviousSnapshot();
-            return false;
-        }
 
         backupEntryToRecovery('attachments', entryName);
         const trashResult = await ipcRenderer.invoke('shell:trashPath', {
@@ -6473,7 +8624,9 @@ function handleEditorContentChanged() {
     if (currentSearchQuery.trim()) {
         renderToolbarSearchResults(currentSearchQuery);
     }
-    persistActiveTabState();
+    if (!pendingAttachmentDeleteSnapshot) {
+        persistActiveTabState();
+    }
     scheduleEditorRender();
 }
 
@@ -6906,6 +9059,11 @@ document.getElementById('editor-link-menu-reveal').addEventListener('click', asy
     hideEditorLinkContextMenu();
     await revealEditorLinkTarget(target);
 });
+document.getElementById('editor-link-menu-rename').addEventListener('click', async () => {
+    const target = editorLinkContextTarget;
+    hideEditorLinkContextMenu();
+    await renameEditorLinkTarget(target);
+});
 document.getElementById('editor-link-menu-delete').addEventListener('click', () => {
     deleteSelectedEditorLink();
 });
@@ -6923,6 +9081,11 @@ document.getElementById('attachment-menu-reveal').addEventListener('click', asyn
     const target = attachmentContextTarget;
     hideAttachmentContextMenu();
     await revealAttachmentTarget(target);
+});
+document.getElementById('attachment-menu-rename').addEventListener('click', async () => {
+    const target = attachmentContextTarget;
+    hideAttachmentContextMenu();
+    await renameAttachmentTarget(target);
 });
 document.getElementById('preview-image-menu-copy').addEventListener('click', () => {
     const target = previewImageContextTarget;
@@ -6994,6 +9157,7 @@ document.querySelectorAll('#editor-toolbar .editor-toolbar-button').forEach((but
         });
     });
 });
+updateSidebarToggleButton();
 document.getElementById('todo-scope-select').addEventListener('change', (event) => {
     updateTodoPanelSettings({ scope: event.target.value });
 });
@@ -7031,6 +9195,12 @@ ipcRenderer.on('menu:action', async (_, action) => {
         break;
     case 'openFolder':
         await handleOpenWorkspaceFolder();
+        break;
+    case 'closeFolder':
+        handleCloseWorkspaceFolder();
+        break;
+    case 'importMarkdownFolder':
+        await handleImportMarkdownFolder();
         break;
     case 'save':
         await saveFile();
@@ -7105,7 +9275,7 @@ function updateOutline() {
     renderAttachmentList(content);
 
     // Regex to find headings (e.g., # Heading)
-    const headingRegex = /^(#{1,6})\s+(.+)$/gm;
+    const headingRegex = /^(?:(?:[-+*]|\d+\.)\s+\[[ xX]\]\s+)?(#{1,6})\s+(.+)$/gm;
     let match;
 
     while ((match = headingRegex.exec(content)) !== null) {

@@ -46,6 +46,8 @@ function buildAppMenu() {
             { label: '新建', accelerator: 'CmdOrCtrl+N', click: () => sendMenuAction('new') },
             { label: '打开', accelerator: 'CmdOrCtrl+O', click: () => sendMenuAction('open') },
             { label: '打开文件夹', accelerator: 'CmdOrCtrl+Shift+O', click: () => sendMenuAction('openFolder') },
+            { label: '关闭文件夹', accelerator: 'CmdOrCtrl+Shift+W', click: () => sendMenuAction('closeFolder') },
+            { label: '导入 Markdown 文件夹', accelerator: 'CmdOrCtrl+Alt+I', click: () => sendMenuAction('importMarkdownFolder') },
             { type: 'separator' },
             { label: '保存', accelerator: 'CmdOrCtrl+S', click: () => sendMenuAction('save') },
             { label: '另存为', accelerator: 'CmdOrCtrl+Shift+S', click: () => sendMenuAction('saveAs') },
@@ -92,7 +94,10 @@ function buildAppMenu() {
 }
 
 function isValidBundle(bundlePath) {
-    return fs.existsSync(path.join(bundlePath, 'text.markdown'));
+    return (
+        fs.existsSync(path.join(bundlePath, 'text.markdown'))
+        || fs.existsSync(path.join(bundlePath, 'text.md'))
+    );
 }
 
 function normalizeOpenTarget(target) {
@@ -298,13 +303,34 @@ ipcMain.handle('dialog:openBundle', async () => {
     if (isValidBundle(selectedPath)) {
         return selectedPath;
     } else {
-        throw new Error('所选文件夹缺少 text.markdown，不是有效的 TextBundle。');
+        throw new Error('所选文件夹缺少 text.markdown 或 text.md，不是有效的 TextBundle。');
     }
 });
 
 ipcMain.handle('dialog:openWorkspaceFolder', async () => {
     const { canceled, filePaths } = await dialog.showOpenDialog({
         title: '选择笔记工作空间文件夹',
+        properties: ['openDirectory', 'createDirectory']
+    });
+
+    if (canceled || !filePaths.length) return null;
+    return filePaths[0];
+});
+
+ipcMain.handle('dialog:selectMarkdownImportSource', async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+        title: '选择要导入的 Markdown 文件夹',
+        properties: ['openDirectory']
+    });
+
+    if (canceled || !filePaths.length) return null;
+    return filePaths[0];
+});
+
+ipcMain.handle('dialog:selectMarkdownImportTarget', async (_, options = {}) => {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+        title: '选择导入目标文件夹',
+        defaultPath: options.defaultPath || undefined,
         properties: ['openDirectory', 'createDirectory']
     });
 
@@ -351,6 +377,21 @@ ipcMain.handle('dialog:renameWorkspaceFolder', async (_, options = {}) => {
         title: '重命名文件夹',
         defaultPath,
         buttonLabel: '确认命名',
+        properties: ['showOverwriteConfirmation']
+    });
+
+    if (canceled || !filePath) return null;
+    return filePath;
+});
+
+ipcMain.handle('dialog:renameAttachmentPath', async (event, options = {}) => {
+    const defaultPath = options.defaultPath || '';
+    const isDirectory = Boolean(options.isDirectory);
+    const ownerWindow = BrowserWindow.fromWebContents(event.sender) || BrowserWindow.getFocusedWindow() || mainWindow || undefined;
+    const { canceled, filePath } = await dialog.showSaveDialog(ownerWindow, {
+        title: isDirectory ? '重命名文件夹附件' : '重命名文件附件',
+        defaultPath,
+        buttonLabel: '确认重命名',
         properties: ['showOverwriteConfirmation']
     });
 
