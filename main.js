@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, systemPreferences, shell, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, systemPreferences, shell, Menu, nativeImage, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { fileURLToPath } = require('url');
@@ -8,7 +8,29 @@ let mainWindow = null;
 let isQuitting = false;
 let isHandlingQuit = false;
 let pendingBundlePath = null;
+let attachmentDragIcon = null;
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
+const ALLOWED_EXTERNAL_PROTOCOLS = new Set(['http:', 'https:', 'mailto:', 'zotero:']);
+const DEFAULT_BUNDLE_EXTENSION = '.kangaroo';
+const LEGACY_BUNDLE_EXTENSION = '.textbundle';
+
+function normalizeBundleSavePath(filePath) {
+    const normalizedPath = String(filePath || '').trim();
+    if (!normalizedPath) {
+        return '';
+    }
+
+    const ext = path.extname(normalizedPath).toLowerCase();
+    if (ext === DEFAULT_BUNDLE_EXTENSION) {
+        return normalizedPath;
+    }
+
+    if (ext === LEGACY_BUNDLE_EXTENSION) {
+        return normalizedPath.slice(0, -LEGACY_BUNDLE_EXTENSION.length) + DEFAULT_BUNDLE_EXTENSION;
+    }
+
+    return `${normalizedPath}${DEFAULT_BUNDLE_EXTENSION}`;
+}
 
 if (!hasSingleInstanceLock) {
     app.quit();
@@ -51,6 +73,7 @@ function buildAppMenu() {
             { type: 'separator' },
             { label: '保存', accelerator: 'CmdOrCtrl+S', click: () => sendMenuAction('save') },
             { label: '另存为', accelerator: 'CmdOrCtrl+Shift+S', click: () => sendMenuAction('saveAs') },
+            { type: 'separator' },
             {
                 label: '导出',
                 submenu: [
@@ -65,8 +88,8 @@ function buildAppMenu() {
     template.push({
         label: 'Edit',
         submenu: [
-            { role: 'undo', label: '撤销' },
-            { role: 'redo', label: '重做' },
+            { label: '撤销', accelerator: 'CmdOrCtrl+Z', click: () => sendMenuAction('undo') },
+            { label: '重做', accelerator: 'CmdOrCtrl+Shift+Z', click: () => sendMenuAction('redo') },
             { type: 'separator' },
             { role: 'cut', label: '剪切' },
             { role: 'copy', label: '复制' },
@@ -136,6 +159,17 @@ async function openTargetWithSystem(target) {
     }
 
     if (normalizedTarget.type === 'external') {
+        let protocol = '';
+        try {
+            protocol = new URL(normalizedTarget.value).protocol.toLowerCase();
+        } catch {
+            return { ok: false, error: '无效的外部链接。' };
+        }
+
+        if (!ALLOWED_EXTERNAL_PROTOCOLS.has(protocol)) {
+            return { ok: false, error: `不允许打开该类型的外部链接：${protocol || normalizedTarget.value}` };
+        }
+
         await shell.openExternal(normalizedTarget.value);
         return { ok: true };
     }
@@ -150,6 +184,312 @@ async function openTargetWithSystem(target) {
     }
 
     return { ok: true };
+}
+
+function pathToFileUri(filePath) {
+    const normalizedPath = path.resolve(String(filePath || ''));
+    return `file://${normalizedPath.split(path.sep).map(encodeURIComponent).join('/')}`;
+}
+
+function getMacFileClipboardHelperTarget() {
+    const appCandidates = [
+        process.resourcesPath ? path.join(process.resourcesPath, 'copy-file-to-clipboard.app') : '',
+        path.join(app.getAppPath(), 'build', 'copy-file-to-clipboard.app'),
+        path.join(__dirname, 'build', 'copy-file-to-clipboard.app')
+    ].filter(Boolean);
+
+    const appPath = appCandidates.find((candidate) => {
+        try {
+            fs.accessSync(path.join(candidate, 'Contents', 'MacOS', 'copy-file-to-clipboard'), fs.constants.X_OK);
+            return true;
+        } catch {
+            return false;
+            }
+        });
+    if (appPath) {
+        return { type: 'app', path: appPath };
+    }
+
+    const candidates = [
+        process.resourcesPath ? path.join(process.resourcesPath, 'copy-file-to-clipboard') : '',
+        path.join(app.getAppPath(), 'build', 'copy-file-to-clipboard'),
+        path.join(__dirname, 'build', 'copy-file-to-clipboard')
+    ].filter(Boolean);
+
+    const helperPath = candidates.find((candidate) => {
+        try {
+            fs.accessSync(candidate, fs.constants.X_OK);
+            return true;
+        } catch {
+            return false;
+        }
+    });
+    return helperPath ? { type: 'executable', path: helperPath } : null;
+}
+
+function copyPathsWithMacClipboardHelper(filePaths) {
+    const helperTarget = getMacFileClipboardHelperTarget();
+    if (!helperTarget) {
+        return Promise.resolve({ ok: false, error: '未找到 macOS 文件剪贴板辅助程序。' });
+    }
+
+    return new Promise((resolve) => {
+        const command = helperTarget.type === 'app' ? '/usr/bin/open' : helperTarget.path;
+        const args = helperTarget.type === 'app'
+            ? ['-W', '-n', helperTarget.path, '--args', ...filePaths]
+            : filePaths;
+        execFile(command, args, { timeout: 5000 }, (error, stdout, stderr) => {
+            if (error) {
+                resolve({
+                    ok: false,
+                    error: String(stderr || stdout || error.message || 'macOS 文件剪贴板写入失败。').trim()
+                });
+                return;
+            }
+            resolve({ ok: true, method: helperTarget.type === 'app' ? 'macos-helper-app' : 'macos-helper-executable' });
+        });
+    });
+}
+
+function copyPathsWithMacFinder(filePaths) {
+    const normalizedPaths = (Array.isArray(filePaths) ? filePaths : [filePaths])
+        .map((filePath) => path.resolve(String(filePath || '')))
+        .filter(Boolean);
+    if (!normalizedPaths.length) {
+        return Promise.resolve({ ok: false, error: '没有可复制的文件。' });
+    }
+
+    const script = [
+        'on run argv',
+        '    if (count of argv) is 1 then',
+        '        set the clipboard to item 1 of argv as «class furl»',
+        '    else',
+        '        set fileReferences to {}',
+        '        repeat with filePath in argv',
+        '            set end of fileReferences to (filePath as «class furl»)',
+        '        end repeat',
+        '        set the clipboard to fileReferences',
+        '    end if',
+        'end run'
+    ].join('\n');
+
+    return new Promise((resolve) => {
+        execFile('/usr/bin/osascript', [
+            '-e',
+            script,
+            ...normalizedPaths
+        ], { timeout: 5000 }, (error, stdout, stderr) => {
+            if (error) {
+                resolve({
+                    ok: false,
+                    error: String(stderr || stdout || error.message || 'Finder 文件剪贴板写入失败。').trim()
+                });
+                return;
+            }
+            resolve({ ok: true, method: 'macos-finder-clipboard' });
+        });
+    });
+}
+
+function copyPathsWithMacFinderKeyboard(filePaths) {
+    const normalizedPaths = (Array.isArray(filePaths) ? filePaths : [filePaths])
+        .map((filePath) => path.resolve(String(filePath || '')))
+        .filter(Boolean);
+    if (!normalizedPaths.length) {
+        return Promise.resolve({ ok: false, error: '没有可复制的文件。' });
+    }
+
+    const script = [
+        'on run argv',
+        '    set fileReferences to {}',
+        '    repeat with filePath in argv',
+        '        set end of fileReferences to (POSIX file filePath as alias)',
+        '    end repeat',
+        '    tell application "Finder"',
+        '        activate',
+        '        set selection to fileReferences',
+        '    end tell',
+        '    delay 0.15',
+        '    tell application "System Events"',
+        '        keystroke "c" using command down',
+        '    end tell',
+        'end run'
+    ].join('\n');
+
+    return new Promise((resolve) => {
+        execFile('/usr/bin/osascript', [
+            '-e',
+            script,
+            ...normalizedPaths
+        ], { timeout: 8000 }, (error, stdout, stderr) => {
+            if (error) {
+                resolve({
+                    ok: false,
+                    error: String(stderr || stdout || error.message || 'Finder Cmd+C 文件复制失败。请在系统设置中允许 Kangaroo 控制 Finder 和 System Events。').trim()
+                });
+                return;
+            }
+            resolve({ ok: true, method: 'macos-finder-command-c' });
+        });
+    });
+}
+
+function writeFileUrlClipboardFormats(filePaths) {
+    const normalizedPaths = (Array.isArray(filePaths) ? filePaths : [filePaths])
+        .map((filePath) => path.resolve(String(filePath || '')))
+        .filter(Boolean);
+    if (!normalizedPaths.length) {
+        return { ok: false, error: '没有可复制的文件。' };
+    }
+
+    const fileUrls = normalizedPaths.map(pathToFileUri);
+    const primaryFileUrl = fileUrls[0];
+
+    clipboard.clear();
+    let wroteFormat = false;
+
+    for (const [format, value] of [
+        ['public.file-url', Buffer.from(primaryFileUrl, 'utf8')],
+        ['public.url', Buffer.from(primaryFileUrl, 'utf8')],
+        ['NSURLPboardType', Buffer.from(primaryFileUrl, 'utf8')],
+        ['text/uri-list', Buffer.from(`${fileUrls.join('\n')}\n`, 'utf8')],
+        ['x-special/gnome-copied-files', Buffer.from(`copy\n${fileUrls.join('\n')}`, 'utf8')],
+        ['public/utf8-plain-text', Buffer.from(primaryFileUrl, 'utf8')],
+        ['public/file-url', Buffer.from(primaryFileUrl, 'utf8')]
+    ]) {
+        try {
+            clipboard.writeBuffer(format, value);
+            wroteFormat = true;
+        } catch {
+            // Keep trying other representations.
+        }
+    }
+
+    return {
+        ok: wroteFormat,
+        formats: typeof clipboard.availableFormats === 'function' ? clipboard.availableFormats() : []
+    };
+}
+
+function writeLinuxFileClipboardFormats(filePaths) {
+    const normalizedPaths = (Array.isArray(filePaths) ? filePaths : [filePaths])
+        .map((filePath) => path.resolve(String(filePath || '')))
+        .filter(Boolean);
+    if (!normalizedPaths.length) {
+        return { ok: false, error: '没有可复制的文件。' };
+    }
+
+    const fileUrls = normalizedPaths.map(pathToFileUri);
+    const uriList = `${fileUrls.join('\n')}\n`;
+    const gnomeCopiedFiles = `copy\n${fileUrls.join('\n')}`;
+
+    clipboard.clear();
+    try {
+        clipboard.writeText(uriList);
+        clipboard.writeBuffer('text/uri-list', Buffer.from(uriList, 'utf8'));
+        clipboard.writeBuffer('x-special/gnome-copied-files', Buffer.from(gnomeCopiedFiles, 'utf8'));
+        return {
+            ok: true,
+            method: 'linux-uri-list',
+            formats: typeof clipboard.availableFormats === 'function' ? clipboard.availableFormats() : []
+        };
+    } catch (error) {
+        return { ok: false, error: error.message };
+    }
+}
+
+function copyPathsWithWindowsClipboard(filePaths) {
+    const normalizedPaths = (Array.isArray(filePaths) ? filePaths : [filePaths])
+        .map((filePath) => path.resolve(String(filePath || '')))
+        .filter(Boolean);
+    if (!normalizedPaths.length) {
+        return Promise.resolve({ ok: false, error: '没有可复制的文件。' });
+    }
+
+    const commands = [
+        ['powershell.exe', ['-STA', '-NoProfile', '-NonInteractive', '-Command']],
+        ['pwsh.exe', ['-NoProfile', '-NonInteractive', '-Command']]
+    ];
+    const script = [
+        'Add-Type -AssemblyName System.Windows.Forms;',
+        '$files = New-Object System.Collections.Specialized.StringCollection;',
+        'foreach ($path in $args) {',
+        '  $resolved = (Resolve-Path -LiteralPath $path -ErrorAction Stop).ProviderPath;',
+        '  [void] $files.Add($resolved);',
+        '}',
+        '[System.Windows.Forms.Clipboard]::SetFileDropList($files);'
+    ].join(' ');
+
+    const tryCommand = (index = 0) => {
+        if (index >= commands.length) {
+            return Promise.resolve({ ok: false, error: '无法调用 Windows 文件剪贴板。' });
+        }
+
+        const [command, baseArgs] = commands[index];
+        return new Promise((resolve) => {
+            execFile(command, [
+                ...baseArgs,
+                script,
+                ...normalizedPaths
+            ], { windowsHide: true }, (error, stdout, stderr) => {
+                if (!error) {
+                    resolve({ ok: true, method: 'windows-file-drop' });
+                    return;
+                }
+
+                tryCommand(index + 1).then((result) => {
+                    if (!result.ok && index === commands.length - 1) {
+                        resolve({
+                            ok: false,
+                            error: String(stderr || stdout || error.message || result.error || '无法调用 Windows 文件剪贴板。').trim()
+                        });
+                        return;
+                    }
+                    resolve(result);
+                });
+            });
+        });
+    };
+
+    return tryCommand();
+}
+
+async function copyPathToSystemClipboard(target) {
+    const normalizedTarget = normalizeOpenTarget(target);
+    if (!normalizedTarget || normalizedTarget.type !== 'path' || !normalizedTarget.value) {
+        return { ok: false, error: '无效的文件目标。' };
+    }
+
+    const normalizedPath = path.resolve(String(normalizedTarget.value));
+    if (!fs.existsSync(normalizedPath)) {
+        return { ok: false, error: `目标不存在：${normalizedPath}` };
+    }
+
+    if (process.platform === 'darwin') {
+        const finderResult = await copyPathsWithMacFinder([normalizedPath]);
+        if (finderResult.ok) {
+            return finderResult;
+        }
+
+        return finderResult;
+    }
+
+    if (process.platform === 'win32') {
+        return await copyPathsWithWindowsClipboard([normalizedPath]);
+    }
+
+    return writeLinuxFileClipboardFormats([normalizedPath]);
+}
+
+function getAttachmentDragIcon() {
+    if (attachmentDragIcon && !attachmentDragIcon.isEmpty()) {
+        return attachmentDragIcon;
+    }
+
+    const dragIconPath = path.join(app.getAppPath(), 'build', 'icon.png');
+    const icon = nativeImage.createFromPath(dragIconPath);
+    attachmentDragIcon = icon.isEmpty() ? icon : icon.resize({ width: 32, height: 32 });
+    return attachmentDragIcon;
 }
 
 async function confirmRendererCanClose(win) {
@@ -281,7 +621,7 @@ function getBundlePathFromArgv(argv = []) {
 }
 
 // 监听：打开 TextBundle 文件夹
-ipcMain.handle('dialog:openBundle', async () => {
+ipcMain.handle('dialog:openBundle', async (_, options = {}) => {
     const properties = ['openFile', 'openDirectory', 'createDirectory'];
 
     if (process.platform === 'darwin') {
@@ -289,10 +629,12 @@ ipcMain.handle('dialog:openBundle', async () => {
     }
 
     const { canceled, filePaths } = await dialog.showOpenDialog({
-        title: '选择 TextBundle 文件夹',
+        title: options.title || '选择 Kangaroo 文件夹',
+        buttonLabel: options.buttonLabel || undefined,
+        defaultPath: options.defaultPath || undefined,
         properties,
         filters: [
-            { name: 'TextBundle', extensions: ['textbundle'] }
+            { name: 'Kangaroo', extensions: ['kangaroo', 'textbundle'] }
         ]
     });
 
@@ -303,7 +645,7 @@ ipcMain.handle('dialog:openBundle', async () => {
     if (isValidBundle(selectedPath)) {
         return selectedPath;
     } else {
-        throw new Error('所选文件夹缺少 text.markdown 或 text.md，不是有效的 TextBundle。');
+        throw new Error('所选文件夹缺少 text.md 或 text.markdown，不是有效的 Kangaroo bundle。');
     }
 });
 
@@ -338,24 +680,32 @@ ipcMain.handle('dialog:selectMarkdownImportTarget', async (_, options = {}) => {
     return filePaths[0];
 });
 
+ipcMain.handle('dialog:openFolder', async (_, options = {}) => {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+        title: options.title || '选择文件夹',
+        buttonLabel: options.buttonLabel || undefined,
+        defaultPath: options.defaultPath || undefined,
+        properties: ['openDirectory', 'createDirectory']
+    });
+
+    if (canceled || !filePaths.length) return null;
+    return filePaths[0];
+});
+
 // 监听：新建 TextBundle
 ipcMain.handle('dialog:createBundle', async (_, options = {}) => {
     const { canceled, filePath } = await dialog.showSaveDialog({
-        title: '新建 TextBundle',
-        defaultPath: options.defaultPath || '我的文档.textbundle',
+        title: '新建 Kangaroo bundle',
+        defaultPath: options.defaultPath || `我的文档${DEFAULT_BUNDLE_EXTENSION}`,
         buttonLabel: '创建',
         filters: [
-            { name: 'TextBundle', extensions: ['textbundle'] }
+            { name: 'Kangaroo', extensions: ['kangaroo', 'textbundle'] }
         ]
     });
 
     if (canceled || !filePath) return null;
 
-    if (path.extname(filePath).toLowerCase() !== '.textbundle') {
-        return `${filePath}.textbundle`;
-    }
-
-    return filePath;
+    return normalizeBundleSavePath(filePath);
 });
 
 ipcMain.handle('dialog:createWorkspaceFolder', async (_, options = {}) => {
@@ -400,23 +750,19 @@ ipcMain.handle('dialog:renameAttachmentPath', async (event, options = {}) => {
 });
 
 ipcMain.handle('dialog:saveBundleAs', async (_, options = {}) => {
-    const defaultPath = options.defaultPath || '我的文档.textbundle';
+    const defaultPath = options.defaultPath || `我的文档${DEFAULT_BUNDLE_EXTENSION}`;
     const { canceled, filePath } = await dialog.showSaveDialog({
-        title: '另存为 TextBundle',
+        title: '另存为 Kangaroo bundle',
         defaultPath,
         buttonLabel: '保存',
         filters: [
-            { name: 'TextBundle', extensions: ['textbundle'] }
+            { name: 'Kangaroo', extensions: ['kangaroo', 'textbundle'] }
         ]
     });
 
     if (canceled || !filePath) return null;
 
-    if (path.extname(filePath).toLowerCase() !== '.textbundle') {
-        return `${filePath}.textbundle`;
-    }
-
-    return filePath;
+    return normalizeBundleSavePath(filePath);
 });
 
 ipcMain.handle('dialog:saveHtmlExport', async (_, options = {}) => {
@@ -491,6 +837,23 @@ ipcMain.handle('dialog:confirmDeleteAttachmentEntry', async (_, options = {}) =>
     return response === 0 ? 'delete' : 'cancel';
 });
 
+ipcMain.handle('dialog:confirmDeleteUnreferencedAttachments', async (_, options = {}) => {
+    const count = Math.max(0, Number(options.count) || 0);
+
+    const { response } = await dialog.showMessageBox({
+        type: 'warning',
+        buttons: ['删除', '取消'],
+        defaultId: 1,
+        cancelId: 1,
+        title: '删除未引用附件',
+        message: `确定要删除这 ${count} 个未引用附件吗？`,
+        detail: '这些文件和文件夹会被移到系统回收站。',
+        noLink: true
+    });
+
+    return response === 0 ? 'delete' : 'cancel';
+});
+
 ipcMain.handle('dialog:confirmDeleteWorkspaceEntry', async (_, options = {}) => {
     const entryName = options.entryName || '这个项目';
     const isFolder = Boolean(options.isFolder);
@@ -541,6 +904,69 @@ ipcMain.handle('shell:trashPath', async (_, target) => {
 
     try {
         await shell.trashItem(normalizedTarget.value);
+        return { ok: true };
+    } catch (error) {
+        return { ok: false, error: error.message };
+    }
+});
+
+ipcMain.handle('shell:copyFileTarget', async (_, target) => {
+    try {
+        return await copyPathToSystemClipboard(target);
+    } catch (error) {
+        return { ok: false, error: error.message || '复制附件失败。' };
+    }
+});
+
+ipcMain.on('attachment:startDrag', (event, payload = {}) => {
+    const targetPath = typeof payload === 'string' ? payload : payload.path;
+    if (!targetPath) {
+        event.returnValue = false;
+        return;
+    }
+
+    const normalizedPath = path.resolve(String(targetPath));
+    if (!fs.existsSync(normalizedPath)) {
+        event.returnValue = false;
+        return;
+    }
+
+    try {
+        event.sender.startDrag({
+            file: normalizedPath,
+            icon: getAttachmentDragIcon()
+        });
+        event.returnValue = true;
+    } catch (error) {
+        console.warn('启动附件拖拽失败:', error);
+        event.returnValue = false;
+    }
+});
+
+ipcMain.handle('window:showAndFocus', async () => {
+    const win = createWindow();
+    if (!win || win.isDestroyed()) {
+        return { ok: false, error: '主窗口不可用。' };
+    }
+
+    try {
+        if (win.isMinimized()) {
+            win.restore();
+        }
+        win.show();
+        win.focus();
+        if (process.platform === 'darwin' && app.dock?.bounce) {
+            app.dock.bounce('informational');
+        } else if (typeof win.flashFrame === 'function') {
+            win.flashFrame(true);
+            setTimeout(() => {
+                try {
+                    win.flashFrame(false);
+                } catch {
+                    // ignore
+                }
+            }, 1500);
+        }
         return { ok: true };
     } catch (error) {
         return { ok: false, error: error.message };

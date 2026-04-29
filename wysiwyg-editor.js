@@ -1,16 +1,121 @@
 const fs = require('fs');
-const { nativeImage } = require('electron');
-const { Editor, Extension, Node: TiptapNode, mergeAttributes, getMarkRange } = require('@tiptap/core');
+const { nativeImage, ipcRenderer } = require('electron');
+const { Editor, Extension, Node: TiptapNode, mergeAttributes, getMarkRange, getRenderedAttributes, renderNestedMarkdownContent } = require('@tiptap/core');
 const { StarterKit } = require('@tiptap/starter-kit');
 const { Underline } = require('@tiptap/extension-underline');
 const { Link } = require('@tiptap/extension-link');
 const { Image } = require('@tiptap/extension-image');
 const { TaskList, TaskItem } = require('@tiptap/extension-list');
 const { Markdown } = require('@tiptap/markdown');
-const { Plugin, Selection } = require('@tiptap/pm/state');
+const { Plugin, Selection, TextSelection } = require('@tiptap/pm/state');
+const { Fragment } = require('@tiptap/pm/model');
 const path = require('path');
 const { pathToFileURL, fileURLToPath } = require('url');
-const { Slice } = require('@tiptap/pm/model');
+
+const pdfPreviewDataUrlCache = new Map();
+
+function startSystemAttachmentDrag(targetPath, options = {}) {
+    const normalizedPath = String(targetPath || '').trim();
+    if (!normalizedPath) {
+        return false;
+    }
+
+    const dragPath = options.copyBeforeDrag
+        ? createDuplicateAttachmentPathForDrag(normalizedPath) || normalizedPath
+        : normalizedPath;
+
+    if (!dragPath) {
+        return false;
+    }
+
+    try {
+        return ipcRenderer.sendSync('attachment:startDrag', {
+            path: dragPath
+        }) === true;
+    } catch {
+        return false;
+    }
+}
+
+function copyFileForDragSync(sourcePath, targetPath) {
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.copyFileSync(sourcePath, targetPath);
+
+    try {
+        const sourceStat = fs.statSync(sourcePath);
+        fs.chmodSync(targetPath, sourceStat.mode);
+        fs.utimesSync(targetPath, sourceStat.atime, sourceStat.mtime);
+    } catch {
+        // ignore metadata preservation failures
+    }
+}
+
+function copyPathForDragSync(sourcePath, targetPath) {
+    const sourceStat = fs.statSync(sourcePath);
+
+    if (sourceStat.isDirectory()) {
+        fs.mkdirSync(targetPath, { recursive: true });
+        for (const entryName of fs.readdirSync(sourcePath)) {
+            const entrySourcePath = path.join(sourcePath, entryName);
+            const entryTargetPath = path.join(targetPath, entryName);
+            const entryStat = fs.lstatSync(entrySourcePath);
+            if (entryStat.isSymbolicLink()) {
+                continue;
+            }
+            if (entryStat.isDirectory()) {
+                copyPathForDragSync(entrySourcePath, entryTargetPath);
+                continue;
+            }
+            copyFileForDragSync(entrySourcePath, entryTargetPath);
+        }
+        return;
+    }
+
+    copyFileForDragSync(sourcePath, targetPath);
+}
+
+function createFinderStyleDuplicatePath(sourcePath) {
+    const normalizedPath = path.resolve(String(sourcePath || '').trim());
+    if (!normalizedPath || !fs.existsSync(normalizedPath)) {
+        return '';
+    }
+
+    const sourceStat = fs.statSync(normalizedPath);
+    const targetDir = path.dirname(normalizedPath);
+    const sourceName = path.basename(normalizedPath);
+    const parsed = path.parse(sourceName);
+    const baseName = parsed.name || sourceName || '复制';
+    const extension = sourceStat.isDirectory() ? '' : parsed.ext || '';
+
+    let candidateName = `${baseName} copy${extension}`;
+    let candidatePath = path.join(targetDir, candidateName);
+    let counter = 2;
+
+    while (fs.existsSync(candidatePath)) {
+        candidateName = `${baseName} copy ${counter++}${extension}`;
+        candidatePath = path.join(targetDir, candidateName);
+    }
+
+    return candidatePath;
+}
+
+function createDuplicateAttachmentPathForDrag(sourcePath) {
+    const normalizedPath = path.resolve(String(sourcePath || '').trim());
+    if (!normalizedPath || !fs.existsSync(normalizedPath)) {
+        return '';
+    }
+
+    try {
+        const targetPath = createFinderStyleDuplicatePath(normalizedPath);
+        if (!targetPath) {
+            return '';
+        }
+        copyPathForDragSync(normalizedPath, targetPath);
+        return targetPath;
+    } catch {
+        return '';
+    }
+}
 
 const KangarooLink = Link.extend({
     addOptions() {
@@ -88,9 +193,10 @@ const KangarooLink = Link.extend({
 const KangarooTaskItem = TaskItem.extend({
     addAttributes() {
         return {
-            ...(this.parent?.() || {}),
+            ...this.parent?.(),
             headingLevel: {
                 default: 0,
+                keepOnSplit: true,
                 parseHTML: (element) => clampNumber(Number(element.getAttribute('data-heading-level') || 0), 0, 6),
                 renderHTML: (attributes) => {
                     const level = clampNumber(Number(attributes?.headingLevel || 0), 0, 6);
@@ -98,15 +204,340 @@ const KangarooTaskItem = TaskItem.extend({
                 }
             }
         };
+    },
+
+    addKeyboardShortcuts() {
+        return this.parent?.() || {};
+    },
+
+    addNodeView() {
+        return ({ node, HTMLAttributes, getPos, editor }) => {
+            const listItem = document.createElement('li');
+            const checkboxWrapper = document.createElement('label');
+            const checkboxStyler = document.createElement('span');
+            const checkbox = document.createElement('input');
+            const content = document.createElement('div');
+
+            const applyTextSelection = (preferEnd = false) => {
+                if (typeof getPos !== 'function') {
+                    return false;
+                }
+
+                const position = getPos();
+                if (typeof position !== 'number') {
+                    return false;
+                }
+
+                const currentNode = editor.state.doc.nodeAt(position);
+                const firstTextblock = findFirstTextblockInNode(currentNode, position);
+                if (!firstTextblock?.node) {
+                    return false;
+                }
+
+                const targetPos = preferEnd
+                    ? Math.min(firstTextblock.pos + firstTextblock.node.content.size + 1, editor.state.doc.content.size)
+                    : Math.min(firstTextblock.pos + 1, editor.state.doc.content.size);
+
+                return editor.chain().focus(undefined, {
+                    scrollIntoView: false
+                }).setTextSelection(targetPos).run();
+            };
+
+            const insertTextIntoTask = (text) => {
+                if (!text) {
+                    return false;
+                }
+                const didFocus = applyTextSelection(false);
+                if (!didFocus) {
+                    return false;
+                }
+                return editor.chain().focus(undefined, {
+                    scrollIntoView: false
+                }).insertContent(text).run();
+            };
+
+            const syncA11y = (currentNode) => {
+                const checkboxLabel = this.options.a11y?.checkboxLabel?.(currentNode, checkbox.checked);
+                checkbox.ariaLabel = checkboxLabel || `Task item checkbox for ${currentNode.textContent || 'empty task item'}`;
+            };
+
+            const applyAttributes = (element, attributes = {}) => {
+                Object.entries(attributes).forEach(([key, value]) => {
+                    if (value === null || value === undefined) {
+                        element.removeAttribute(key);
+                        return;
+                    }
+                    element.setAttribute(key, String(value));
+                });
+            };
+
+            checkboxWrapper.contentEditable = 'false';
+            checkbox.type = 'checkbox';
+            checkbox.tabIndex = -1;
+            checkboxWrapper.setAttribute('data-task-checkbox-wrapper', '');
+            checkboxStyler.setAttribute('data-task-checkbox-styler', '');
+
+            checkbox.addEventListener('mousedown', (event) => {
+                event.preventDefault();
+            });
+            checkbox.addEventListener('click', () => {
+                window.requestAnimationFrame(() => {
+                    checkbox.blur();
+                    applyTextSelection(false);
+                });
+            });
+            checkbox.addEventListener('keydown', (event) => {
+                if (event.metaKey || event.ctrlKey || event.altKey) {
+                    return;
+                }
+
+                if (event.key === 'ArrowLeft' || event.key === 'Home') {
+                    event.preventDefault();
+                    applyTextSelection(false);
+                    return;
+                }
+
+                if (event.key === 'ArrowRight' || event.key === 'End') {
+                    event.preventDefault();
+                    applyTextSelection(true);
+                    return;
+                }
+
+                if (event.key === ' ' || event.key === 'Spacebar') {
+                    event.preventDefault();
+                    insertTextIntoTask(' ');
+                    return;
+                }
+
+                if (event.key.length === 1) {
+                    event.preventDefault();
+                    insertTextIntoTask(event.key);
+                }
+            });
+            checkbox.addEventListener('change', (event) => {
+                if (!editor.isEditable && !this.options.onReadOnlyChecked) {
+                    checkbox.checked = !checkbox.checked;
+                    return;
+                }
+
+                const { checked } = event.target;
+                if (editor.isEditable && typeof getPos === 'function') {
+                    editor.chain().focus(undefined, { scrollIntoView: false }).command(({ tr }) => {
+                        const position = getPos();
+                        if (typeof position !== 'number') {
+                            return false;
+                        }
+                        const currentNode = tr.doc.nodeAt(position);
+                        tr.setNodeMarkup(position, undefined, {
+                            ...currentNode?.attrs,
+                            checked
+                        });
+                        return true;
+                    }).run();
+
+                    const lineNumber = this.editor?.storage?.kangarooWysiwygInstance?.resolveLineFromPos?.(typeof getPos === 'function' ? getPos() : null) || null;
+                    const handler = this.editor?.storage?.kangarooWysiwygInstance?.taskInteractionHandlers?.onCheckedChange;
+                    if (typeof handler === 'function') {
+                        handler(node, checked, { lineNumber });
+                    }
+                }
+
+                if (!editor.isEditable && this.options.onReadOnlyChecked) {
+                    if (!this.options.onReadOnlyChecked(node, checked)) {
+                        checkbox.checked = !checkbox.checked;
+                    }
+                }
+
+                window.requestAnimationFrame(() => {
+                    checkbox.blur();
+                    applyTextSelection(false);
+                });
+            });
+
+            checkboxWrapper.addEventListener('mousedown', (event) => {
+                if (event.target === checkbox) {
+                    return;
+                }
+                event.preventDefault();
+                applyTextSelection(false);
+            });
+
+            applyAttributes(listItem, this.options.HTMLAttributes);
+            applyAttributes(listItem, HTMLAttributes);
+            listItem.dataset.checked = String(node.attrs.checked);
+            if (Number(node.attrs?.headingLevel || 0) > 0) {
+                listItem.dataset.headingLevel = String(node.attrs.headingLevel);
+                listItem.setAttribute('data-heading-level', String(node.attrs.headingLevel));
+            } else {
+                delete listItem.dataset.headingLevel;
+                listItem.removeAttribute('data-heading-level');
+            }
+            checkbox.checked = Boolean(node.attrs.checked);
+            syncA11y(node);
+
+            checkboxWrapper.append(checkbox, checkboxStyler);
+            listItem.append(checkboxWrapper, content);
+
+            let previousRenderedKeys = new Set(Object.keys(HTMLAttributes || {}));
+
+            return {
+                dom: listItem,
+                contentDOM: content,
+                update: (updatedNode) => {
+                    if (updatedNode.type !== this.type) {
+                        return false;
+                    }
+
+                    listItem.dataset.checked = String(updatedNode.attrs.checked);
+                    if (Number(updatedNode.attrs?.headingLevel || 0) > 0) {
+                        listItem.dataset.headingLevel = String(updatedNode.attrs.headingLevel);
+                        listItem.setAttribute('data-heading-level', String(updatedNode.attrs.headingLevel));
+                    } else {
+                        delete listItem.dataset.headingLevel;
+                        listItem.removeAttribute('data-heading-level');
+                    }
+                    checkbox.checked = Boolean(updatedNode.attrs.checked);
+                    syncA11y(updatedNode);
+
+                    const extensionAttributes = editor.extensionManager.attributes;
+                    const nextHTMLAttributes = getRenderedAttributes(updatedNode, extensionAttributes);
+                    const staticAttrs = this.options.HTMLAttributes || {};
+                    const nextKeys = new Set(Object.keys(nextHTMLAttributes));
+
+                    previousRenderedKeys.forEach((key) => {
+                        if (!nextKeys.has(key)) {
+                            if (key in staticAttrs) {
+                                listItem.setAttribute(key, String(staticAttrs[key]));
+                            } else {
+                                listItem.removeAttribute(key);
+                            }
+                        }
+                    });
+
+                    Object.entries(nextHTMLAttributes).forEach(([key, value]) => {
+                        if (value === null || value === undefined) {
+                            if (key in staticAttrs) {
+                                listItem.setAttribute(key, String(staticAttrs[key]));
+                            } else {
+                                listItem.removeAttribute(key);
+                            }
+                            return;
+                        }
+                        listItem.setAttribute(key, String(value));
+                    });
+
+                    previousRenderedKeys = nextKeys;
+                    return true;
+                }
+            };
+        };
+    },
+
+    renderMarkdown(node, h, ctx) {
+        const checkedChar = node.attrs?.checked ? 'x' : ' ';
+        const prefix = `- [${checkedChar}] `;
+        return renderNestedMarkdownContent(node, h, prefix, ctx);
     }
 });
 
+const KangarooHeadingKeyboardBehavior = Extension.create({
+    name: 'kangarooHeadingKeyboardBehavior',
+    priority: 1000,
+    addKeyboardShortcuts() {
+        return {
+            Enter: () => {
+                const { selection } = this.editor.state;
+                if (!selection?.empty) {
+                    return false;
+                }
+
+                const $from = selection.$from;
+                const parent = $from?.parent;
+                if (parent?.type?.name !== 'heading') {
+                    return false;
+                }
+
+                for (let depth = $from.depth; depth >= 0; depth--) {
+                    if ($from.node(depth)?.type?.name === 'taskItem') {
+                        return false;
+                    }
+                }
+
+                if ($from.parentOffset < parent.content.size) {
+                    return false;
+                }
+
+                const paragraphType = this.editor.state.schema.nodes.paragraph;
+                if (!paragraphType) {
+                    return false;
+                }
+
+                const insertPos = $from.after($from.depth);
+                const tr = this.editor.state.tr.insert(insertPos, paragraphType.create());
+                const selectionPos = Math.min(insertPos + 1, tr.doc.content.size);
+                tr.setSelection(Selection.near(tr.doc.resolve(selectionPos), 1));
+                this.editor.view.dispatch(tr.scrollIntoView());
+                return true;
+            }
+        };
+    }
+});
+
+function insertParagraphAfterSelectedNode(editor, nodeTypeName) {
+    const state = editor?.state;
+    const view = editor?.view;
+    const selection = state?.selection;
+    if (!state || !view || selection?.node?.type?.name !== nodeTypeName) {
+        return false;
+    }
+
+    const paragraphType = state.schema.nodes.paragraph;
+    if (!paragraphType) {
+        return false;
+    }
+
+    try {
+        if (selection.$from?.depth > 0 && selection.$from.parent?.isTextblock) {
+            const parent = selection.$from.parent;
+            const parentStart = selection.$from.before(selection.$from.depth);
+            const parentEnd = selection.$from.after(selection.$from.depth);
+            const contentStart = parentStart + 1;
+            const selectedEndOffset = Math.max(0, Math.min(selection.to - contentStart, parent.content.size));
+            const beforeContent = parent.content.cut(0, selectedEndOffset);
+            const afterContent = parent.content.cut(selectedEndOffset);
+            const beforeParagraph = parent.type.create(parent.attrs, beforeContent, parent.marks);
+            const replacementNodes = [beforeParagraph];
+
+            if (afterContent.size > 0) {
+                const afterParagraph = parent.type.create(parent.attrs, afterContent, parent.marks);
+                replacementNodes.push(afterParagraph);
+            } else {
+                replacementNodes.push(paragraphType.create());
+            }
+
+            const tr = state.tr.replaceWith(parentStart, parentEnd, replacementNodes);
+            const selectionPos = Math.min(parentStart + beforeParagraph.nodeSize + 1, tr.doc.content.size);
+            tr.setSelection(TextSelection.create(tr.doc, selectionPos));
+            view.dispatch(tr.scrollIntoView());
+            return true;
+        }
+
+        const tr = state.tr.insert(selection.to, paragraphType.create());
+        const selectionPos = Math.min(selection.to + 1, tr.doc.content.size);
+        tr.setSelection(TextSelection.create(tr.doc, selectionPos));
+        view.dispatch(tr.scrollIntoView());
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 const ResizableImage = Image.extend({
     inline() {
-        return true;
+        return false;
     },
     group() {
-        return 'inline';
+        return 'block';
     },
     addOptions() {
         return {
@@ -176,11 +607,12 @@ const ResizableImage = Image.extend({
             let startHeight = 0;
             let aspectRatio = 1;
 
-            const container = document.createElement('span');
+            const container = document.createElement('div');
             container.dataset.resizeContainer = '';
             container.dataset.node = this.name;
+            container.draggable = true;
 
-            const wrapper = document.createElement('span');
+            const wrapper = document.createElement('div');
             wrapper.dataset.resizeWrapper = '';
             wrapper.style.position = 'relative';
             wrapper.style.display = 'inline-block';
@@ -292,6 +724,62 @@ const ResizableImage = Image.extend({
                 applyNodeSelection(true);
             });
 
+            container.addEventListener('contextmenu', (event) => {
+                const instance = this.editor?.storage?.kangarooWysiwygInstance || null;
+                if (!instance) return;
+
+                const info = nodeViewApi.getInfo();
+                if (!info?.imagePath) {
+                    return;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                instance.selectImageNode(nodeViewApi);
+                const handler = instance.imageInteractionHandlers?.onContextMenu;
+                if (typeof handler === 'function') {
+                    handler(event, info);
+                }
+            }, true);
+
+            container.addEventListener('dragstart', (event) => {
+                const instance = this.editor?.storage?.kangarooWysiwygInstance || null;
+                const info = {
+                    pos: typeof getPos === 'function' ? getPos() : null,
+                    node: currentNode,
+                    nodeView: nodeViewApi,
+                    element: container,
+                    cardKind: 'image',
+                    absolutePath: resolvePreviewLinkTarget(currentNode?.attrs?.src || '')?.value || '',
+                    href: String(currentNode?.attrs?.src || '').trim(),
+                    text: String(currentNode?.attrs?.alt || '') || 'image'
+                };
+                if (!instance || !info.absolutePath) {
+                    return;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                event.dataTransfer?.clearData();
+                event.dataTransfer?.setData('text/plain', '');
+                if (event.dataTransfer) {
+                    event.dataTransfer.effectAllowed = 'copy';
+                    event.dataTransfer.dropEffect = 'copy';
+                }
+
+                instance.selectImageNode(nodeViewApi);
+                startSystemAttachmentDrag(info.absolutePath, {
+                    copyBeforeDrag: Boolean(event.altKey)
+                });
+            }, true);
+
+            container.addEventListener('dragend', (event) => {
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+            }, true);
+
             handle.addEventListener('mousedown', (event) => {
                 if (event.button !== 0) return;
                 event.preventDefault();
@@ -325,7 +813,26 @@ const ResizableImage = Image.extend({
                 getDom: () => container,
                 getImageElement: () => el,
                 getSourceSrc: () => String(currentNode?.attrs?.src || HTMLAttributes.src || ''),
-                getResolvedSrc: () => String(el.getAttribute('src') || '')
+                getResolvedSrc: () => String(el.getAttribute('src') || ''),
+                getInfo: () => {
+                    const sourceSrc = String(currentNode?.attrs?.src || HTMLAttributes.src || '');
+                    const resolvedSrc = String(el.getAttribute('src') || '');
+                    const absolutePath = resolvePreviewLinkTarget(sourceSrc)?.value || resolvePreviewLinkTarget(resolvedSrc)?.value || '';
+                    return {
+                        pos: typeof getPos === 'function' ? getPos() : null,
+                        node: currentNode,
+                        nodeView: nodeViewApi,
+                        element: container,
+                        cardKind: 'image',
+                        absolutePath,
+                        imagePath: absolutePath,
+                        sourceSrc,
+                        resolvedSrc,
+                        href: sourceSrc,
+                        text: String(currentNode?.attrs?.alt || '') || 'image',
+                        imageElement: el
+                    };
+                }
             };
 
             container.__kangarooImageNodeView = nodeViewApi;
@@ -347,7 +854,11 @@ const ResizableImage = Image.extend({
                     nodeViewApi.deselect();
                 },
                 stopEvent: (event) => {
-                    return event.target === handle;
+                    const target = getEventTargetElement(event?.target);
+                    if (target === handle) {
+                        return true;
+                    }
+                    return ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'dragstart', 'dragend', 'dragover', 'drop'].includes(event.type);
                 },
                 ignoreMutation: () => true,
                 destroy: () => {
@@ -378,6 +889,15 @@ const ResizableImage = Image.extend({
 });
 
 const KangarooImage = ResizableImage.extend({
+    inline() {
+        return false;
+    },
+    group() {
+        return 'block';
+    },
+    draggable: true,
+    selectable: true,
+    atom: true,
     addCommands() {
         const parentCommands = this.parent?.() || {};
         return {
@@ -408,11 +928,8 @@ const KangarooImage = ResizableImage.extend({
                 const commandChain = chain().focus(undefined, {
                     scrollIntoView: false
                 }).insertContent({
-                    type: 'paragraph',
-                    content: [{
-                        type: this.name,
-                        attrs
-                    }]
+                    type: this.name,
+                    attrs
                 });
 
                 if (insertTrailingParagraph) {
@@ -427,9 +944,10 @@ const KangarooImage = ResizableImage.extend({
 
 const KangarooAttachment = TiptapNode.create({
     name: 'kangarooAttachment',
-    inline: true,
-    group: 'inline',
+    inline: false,
+    group: 'block',
     atom: true,
+    draggable: true,
     selectable: true,
     defining: true,
     isolating: true,
@@ -463,7 +981,7 @@ const KangarooAttachment = TiptapNode.create({
     parseHTML() {
         return [
             {
-                tag: 'span[data-kangaroo-attachment]',
+                tag: 'div[data-kangaroo-attachment], span[data-kangaroo-attachment]',
                 getAttrs: (element) => {
                     const href = String(element.getAttribute('data-href') || '').trim();
                     const label = String(element.getAttribute('data-label') || element.textContent || '').trim();
@@ -487,7 +1005,7 @@ const KangarooAttachment = TiptapNode.create({
             ? this.options.resolveDisplayMeta(href)
             : getLinkDisplayMeta(href);
 
-        return ['span', mergeAttributes(HTMLAttributes, {
+        return ['div', mergeAttributes(HTMLAttributes, {
             'data-kangaroo-attachment': '',
             'data-href': href,
             'data-label': label,
@@ -496,8 +1014,8 @@ const KangarooAttachment = TiptapNode.create({
             title: stripAttachmentIdentityFromTitle(HTMLAttributes?.title || null) || displayMeta.title || href || '',
             class: `kangaroo-attachment-card kangaroo-attachment-${displayMeta.kind || 'attachment-file'}`
         }),
-            ['span', { 'data-kangaroo-attachment-wrapper': '', class: 'kangaroo-attachment-shell' },
-                ['span', { class: 'kangaroo-attachment-inner' },
+            ['div', { class: 'kangaroo-attachment-shell', 'data-kangaroo-attachment-shell': '' },
+                ['div', { class: 'kangaroo-attachment-header', 'data-kangaroo-attachment-header': '' },
                     ['span', { class: 'kangaroo-attachment-icon', 'aria-hidden': 'true' }, displayMeta.icon || '📄'],
                     ['span', { class: 'kangaroo-attachment-label' }, label],
                     ['span', { class: 'kangaroo-attachment-badge', 'aria-hidden': 'true' }, displayMeta.badge || '文件']
@@ -532,7 +1050,6 @@ const KangarooAttachment = TiptapNode.create({
                 const title = options.title || null;
                 const identity = options.identity || null;
                 const { insertTrailingParagraph = true } = options;
-
                 const commandChain = chain().focus(undefined, {
                     scrollIntoView: false
                 }).insertContent({
@@ -556,19 +1073,20 @@ const KangarooAttachment = TiptapNode.create({
 
     addNodeView() {
         return ({ node, getPos }) => {
-            const container = document.createElement('span');
+            const container = document.createElement('div');
             container.dataset.kangarooAttachment = '';
             container.contentEditable = 'false';
-            container.draggable = false;
+            container.draggable = true;
 
-            const wrapper = document.createElement('span');
-            wrapper.dataset.kangarooAttachmentWrapper = '';
-            wrapper.contentEditable = 'false';
-            wrapper.className = 'kangaroo-attachment-shell';
+            const shell = document.createElement('div');
+            shell.className = 'kangaroo-attachment-shell';
+            shell.dataset.kangarooAttachmentShell = '';
+            shell.contentEditable = 'false';
 
-            const inner = document.createElement('span');
-            inner.className = 'kangaroo-attachment-inner';
-            inner.contentEditable = 'false';
+            const header = document.createElement('div');
+            header.className = 'kangaroo-attachment-header';
+            header.dataset.kangarooAttachmentHeader = '';
+            header.contentEditable = 'false';
 
             const icon = document.createElement('span');
             icon.className = 'kangaroo-attachment-icon';
@@ -584,11 +1102,11 @@ const KangarooAttachment = TiptapNode.create({
             badge.setAttribute('aria-hidden', 'true');
             badge.contentEditable = 'false';
 
-            inner.appendChild(icon);
-            inner.appendChild(label);
-            inner.appendChild(badge);
-            wrapper.appendChild(inner);
-            container.appendChild(wrapper);
+            header.appendChild(icon);
+            header.appendChild(label);
+            header.appendChild(badge);
+            shell.appendChild(header);
+            container.appendChild(shell);
 
             const syncNodeState = (updatedNode = node) => {
                 const href = String(updatedNode.attrs?.href || '').trim();
@@ -596,12 +1114,13 @@ const KangarooAttachment = TiptapNode.create({
                 const displayMeta = this.options.resolveDisplayMeta
                     ? this.options.resolveDisplayMeta(href)
                     : getLinkDisplayMeta(href);
+                const fallbackAbsolutePath = resolvePreviewLinkTarget(href)?.value || '';
 
                 container.className = `kangaroo-attachment-card kangaroo-attachment-${displayMeta.kind || 'attachment-file'}`;
                 container.setAttribute('data-href', href);
                 container.setAttribute('data-label', displayLabel);
                 container.setAttribute('data-link-kind', displayMeta.kind || 'attachment-file');
-                container.setAttribute('data-kangaroo-path', displayMeta.absolutePath || '');
+                container.setAttribute('data-kangaroo-path', displayMeta.absolutePath || fallbackAbsolutePath || '');
                 container.setAttribute('title', stripAttachmentIdentityFromTitle(updatedNode.attrs?.title || null) || displayMeta.title || href || '');
 
                 icon.textContent = displayMeta.icon || '📄';
@@ -615,8 +1134,17 @@ const KangarooAttachment = TiptapNode.create({
                     if (updatedNode.type.name !== this.name) {
                         return false;
                     }
+                    const attrsChanged = (
+                        String(updatedNode.attrs?.href || '') !== String(node.attrs?.href || '')
+                        || String(updatedNode.attrs?.label || '') !== String(node.attrs?.label || '')
+                        || String(updatedNode.attrs?.title || '') !== String(node.attrs?.title || '')
+                        || String(updatedNode.attrs?.identity || '') !== String(node.attrs?.identity || '')
+                        || clampPdfPreviewWidth(updatedNode.attrs?.width) !== clampPdfPreviewWidth(node.attrs?.width)
+                    );
                     node = updatedNode;
-                    syncNodeState(updatedNode);
+                    if (attrsChanged) {
+                        syncNodeState(updatedNode);
+                    }
                     return true;
                 },
                 selectNode: () => {
@@ -655,7 +1183,7 @@ const KangarooAttachment = TiptapNode.create({
 
             const getInstance = () => this.editor?.storage?.kangarooWysiwygInstance || null;
 
-            container.addEventListener('mousedown', (event) => {
+            container.addEventListener('click', (event) => {
                 if (event.button !== 0) return;
                 const instance = getInstance();
                 if (!instance || instance.shouldSuppressClickSelection?.()) {
@@ -699,6 +1227,37 @@ const KangarooAttachment = TiptapNode.create({
                 }
             }, true);
 
+            container.addEventListener('dragstart', (event) => {
+                const instance = getInstance();
+                if (!instance) return;
+
+                const info = nodeViewApi.getInfo();
+                const dragPath = info?.absolutePath || '';
+                if (!dragPath) {
+                    return;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                event.dataTransfer?.clearData();
+                event.dataTransfer?.setData('text/plain', '');
+                if (event.dataTransfer) {
+                    event.dataTransfer.effectAllowed = 'copy';
+                    event.dataTransfer.dropEffect = 'copy';
+                }
+
+                instance.selectAttachmentNode(nodeViewApi);
+                startSystemAttachmentDrag(dragPath, {
+                    copyBeforeDrag: Boolean(event.altKey)
+                });
+            }, true);
+
+            container.addEventListener('dragend', (event) => {
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+            }, true);
+
             return {
                 ...nodeViewApi,
                 stopEvent: (event) => {
@@ -709,8 +1268,7 @@ const KangarooAttachment = TiptapNode.create({
                     if (!target?.closest?.('[data-kangaroo-attachment]')) {
                         return false;
                     }
-
-                    return ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu'].includes(event.type);
+                    return ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'dragstart', 'dragend', 'dragover', 'drop'].includes(event.type);
                 },
                 destroy: () => {
                     delete container.__kangarooAttachmentNodeView;
@@ -740,9 +1298,10 @@ const KangarooAttachment = TiptapNode.create({
 
 const KangarooVideo = TiptapNode.create({
     name: 'kangarooVideo',
-    inline: true,
-    group: 'inline',
+    inline: false,
+    group: 'block',
     atom: true,
+    draggable: true,
     selectable: true,
     defining: true,
     isolating: true,
@@ -777,7 +1336,7 @@ const KangarooVideo = TiptapNode.create({
     parseHTML() {
         return [
             {
-                tag: 'span[data-kangaroo-video]',
+                tag: 'div[data-kangaroo-video], span[data-kangaroo-video]',
                 getAttrs: (element) => {
                     const href = String(element.getAttribute('data-href') || '').trim();
                     const label = String(element.getAttribute('data-label') || '').trim();
@@ -806,7 +1365,7 @@ const KangarooVideo = TiptapNode.create({
             : href;
         const markdownTitle = mergeAttachmentIdentityIntoTitle(HTMLAttributes?.title || null, HTMLAttributes?.identity || null);
 
-        return ['span', mergeAttributes(HTMLAttributes, {
+        return ['div', mergeAttributes(HTMLAttributes, {
             'data-kangaroo-video': '',
             'data-href': href,
             'data-label': label,
@@ -815,13 +1374,13 @@ const KangarooVideo = TiptapNode.create({
             title: stripAttachmentIdentityFromTitle(markdownTitle) || displayMeta.title || href || '',
             class: `kangaroo-video-card kangaroo-video-${displayMeta.kind || 'attachment-video'}`
         }),
-            ['span', { class: 'kangaroo-video-shell', 'data-kangaroo-video-shell': '' },
-                ['span', { class: 'kangaroo-video-header', 'data-kangaroo-video-header': '' },
+            ['div', { class: 'kangaroo-video-shell', 'data-kangaroo-video-shell': '' },
+                ['div', { class: 'kangaroo-video-header', 'data-kangaroo-video-header': '' },
                     ['span', { class: 'kangaroo-video-icon', 'aria-hidden': 'true' }, displayMeta.icon || '🎬'],
                     ['span', { class: 'kangaroo-video-label' }, label],
                     ['span', { class: 'kangaroo-video-badge', 'aria-hidden': 'true' }, displayMeta.badge || '视频']
                 ],
-                ['span', { class: 'kangaroo-video-player', 'data-kangaroo-video-player': '' },
+                ['div', { class: 'kangaroo-video-player', 'data-kangaroo-video-player': '' },
                     ['video', {
                         controls: 'true',
                         preload: 'metadata',
@@ -883,16 +1442,16 @@ const KangarooVideo = TiptapNode.create({
 
     addNodeView() {
         return ({ node, getPos }) => {
-            const container = document.createElement('span');
+            const container = document.createElement('div');
             container.dataset.kangarooVideo = '';
             container.contentEditable = 'false';
-            container.draggable = false;
+            container.draggable = true;
 
-            const shell = document.createElement('span');
+            const shell = document.createElement('div');
             shell.className = 'kangaroo-video-shell';
             shell.dataset.kangarooVideoShell = '';
 
-            const header = document.createElement('span');
+            const header = document.createElement('div');
             header.className = 'kangaroo-video-header';
             header.dataset.kangarooVideoHeader = '';
             header.contentEditable = 'false';
@@ -911,7 +1470,7 @@ const KangarooVideo = TiptapNode.create({
             badge.setAttribute('aria-hidden', 'true');
             badge.contentEditable = 'false';
 
-            const player = document.createElement('span');
+            const player = document.createElement('div');
             player.className = 'kangaroo-video-player';
             player.dataset.kangarooVideoPlayer = '';
             player.contentEditable = 'false';
@@ -941,12 +1500,13 @@ const KangarooVideo = TiptapNode.create({
                 const resolvedSrc = this.options.resolveSrc
                     ? this.options.resolveSrc(href)
                     : href;
+                const fallbackAbsolutePath = resolvePreviewLinkTarget(href)?.value || '';
 
                 container.className = `kangaroo-video-card kangaroo-video-${displayMeta.kind || 'attachment-video'}`;
                 container.setAttribute('data-href', href);
                 container.setAttribute('data-label', displayLabel);
                 container.setAttribute('data-link-kind', displayMeta.kind || 'attachment-video');
-                container.setAttribute('data-kangaroo-path', displayMeta.absolutePath || '');
+                container.setAttribute('data-kangaroo-path', displayMeta.absolutePath || fallbackAbsolutePath || '');
                 container.setAttribute('title', stripAttachmentIdentityFromTitle(updatedNode.attrs?.title || null) || displayMeta.title || href || '');
 
                 icon.textContent = displayMeta.icon || '🎬';
@@ -1006,7 +1566,7 @@ const KangarooVideo = TiptapNode.create({
 
             const getInstance = () => this.editor?.storage?.kangarooWysiwygInstance || null;
 
-            container.addEventListener('mousedown', (event) => {
+            container.addEventListener('click', (event) => {
                 if (event.button !== 0) return;
                 const instance = getInstance();
                 if (!instance || instance.shouldSuppressClickSelection?.()) {
@@ -1067,7 +1627,7 @@ const KangarooVideo = TiptapNode.create({
                         return true;
                     }
 
-                    return ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu'].includes(event.type);
+                    return ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'dragstart', 'dragend', 'dragover', 'drop'].includes(event.type);
                 },
                 destroy: () => {
                     delete container.__kangarooVideoNodeView;
@@ -1113,28 +1673,31 @@ const KangarooMarkdownPasteBehavior = Extension.create({
                         }
 
                         const hasFiles = Array.from(clipboardData.files || []).length > 0;
-                        const hasHtml = Boolean(clipboardData.getData('text/html'));
+                        const rawMarkdown = String(clipboardData.getData('text/markdown') || '');
                         const rawText = String(clipboardData.getData('text/plain') || '');
+                        const markdownCandidate = rawMarkdown || rawText;
 
-                        if (hasFiles || hasHtml || !rawText.trim()) {
+                        if (hasFiles || !markdownCandidate.trim()) {
                             return false;
                         }
 
-                        if (!shouldInterpretPastedTextAsMarkdown(rawText)) {
+                        if (!shouldInterpretPastedTextAsMarkdown(markdownCandidate)) {
                             return false;
                         }
 
-                        event.preventDefault();
-                        instance.editor.chain().focus(undefined, {
-                            scrollIntoView: false
-                        }).insertContent(normalizePastedMarkdown(rawText), {
-                            contentType: 'markdown'
-                        }).run();
-                        instance.normalizeTaskHeadingNodesFromText();
-                        instance.syncMarkdown();
-                        instance.refreshLineMap?.();
-                        instance.emitChange?.();
-                        return true;
+                        const didInsertMarkdown = instance.insertMarkdown?.(markdownCandidate);
+                        if (didInsertMarkdown) {
+                            event.preventDefault();
+                            return true;
+                        }
+
+                        const didInsertPlainText = instance.insertText?.(markdownCandidate);
+                        if (didInsertPlainText !== false) {
+                            event.preventDefault();
+                            return true;
+                        }
+
+                        return false;
                     }
                 }
             })
@@ -1144,6 +1707,47 @@ const KangarooMarkdownPasteBehavior = Extension.create({
 
 const KangarooAssetKeyboardBehavior = Extension.create({
     name: 'kangarooAssetKeyboardBehavior',
+    addProseMirrorPlugins() {
+        const isAssetNodeType = (typeName) => (
+            typeName === 'image'
+            || typeName === 'kangarooAttachment'
+            || typeName === 'kangarooVideo'
+            || typeName === 'kangarooPdf'
+        );
+
+        return [
+            new Plugin({
+                props: {
+                    handleDOMEvents: {
+                        keydown: (view, event) => {
+                            if (event.defaultPrevented) return false;
+                            if (event.metaKey || event.ctrlKey || event.altKey) return false;
+
+                            const isSpaceKey = event.key === ' ' || event.key === 'Spacebar' || event.code === 'Space';
+                            if (!isSpaceKey) return false;
+
+                            const instance = this.editor?.storage?.kangarooWysiwygInstance || null;
+                            const hasSelectedAssetView = Boolean(
+                                instance?.selectedImageNodeView
+                                || instance?.selectedPdfNodeView
+                                || instance?.selectedVideoNodeView
+                                || instance?.selectedAttachmentNodeView
+                            );
+                            const selectedNodeType = String(this.editor?.state?.selection?.node?.type?.name || '');
+                            if (!hasSelectedAssetView && !isAssetNodeType(selectedNodeType)) {
+                                return false;
+                            }
+
+                            event.preventDefault();
+                            event.stopPropagation();
+                            event.stopImmediatePropagation?.();
+                            return true;
+                        }
+                    }
+                }
+            })
+        ];
+    },
     addKeyboardShortcuts() {
         const getInstance = () => this.editor?.storage?.kangarooWysiwygInstance || null;
 
@@ -1151,6 +1755,10 @@ const KangarooAssetKeyboardBehavior = Extension.create({
             Backspace: () => {
                 const instance = getInstance();
                 if (!instance) return false;
+
+                if (instance.deleteCurrentEmptyParagraphNearImage()) {
+                    return true;
+                }
 
                 if (instance.preventImageBackspaceFromTrailingEmptyLine()) {
                     return true;
@@ -1203,99 +1811,16 @@ const KangarooAssetKeyboardBehavior = Extension.create({
                 }
 
                 return false;
+            },
+            Enter: () => {
+                const instance = getInstance();
+                if (instance?.selectedImageNodeView) {
+                    return instance.insertParagraphAfterSelectedImageNode();
+                }
+
+                return insertParagraphAfterSelectedNode(this.editor, 'image');
             }
         };
-    }
-});
-
-const KangarooAttachmentClickBehavior = Extension.create({
-    name: 'kangarooAttachmentClickBehavior',
-    addProseMirrorPlugins() {
-        return [
-            new Plugin({
-                props: {
-                    handleClick: (view, pos, event) => {
-                        if (event.button !== 0) {
-                            return false;
-                        }
-
-                        const instance = this.editor?.storage?.kangarooWysiwygInstance;
-                        if (!instance || instance.shouldSuppressClickSelection?.()) {
-                            return false;
-                        }
-
-                        const targetElement = getEventTargetElement(event.target);
-                        if (targetElement?.closest?.('[data-resize-handle]')) {
-                            return false;
-                        }
-
-                        const selection = window.getSelection?.();
-                        if (selection && String(selection).trim()) {
-                            return false;
-                        }
-
-                        const attachmentInfo = instance.getAttachmentInfoAtPoint(event.clientX, event.clientY);
-                        if (!attachmentInfo) {
-                            return false;
-                        }
-
-                        event.preventDefault();
-                        instance.selectAttachment(attachmentInfo);
-                        return true;
-                    }
-                }
-            })
-        ];
-    }
-});
-
-const KangarooAttachmentInteractionBehavior = Extension.create({
-    name: 'kangarooAttachmentInteractionBehavior',
-    addProseMirrorPlugins() {
-        const getAttachmentInfoAtEvent = (event) => {
-            const instance = this.editor?.storage?.kangarooWysiwygInstance;
-            if (!instance) return null;
-
-            const attachmentInfo = instance.getAttachmentInfoAtPoint(event.clientX, event.clientY);
-            if (!attachmentInfo) return null;
-
-            return { instance, attachmentInfo };
-        };
-
-        return [
-            new Plugin({
-                props: {
-                    handleDOMEvents: {
-                        dblclick: (view, event) => {
-                            const info = getAttachmentInfoAtEvent(event);
-                            if (!info) return false;
-
-                            event.preventDefault();
-                            event.stopPropagation();
-                            info.instance.selectAttachment(info.attachmentInfo);
-                            const handler = info.instance.attachmentInteractionHandlers?.onOpen;
-                            if (typeof handler === 'function') {
-                                handler(info.attachmentInfo);
-                            }
-                            return true;
-                        },
-                        contextmenu: (view, event) => {
-                            const info = getAttachmentInfoAtEvent(event);
-                            if (!info) return false;
-
-                            event.preventDefault();
-                            event.stopPropagation();
-                            info.instance.selectAttachment(info.attachmentInfo);
-                            const handler = info.instance.attachmentInteractionHandlers?.onContextMenu;
-                            if (typeof handler === 'function') {
-                                handler(event, info.attachmentInfo);
-                            }
-                            return true;
-                        }
-                    }
-                }
-            })
-        ];
     }
 });
 
@@ -1535,9 +2060,10 @@ const KangarooVideoDisplayBehavior = Extension.create({
 
 const KangarooPdf = TiptapNode.create({
     name: 'kangarooPdf',
-    inline: true,
-    group: 'inline',
+    inline: false,
+    group: 'block',
     atom: true,
+    draggable: true,
     selectable: true,
     defining: true,
     isolating: true,
@@ -1572,7 +2098,7 @@ const KangarooPdf = TiptapNode.create({
     parseHTML() {
         return [
             {
-                tag: 'span[data-kangaroo-pdf]',
+                tag: 'div[data-kangaroo-pdf], span[data-kangaroo-pdf]',
                 getAttrs: (element) => {
                     const href = String(element.getAttribute('data-href') || '').trim();
                     const label = String(element.getAttribute('data-label') || '').trim();
@@ -1605,7 +2131,7 @@ const KangarooPdf = TiptapNode.create({
             width
         );
 
-        return ['span', mergeAttributes(HTMLAttributes, {
+        return ['div', mergeAttributes(HTMLAttributes, {
             'data-kangaroo-pdf': '',
             'data-href': href,
             'data-label': label,
@@ -1615,13 +2141,13 @@ const KangarooPdf = TiptapNode.create({
             style: `--kangaroo-pdf-width:${width}px;`,
             class: `kangaroo-pdf-card kangaroo-pdf-${displayMeta.kind || 'attachment-pdf'}`
         }),
-            ['span', { class: 'kangaroo-pdf-shell', 'data-kangaroo-pdf-shell': '' },
-                ['span', { class: 'kangaroo-pdf-header', 'data-kangaroo-pdf-header': '' },
+            ['div', { class: 'kangaroo-pdf-shell', 'data-kangaroo-pdf-shell': '' },
+                ['div', { class: 'kangaroo-pdf-header', 'data-kangaroo-pdf-header': '' },
                     ['span', { class: 'kangaroo-pdf-icon', 'aria-hidden': 'true' }, displayMeta.icon || '📕'],
                     ['span', { class: 'kangaroo-pdf-label' }, label],
                     ['span', { class: 'kangaroo-pdf-badge', 'aria-hidden': 'true' }, displayMeta.badge || 'PDF']
                 ],
-                ['span', { class: 'kangaroo-pdf-viewer', 'data-kangaroo-pdf-viewer': '' },
+                ['div', { class: 'kangaroo-pdf-viewer', 'data-kangaroo-pdf-viewer': '' },
                     ['img', {
                         src: '',
                         alt: label,
@@ -1690,16 +2216,16 @@ const KangarooPdf = TiptapNode.create({
 
     addNodeView() {
         return ({ node, getPos }) => {
-            const container = document.createElement('span');
+            const container = document.createElement('div');
             container.dataset.kangarooPdf = '';
             container.contentEditable = 'false';
-            container.draggable = false;
+            container.draggable = true;
 
-            const shell = document.createElement('span');
+            const shell = document.createElement('div');
             shell.className = 'kangaroo-pdf-shell';
             shell.dataset.kangarooPdfShell = '';
 
-            const header = document.createElement('span');
+            const header = document.createElement('div');
             header.className = 'kangaroo-pdf-header';
             header.dataset.kangarooPdfHeader = '';
             header.contentEditable = 'false';
@@ -1718,7 +2244,7 @@ const KangarooPdf = TiptapNode.create({
             badge.setAttribute('aria-hidden', 'true');
             badge.contentEditable = 'false';
 
-            const viewer = document.createElement('span');
+            const viewer = document.createElement('div');
             viewer.className = 'kangaroo-pdf-viewer';
             viewer.dataset.kangarooPdfViewer = '';
             viewer.contentEditable = 'false';
@@ -1788,12 +2314,13 @@ const KangarooPdf = TiptapNode.create({
                 const resolvedSrc = this.options.resolveSrc
                     ? this.options.resolveSrc(href)
                     : href;
+                const fallbackAbsolutePath = resolvePreviewLinkTarget(href)?.value || '';
 
                 container.className = `kangaroo-pdf-card kangaroo-pdf-${displayMeta.kind || 'attachment-pdf'}`;
                 container.setAttribute('data-href', href);
                 container.setAttribute('data-label', displayLabel);
                 container.setAttribute('data-link-kind', displayMeta.kind || 'attachment-pdf');
-                container.setAttribute('data-kangaroo-path', displayMeta.absolutePath || '');
+                container.setAttribute('data-kangaroo-path', displayMeta.absolutePath || fallbackAbsolutePath || '');
                 container.setAttribute('title', stripAttachmentIdentityFromTitle(stripPdfWidthFromTitle(updatedNode.attrs?.title || null)) || displayMeta.title || href || '');
                 container.style.setProperty('--kangaroo-pdf-width', `${width}px`);
                 container.style.width = `${width}px`;
@@ -1899,7 +2426,7 @@ const KangarooPdf = TiptapNode.create({
                 }
             };
 
-            container.addEventListener('mousedown', (event) => {
+            container.addEventListener('click', (event) => {
                 if (event.button !== 0) return;
                 const instance = getInstance();
                 if (!instance || instance.shouldSuppressClickSelection?.()) {
@@ -1945,6 +2472,37 @@ const KangarooPdf = TiptapNode.create({
                 if (typeof handler === 'function') {
                     handler(event, nodeViewApi.getInfo());
                 }
+            }, true);
+
+            container.addEventListener('dragstart', (event) => {
+                const instance = getInstance();
+                if (!instance) return;
+
+                const info = nodeViewApi.getInfo();
+                const dragPath = info?.absolutePath || '';
+                if (!dragPath) {
+                    return;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                event.dataTransfer?.clearData();
+                event.dataTransfer?.setData('text/plain', '');
+                if (event.dataTransfer) {
+                    event.dataTransfer.effectAllowed = 'copy';
+                    event.dataTransfer.dropEffect = 'copy';
+                }
+
+                instance.selectPdfNode(nodeViewApi);
+                startSystemAttachmentDrag(dragPath, {
+                    copyBeforeDrag: Boolean(event.altKey)
+                });
+            }, true);
+
+            container.addEventListener('dragend', (event) => {
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
             }, true);
 
             resizeHandle.addEventListener('mousedown', (event) => {
@@ -1996,7 +2554,7 @@ const KangarooPdf = TiptapNode.create({
                         return true;
                     }
 
-                    return ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu'].includes(event.type);
+                    return ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'dragstart', 'dragend', 'dragover', 'drop'].includes(event.type);
                 },
                 destroy: () => {
                     delete container.__kangarooPdfNodeView;
@@ -2125,6 +2683,8 @@ class KangarooWysiwygEditor {
         this.lineBlocks = [];
         this.activeHighlightElement = null;
         this.clearHighlightTimer = null;
+        this.lineMapRefreshTimer = null;
+        this.rangeSelectionHighlightFrame = null;
         this.isApplyingExternalUpdate = false;
         this.currentMarkdown = normalizeMarkdown(initialMarkdown);
         this.bundlePath = null;
@@ -2152,6 +2712,9 @@ class KangarooWysiwygEditor {
         };
         this.deleteInteractionHandlers = {
             onBeforeDelete: null
+        };
+        this.taskInteractionHandlers = {
+            onCheckedChange: null
         };
         this.pointerInteraction = {
             active: false,
@@ -2188,7 +2751,7 @@ class KangarooWysiwygEditor {
 
         this.editor = new Editor({
             element: this.root,
-            content: this.currentMarkdown,
+            content: prepareMarkdownForEditorParsing(this.currentMarkdown),
             contentType: 'markdown',
             autofocus: false,
             extensions: [
@@ -2198,6 +2761,7 @@ class KangarooWysiwygEditor {
                 Underline,
                 KangarooMarkdownPasteBehavior,
                 KangarooAssetKeyboardBehavior,
+                KangarooHeadingKeyboardBehavior,
                 KangarooLinkDisplayBehavior,
                 KangarooLinkNormalizationBehavior,
                 KangarooImageDisplayBehavior,
@@ -2240,6 +2804,10 @@ class KangarooWysiwygEditor {
                 attributes: {
                     class: 'kangaroo-prosemirror'
                 }
+                ,
+                clipboardTextSerializer: (slice) => serializeClipboardSliceToMarkdown(this, slice, {
+                    stripTaskTimestamps: true
+                })
             },
             onCreate: () => {
                 this.normalizeTaskHeadingNodesFromText();
@@ -2248,22 +2816,32 @@ class KangarooWysiwygEditor {
                 this.refreshRangeSelectionHighlights();
             },
             onSelectionUpdate: () => {
-                this.refreshLineMap();
+                this.scheduleRefreshLineMap();
                 this.syncSelectedLinkWithSelection();
-                this.refreshRangeSelectionHighlights();
+                this.scheduleRefreshRangeSelectionHighlights();
             },
             onUpdate: () => {
                 if (this.isApplyingExternalUpdate) return;
                 if (this.normalizeTaskHeadingNodesFromText()) {
                     return;
                 }
-                this.syncMarkdown();
-                this.refreshLineMap();
-                this.refreshRangeSelectionHighlights();
+
+                const nextMarkdown = stripTaskCompletionTimestampsFromMarkdown(applyTaskHeadingLevelsToMarkdown(
+                    normalizeMarkdown(this.editor.getMarkdown()),
+                    this.collectTaskHeadingLevels()
+                ));
+                if (nextMarkdown === this.currentMarkdown) {
+                    return;
+                }
+
+                this.currentMarkdown = nextMarkdown;
+                this.scheduleRefreshLineMap();
+                this.scheduleRefreshRangeSelectionHighlights();
                 this.emitChange();
             }
         });
         this.editor.storage.kangarooWysiwygInstance = this;
+        this.editor.kangarooTaskInteractionHandlers = this.taskInteractionHandlers;
 
         this.syncMarkdown();
         this.refreshLineMap();
@@ -2329,6 +2907,14 @@ class KangarooWysiwygEditor {
             window.clearTimeout(this.clearHighlightTimer);
             this.clearHighlightTimer = null;
         }
+        if (this.lineMapRefreshTimer) {
+            window.clearTimeout(this.lineMapRefreshTimer);
+            this.lineMapRefreshTimer = null;
+        }
+        if (this.rangeSelectionHighlightFrame) {
+            window.cancelAnimationFrame(this.rangeSelectionHighlightFrame);
+            this.rangeSelectionHighlightFrame = null;
+        }
 
         this.clearSelectedImageNode();
         this.clearSelectedPdfNode();
@@ -2344,7 +2930,7 @@ class KangarooWysiwygEditor {
 
     getLiveMarkdownSnapshot() {
         try {
-            return normalizeMarkdown(this.editor?.getMarkdown?.() || this.currentMarkdown);
+            return this.currentMarkdown;
         } catch {
             return this.currentMarkdown;
         }
@@ -2379,8 +2965,50 @@ class KangarooWysiwygEditor {
     }
 
     setValue(markdown, options = {}) {
-        const { emitChange = false } = options;
-        this.currentMarkdown = normalizeMarkdown(markdown);
+        const {
+            emitChange = false,
+            preserveSelection = false,
+            preserveViewport = false,
+            forceRebuild = false
+        } = options;
+        const nextMarkdown = stripTaskCompletionTimestampsFromMarkdown(normalizeMarkdown(markdown));
+        const liveMarkdown = normalizeMarkdown(this.editor?.getMarkdown?.() || '');
+        const selectionSnapshot = preserveSelection
+            ? {
+                from: this.editor?.state?.selection?.from ?? 1,
+                to: this.editor?.state?.selection?.to ?? 1
+            }
+            : null;
+        const viewportSnapshot = preserveViewport && this.host
+            ? {
+                top: this.host.scrollTop,
+                left: this.host.scrollLeft
+            }
+            : null;
+
+        if (!forceRebuild && nextMarkdown === this.currentMarkdown && liveMarkdown === this.currentMarkdown) {
+            this.clearSelectedImageNode();
+            this.clearSelectedPdfNode();
+            this.clearSelectedVideoNode();
+            this.clearSelectedAttachmentNode();
+            this.clearSelectedLink();
+            clearBrowserSelection();
+            if (selectionSnapshot) {
+                this.restoreSelectionSnapshot(selectionSnapshot, { scrollIntoView: false });
+            } else {
+                resetEditorSelectionToDocumentStart(this.editor);
+            }
+            if (viewportSnapshot) {
+                this.host.scrollTop = viewportSnapshot.top;
+                this.host.scrollLeft = viewportSnapshot.left;
+            }
+            if (emitChange) {
+                this.emitChange();
+            }
+            return;
+        }
+
+        this.currentMarkdown = nextMarkdown;
         this.clearSelectedImageNode();
         this.clearSelectedPdfNode();
         this.clearSelectedVideoNode();
@@ -2388,7 +3016,7 @@ class KangarooWysiwygEditor {
         this.clearSelectedLink();
         clearBrowserSelection();
         this.isApplyingExternalUpdate = true;
-        this.editor.commands.setContent(this.currentMarkdown, {
+        this.editor.commands.setContent(prepareMarkdownForEditorParsing(this.currentMarkdown), {
             contentType: 'markdown',
             emitUpdate: false
         });
@@ -2403,7 +3031,15 @@ class KangarooWysiwygEditor {
         if (didRepair || didNormalizeAttachment || didNormalizePdf || didNormalizeVideo) {
             this.syncMarkdown();
         }
-        resetEditorSelectionToDocumentStart(this.editor);
+        if (selectionSnapshot) {
+            this.restoreSelectionSnapshot(selectionSnapshot, { scrollIntoView: false });
+        } else {
+            resetEditorSelectionToDocumentStart(this.editor);
+        }
+        if (viewportSnapshot) {
+            this.host.scrollTop = viewportSnapshot.top;
+            this.host.scrollLeft = viewportSnapshot.left;
+        }
         this.refreshLineMap();
         this.refreshLinkDomState();
         this.refreshAttachmentNodeLabels();
@@ -2415,6 +3051,11 @@ class KangarooWysiwygEditor {
     }
 
     refreshDisplayState() {
+        const liveMarkdown = normalizeMarkdown(this.editor?.getMarkdown?.() || '');
+        if (liveMarkdown === this.currentMarkdown) {
+            return false;
+        }
+
         const selection = {
             from: this.editor.state.selection.from,
             to: this.editor.state.selection.to
@@ -2480,27 +3121,56 @@ class KangarooWysiwygEditor {
             return false;
         }
 
+        let isDirectoryRename = false;
+        try {
+            isDirectoryRename = fs.existsSync(previousAbsolutePath) && fs.statSync(previousAbsolutePath).isDirectory();
+        } catch {
+            isDirectoryRename = false;
+        }
+
         const oldRelativeHref = normalizeLinkHref(path.relative(this.bundlePath, previousAbsolutePath));
         const nextRelativeHref = normalizeLinkHref(path.relative(this.bundlePath, nextAbsolutePath));
         if (!oldRelativeHref || !nextRelativeHref) {
             return false;
         }
 
+        const normalizedOldPrefix = oldRelativeHref.replace(/\/+$/, '');
+        const oldRelativePrefix = `${normalizedOldPrefix}/`;
+
         const previousIdentity = getAttachmentIdentityFromPath(previousAbsolutePath);
         const nextIdentity = getAttachmentIdentityFromPath(nextAbsolutePath) || previousIdentity;
         const nextLabel = safeDecodeUri(path.basename(nextRelativeHref)) || decodeLinkLabelFromHref(nextRelativeHref);
+        const resolveAnyLocalPath = (href) => {
+            const normalizedHref = normalizeLinkHref(href).replace(/^\.?\//, '');
+            if (!normalizedHref) return '';
+
+            const attachmentPath = this.resolveAttachmentAbsolutePath(normalizedHref);
+            if (attachmentPath) return path.resolve(attachmentPath);
+
+            const localPath = resolveLocalHref(normalizedHref, this.bundlePath);
+            return localPath ? path.resolve(localPath) : '';
+        };
 
         const shouldMatchAttachmentRef = (href, title = null, identityAttr = null) => {
             const normalizedHref = normalizeLinkHref(href).replace(/^\.?\//, '');
-            if (!normalizedHref.startsWith('attachments/')) {
-                return false;
+            const resolvedAbsolutePath = resolveAnyLocalPath(normalizedHref);
+            const effectiveIdentity = identityAttr || parseAttachmentIdentityFromTitle(title) || (resolvedAbsolutePath ? getAttachmentIdentityFromPath(resolvedAbsolutePath) : null);
+            const isAttachmentHref = normalizedHref.startsWith('attachments/');
+
+            if (isDirectoryRename) {
+                return (isAttachmentHref && (
+                        normalizedHref === normalizedOldPrefix
+                        || normalizedHref.startsWith(oldRelativePrefix)
+                    ))
+                    || (resolvedAbsolutePath && (
+                        resolvedAbsolutePath === previousAbsolutePath
+                        || !path.relative(previousAbsolutePath, resolvedAbsolutePath).startsWith('..')
+                    ))
+                    || (Boolean(previousIdentity) && effectiveIdentity === previousIdentity);
             }
 
-            const resolvedAbsolutePath = this.resolveAttachmentAbsolutePath(normalizedHref);
-            const effectiveIdentity = identityAttr || parseAttachmentIdentityFromTitle(title) || (resolvedAbsolutePath ? getAttachmentIdentityFromPath(resolvedAbsolutePath) : null);
-
-            return normalizedHref === oldRelativeHref
-                || resolvedAbsolutePath === previousAbsolutePath
+            return (isAttachmentHref && normalizedHref === oldRelativeHref)
+                || (resolvedAbsolutePath && resolvedAbsolutePath === previousAbsolutePath)
                 || (Boolean(previousIdentity) && effectiveIdentity === previousIdentity);
         };
 
@@ -2525,13 +3195,19 @@ class KangarooWysiwygEditor {
                 }
 
                 const nextTitle = buildNextTitle(range.attrs?.title || null, nextIdentity, isPdfAttachmentHref(nextRelativeHref) ? parsePdfWidthFromTitle(range.attrs?.title || null, 560) : null);
-                tr = tr.insertText(nextLabel, range.from, range.to);
+                const normalizedRangeHref = normalizeLinkHref(range.attrs?.href || '').replace(/^\.?\//, '');
+                let nextRangeHref = nextRelativeHref;
+                if (isDirectoryRename && normalizedRangeHref.startsWith(normalizedOldPrefix)) {
+                    nextRangeHref = `${nextRelativeHref}${normalizedRangeHref.slice(normalizedOldPrefix.length)}`;
+                }
+                const nextRangeLabel = safeDecodeUri(path.basename(nextRangeHref)) || decodeLinkLabelFromHref(nextRangeHref);
+                tr = tr.insertText(nextRangeLabel, range.from, range.to);
                 tr = tr.addMark(
                     range.from,
-                    range.from + nextLabel.length,
+                    range.from + nextRangeLabel.length,
                     linkMark.create({
                         ...range.attrs,
-                        href: nextRelativeHref,
+                        href: nextRangeHref,
                         title: nextTitle
                     })
                 );
@@ -2549,10 +3225,19 @@ class KangarooWysiwygEditor {
                 return true;
             }
 
+            const normalizedNodeHref = normalizeLinkHref(node.attrs?.href || '').replace(/^\.?\//, '');
+            let nextNodeHref = nextRelativeHref;
+            if (isDirectoryRename && normalizedNodeHref.startsWith(normalizedOldPrefix)) {
+                nextNodeHref = `${nextRelativeHref}${normalizedNodeHref.slice(normalizedOldPrefix.length)}`;
+            }
+            if (!normalizedNodeHref.startsWith('attachments/')) {
+                nextNodeHref = nextRelativeHref;
+            }
+            const nextNodeLabel = safeDecodeUri(path.basename(nextNodeHref)) || decodeLinkLabelFromHref(nextNodeHref);
             const nextAttrs = {
                 ...node.attrs,
-                href: nextRelativeHref,
-                label: nextLabel,
+                href: nextNodeHref,
+                label: nextNodeLabel,
                 title: buildNextTitle(node.attrs?.title || null, nextIdentity, typeName === 'kangarooPdf' ? clampPdfPreviewWidth(node.attrs?.width) : null),
                 identity: nextIdentity
             };
@@ -2572,6 +3257,7 @@ class KangarooWysiwygEditor {
         this.refreshLinkDomState();
         this.refreshAttachmentNodeLabels();
         this.refreshRangeSelectionHighlights();
+        this.emitChange();
         return true;
     }
 
@@ -2662,46 +3348,46 @@ class KangarooWysiwygEditor {
             return this.selectImageNodeAtDocPos(findLastImageNodePos(currentParent, currentParentStart));
         }
 
-        if (String(currentParent.textContent || '').trim()) {
-            return false;
-        }
+        return false;
+    }
 
-        if ($from.depth <= 0) {
+    deleteCurrentEmptyParagraphNearImage() {
+        const { selection } = this.editor.state;
+        if (!selection?.empty || selection?.node) return false;
+
+        const { $from } = selection;
+        const currentParent = $from.parent;
+        if (!isEffectivelyEmptyTextblockNode(currentParent) || $from.depth <= 0) {
             return false;
         }
 
         const parentContainer = $from.node($from.depth - 1);
         const indexInContainer = $from.index($from.depth - 1);
-        if (indexInContainer <= 0) {
+        const previousSibling = indexInContainer > 0
+            ? parentContainer.child(indexInContainer - 1)
+            : null;
+        const nextSibling = indexInContainer < parentContainer.childCount - 1
+            ? parentContainer.child(indexInContainer + 1)
+            : null;
+
+        if (!isImageContainerNode(previousSibling) && !isImageContainerNode(nextSibling)) {
             return false;
         }
 
-        let previousSibling = null;
-        let previousSiblingStart = null;
-        let probeStart = $from.before($from.depth);
-
-        for (let index = indexInContainer - 1; index >= 0; index--) {
-            const sibling = parentContainer.child(index);
-            probeStart -= sibling.nodeSize;
-
-            if (isEffectivelyEmptyTextblockNode(sibling)) {
-                continue;
-            }
-
-            previousSibling = sibling;
-            previousSiblingStart = probeStart;
-            break;
-        }
-
-        if (typeof previousSiblingStart !== 'number') {
+        try {
+            const deleteFrom = $from.before($from.depth);
+            const deleteTo = $from.after($from.depth);
+            const tr = this.editor.state.tr.delete(deleteFrom, deleteTo);
+            const selectionPos = Math.max(0, Math.min(deleteFrom, tr.doc.content.size));
+            tr.setSelection(Selection.near(tr.doc.resolve(selectionPos), -1));
+            this.editor.view.dispatch(tr.scrollIntoView());
+            this.syncMarkdown();
+            this.refreshLineMap();
+            this.emitChange();
+            return true;
+        } catch {
             return false;
         }
-
-        if (!isImageContainerNode(previousSibling)) {
-            return false;
-        }
-
-        return this.moveCursorToEndOfNode(previousSibling, previousSiblingStart);
     }
 
     selectImageNodeAtDocPos(pos) {
@@ -2785,6 +3471,15 @@ class KangarooWysiwygEditor {
         };
     }
 
+    setTaskInteractionHandlers(handlers = {}) {
+        this.taskInteractionHandlers = {
+            onCheckedChange: typeof handlers.onCheckedChange === 'function' ? handlers.onCheckedChange : null
+        };
+        if (this.editor) {
+            this.editor.kangarooTaskInteractionHandlers = this.taskInteractionHandlers;
+        }
+    }
+
     onDidChangeModelContent(listener) {
         this.listeners.add(listener);
         return () => this.listeners.delete(listener);
@@ -2797,11 +3492,12 @@ class KangarooWysiwygEditor {
 
     insertMarkdown(markdown) {
         if (!markdown) return;
-        this.editor.chain().focus().insertContent(markdown, { contentType: 'markdown' }).run();
+        const didInsert = insertMarkdownWithImageFallback(this, markdown, { scrollIntoView: false });
         this.normalizeTaskHeadingNodesFromText();
         this.syncMarkdown();
         this.refreshLineMap();
         this.emitChange();
+        return didInsert;
     }
 
     insertHtml(html) {
@@ -2834,15 +3530,12 @@ class KangarooWysiwygEditor {
         const chain = this.editor.chain().focus(undefined, {
             scrollIntoView: false
         }).insertContent({
-            type: 'paragraph',
-            content: [{
-                type: 'image',
-                attrs: {
-                    src: targetSrc,
-                    alt: options.alt || 'image',
-                    title: options.title || null
-                }
-            }]
+            type: 'image',
+            attrs: {
+                src: targetSrc,
+                alt: options.alt || 'image',
+                title: options.title || null
+            }
         });
 
         if (options.insertTrailingParagraph) {
@@ -2947,34 +3640,80 @@ class KangarooWysiwygEditor {
     }
 
     setTaskItemHeadingLevel(level) {
-        const context = this.getTaskItemContext();
-        if (!context) return false;
+        const taskContext = this.getTaskItemContext();
+        if (!taskContext?.node) {
+            return false;
+        }
+        return this.applyTaskItemHeadingLevel(level);
+    }
 
-        const nextLevel = clampNumber(Number(level || 0), 0, 6);
-        const currentLevel = clampNumber(Number(context.node.attrs?.headingLevel || 0), 0, 6);
-        const resolvedLevel = currentLevel === nextLevel ? 0 : nextLevel;
+    applyTaskItemHeadingLevel(level) {
+        const taskContext = this.getTaskItemContext();
+        if (!taskContext?.node) {
+            return false;
+        }
 
-        const tr = this.editor.state.tr.setNodeMarkup(context.pos, undefined, {
-            ...context.node.attrs,
-            headingLevel: resolvedLevel
-        });
+        const nextHeadingLevel = clampNumber(Number(level || 0), 0, 6);
+        const firstTextblock = findFirstTextblockInNode(taskContext.node, taskContext.pos);
+        if (!firstTextblock?.node) {
+            return false;
+        }
+
+        const textblockNode = firstTextblock.node;
+        const currentText = String(textblockNode.textContent || '');
+        const parsedHeading = parseTaskHeadingText(currentText);
+        const nextText = parsedHeading ? parsedHeading.text : currentText;
+        const currentHeadingLevel = clampNumber(Number(taskContext.node.attrs?.headingLevel || 0), 0, 6);
+        const needsTextUpdate = nextText !== currentText;
+        const needsHeadingLevelUpdate = currentHeadingLevel !== nextHeadingLevel;
+        const paragraphType = this.editor.state.schema.nodes.paragraph;
+        const needsParagraphConversion = paragraphType && textblockNode.type?.name !== 'paragraph';
+
+        if (!needsTextUpdate && !needsHeadingLevelUpdate && !needsParagraphConversion) {
+            return true;
+        }
+
+        let tr = this.editor.state.tr;
+        if (needsHeadingLevelUpdate) {
+            tr = tr.setNodeMarkup(taskContext.pos, undefined, {
+                ...taskContext.node.attrs,
+                headingLevel: nextHeadingLevel
+            });
+        }
+        if (needsParagraphConversion) {
+            tr = tr.setNodeMarkup(firstTextblock.pos, paragraphType, {});
+        }
+        if (needsTextUpdate) {
+            const textFrom = firstTextblock.pos + 1;
+            const textTo = textFrom + textblockNode.content.size;
+            tr = tr.insertText(nextText, textFrom, textTo);
+        }
 
         this.editor.view.dispatch(tr);
-        this.syncMarkdown();
-        this.refreshLineMap();
-        this.emitChange();
         return true;
     }
 
     toggleHeading(level) {
-        const headingLevel = clampNumber(Number(level), 1, 6);
-        if (this.getTaskItemContext()) {
-            return this.setTaskItemHeadingLevel(headingLevel);
+        const lineNumber = this.getAnchorLineFromCursor();
+        const currentLine = this.getLineText(lineNumber);
+        if (isTodoMarkdownLine(currentLine)) {
+            const nextLine = updateTodoHeadingMarkdownLine(currentLine, level);
+            if (nextLine && nextLine !== currentLine) {
+                this.replaceLines(lineNumber, lineNumber, [nextLine], {
+                    preferredKind: 'task',
+                    preferredText: normalizeMarkdownLineForMatch(nextLine),
+                    textblockOrder: this.getCurrentTextblockOrder(),
+                    restoreByTextblockOrder: false,
+                    preserveViewport: true
+                });
+                return true;
+            }
+            return true;
         }
 
         return this.editor.chain().focus(undefined, {
             scrollIntoView: false
-        }).toggleHeading({ level: headingLevel }).run();
+        }).toggleHeading({ level: clampNumber(Number(level), 1, 6) }).run();
     }
 
     toggleBulletList() {
@@ -3072,11 +3811,12 @@ class KangarooWysiwygEditor {
 
     getToolbarState() {
         const taskContext = this.getTaskItemContext();
-        const taskHeadingLevel = clampNumber(Number(taskContext?.node?.attrs?.headingLevel || 0), 0, 6);
         return {
-            canUndo: this.editor.can().chain().focus(undefined, { scrollIntoView: false }).undo().run(),
-            canRedo: this.editor.can().chain().focus(undefined, { scrollIntoView: false }).redo().run(),
-            headingLevel: taskHeadingLevel || [1, 2, 3, 4, 5, 6].find((level) => this.editor.isActive('heading', { level })) || 0,
+            canUndo: false,
+            canRedo: false,
+            headingLevel: taskContext
+                ? clampNumber(Number(taskContext.node?.attrs?.headingLevel || 0), 0, 6)
+                : ([1, 2, 3, 4, 5, 6].find((candidateLevel) => this.editor.isActive('heading', { level: candidateLevel })) || 0),
             bulletList: this.editor.isActive('bulletList'),
             orderedList: this.editor.isActive('orderedList'),
             taskList: this.editor.isActive('taskList'),
@@ -3292,11 +4032,458 @@ class KangarooWysiwygEditor {
         return this.getSelectedTextblockEntries().map((entry) => entry.lineNumber);
     }
 
+    focusTaskLine(lineNumber) {
+        if (!Number.isInteger(lineNumber) || lineNumber <= 0) {
+            return false;
+        }
+
+        let targetPos = null;
+        this.editor.state.doc.descendants((node, pos) => {
+            if (node?.type?.name !== 'taskItem') {
+                return true;
+            }
+
+            const firstTextblock = findFirstTextblockInNode(node, pos);
+            if (!firstTextblock) {
+                return true;
+            }
+
+            const resolvedLine = this.resolveLineFromPos(firstTextblock.pos);
+            if (resolvedLine !== lineNumber) {
+                return true;
+            }
+
+            targetPos = firstTextblock.pos + 1;
+            return false;
+        });
+
+        if (typeof targetPos !== 'number') {
+            return false;
+        }
+
+        this.editor.chain().focus().setTextSelection(targetPos).run();
+        this.scrollPositionIntoView(targetPos);
+        return true;
+    }
+
+    focusTaskByKindIndex(kindIndex) {
+        if (!Number.isInteger(kindIndex) || kindIndex < 0) {
+            return false;
+        }
+
+        const block = this.findBlockByKindIndex('task', kindIndex, {});
+        if (!block) {
+            return false;
+        }
+
+        const position = this.getEditorPositionForBlock(block);
+        if (typeof position !== 'number') {
+            return false;
+        }
+
+        this.editor.chain().focus().setTextSelection(position).run();
+        this.scrollPositionIntoView(position);
+        return true;
+    }
+
+    focusTaskAtLine(lineNumber) {
+        if (!Number.isInteger(lineNumber) || lineNumber <= 0) {
+            return false;
+        }
+
+        const block = this.lineBlocks.find((entry) => (
+            entry.kind === 'task'
+            && entry.lineNumber === lineNumber
+        ));
+        if (!block) {
+            return false;
+        }
+
+        const position = this.getEditorPositionForBlock(block);
+        if (typeof position !== 'number') {
+            return false;
+        }
+
+        this.editor.chain().focus().setTextSelection(position).run();
+        this.scrollPositionIntoView(position);
+        return true;
+    }
+
+    focusTextLine(lineNumber) {
+        if (!Number.isInteger(lineNumber) || lineNumber <= 0) {
+            return false;
+        }
+
+        const block = this.lineBlocks.find((entry) => (
+            entry.kind === 'text'
+            && entry.lineNumber === lineNumber
+            && entry.isTextblock
+        ));
+        if (!block) {
+            return false;
+        }
+
+        const position = this.getEditorPositionForBlock(block);
+        if (typeof position !== 'number') {
+            return false;
+        }
+
+        this.editor.chain().focus().setTextSelection(position).run();
+        this.scrollPositionIntoView(position);
+        return true;
+    }
+
+    scheduleFocusTextLine(lineNumber) {
+        const tryFocus = () => {
+            if (this.focusTextLine(lineNumber)) {
+                return true;
+            }
+
+            this.jumpToLine(lineNumber, {
+                preferredKind: 'text',
+                preferredText: ''
+            });
+            return true;
+        };
+
+        if (tryFocus()) {
+            return;
+        }
+
+        window.requestAnimationFrame(() => {
+            tryFocus();
+        });
+    }
+
+    scheduleFocusTaskLine(lineNumber) {
+        const tryFocus = () => {
+            if (this.focusTaskLine(lineNumber)) {
+                return true;
+            }
+
+            this.jumpToLine(lineNumber, {
+                preferredKind: 'task',
+                preferredText: ''
+            });
+            return true;
+        };
+
+        if (tryFocus()) {
+            return;
+        }
+
+        window.requestAnimationFrame(() => {
+            if (tryFocus()) {
+                return;
+            }
+
+            window.setTimeout(() => {
+                tryFocus();
+            }, 120);
+        });
+    }
+
+    scheduleFocusTaskByKindIndex(kindIndex, fallbackLineNumber = null) {
+        const tryFocus = () => {
+            if (this.focusTaskByKindIndex(kindIndex)) {
+                return true;
+            }
+
+            if (Number.isInteger(fallbackLineNumber) && fallbackLineNumber > 0) {
+                if (this.focusTaskAtLine(fallbackLineNumber) || this.focusTaskLine(fallbackLineNumber)) {
+                    return true;
+                }
+
+                this.jumpToLine(fallbackLineNumber, {
+                    preferredKind: 'task',
+                    preferredText: ''
+                });
+                return true;
+            }
+
+            return false;
+        };
+
+        if (tryFocus()) {
+            return;
+        }
+
+        window.requestAnimationFrame(() => {
+            tryFocus();
+        });
+    }
+
+    handleTaskItemEnter(taskItemName = 'taskItem') {
+        const { state } = this.editor;
+        const { selection } = state;
+        if (!selection?.empty) {
+            return false;
+        }
+
+        const taskContext = findTaskItemSelectionContext(state, taskItemName);
+        if (!taskContext) {
+            return false;
+        }
+
+        const firstTextblock = findFirstTextblockInNode(taskContext.node, taskContext.pos);
+        if (!firstTextblock?.node) {
+            return false;
+        }
+
+        const textblockNode = firstTextblock.node;
+        const isCursorAtEnd = selection.$from.parent === textblockNode
+            ? selection.$from.parentOffset >= textblockNode.content.size
+            : false;
+
+        if (!isCursorAtEnd) {
+            return false;
+        }
+
+        const taskText = String(textblockNode.textContent || '');
+        const visibleText = stripTaskCompletionTimestamp(taskText)
+            .replace(/^#{1,6}(?:\s+|$)/, '')
+            .trim();
+        if (!visibleText) {
+            return this.exitEmptyTaskItem(taskContext);
+        }
+
+        const didInsert = this.insertTaskSuccessor(taskContext);
+        if (!didInsert) {
+            return false;
+        }
+
+        return true;
+    }
+
+    normalizeTaskItemHeadingStructure(taskContext, firstTextblock, headingLevel) {
+        return false;
+    }
+
+    insertTaskSuccessor(taskContext) {
+        if (!taskContext?.node || taskContext.node.type?.name !== 'taskItem') {
+            return false;
+        }
+
+        const { state } = this.editor;
+        const taskItemType = taskContext.node.type;
+        const paragraphType = state.schema.nodes.paragraph;
+        if (!taskItemType || !paragraphType) {
+            return false;
+        }
+
+        const insertPos = taskContext.pos + taskContext.node.nodeSize;
+        let tr = state.tr;
+        const nextTaskNode = taskItemType.create(
+            {
+                ...taskContext.node.attrs,
+                checked: false
+            },
+            [paragraphType.create()]
+        );
+
+        tr = tr.insert(insertPos, nextTaskNode);
+        const insertedTaskPos = tr.doc.resolve(insertPos);
+        const insertedTaskNode = insertedTaskPos.nodeAfter || insertedTaskPos.nodeBefore || null;
+        const firstTextblock = insertedTaskNode
+            ? findFirstTextblockInNode(insertedTaskNode, insertPos)
+            : null;
+        const selectionPos = firstTextblock
+            ? clampNumber(firstTextblock.pos + 1, 1, tr.doc.content.size)
+            : clampNumber(insertPos + 2, 1, tr.doc.content.size);
+        tr = tr.setSelection(Selection.near(tr.doc.resolve(selectionPos), 1));
+        this.editor.view.dispatch(tr.scrollIntoView());
+        return true;
+    }
+
+    insertParagraphAfterTaskItem(taskContext) {
+        if (!taskContext?.node || taskContext.node.type?.name !== 'taskItem') {
+            return false;
+        }
+
+        const { state } = this.editor;
+        const { selection } = state;
+        const { $from } = selection;
+        const paragraphType = state.schema.nodes.paragraph;
+        if (!paragraphType) {
+            return false;
+        }
+
+        let taskListDepth = null;
+        for (let depth = taskContext.depth - 1; depth >= 0; depth--) {
+            if ($from.node(depth)?.type?.name === 'taskList') {
+                taskListDepth = depth;
+                break;
+            }
+        }
+
+        if (!Number.isInteger(taskListDepth) || taskListDepth < 0) {
+            return false;
+        }
+
+        const taskListNode = $from.node(taskListDepth);
+        const taskListPos = $from.before(taskListDepth);
+        const taskItemIndex = $from.index(taskListDepth);
+        const taskListType = taskListNode.type;
+
+        const beforeItems = [];
+        const afterItems = [];
+        taskListNode.forEach((child, _offset, index) => {
+            if (index <= taskItemIndex) {
+                beforeItems.push(child);
+            } else {
+                afterItems.push(child);
+            }
+        });
+
+        const replacementNodes = [];
+        let paragraphPos = taskListPos;
+
+        if (beforeItems.length) {
+            const beforeList = taskListType.create(taskListNode.attrs, Fragment.fromArray(beforeItems));
+            replacementNodes.push(beforeList);
+            paragraphPos += beforeList.nodeSize;
+        }
+
+        replacementNodes.push(paragraphType.create());
+
+        if (afterItems.length) {
+            const afterList = taskListType.create(taskListNode.attrs, Fragment.fromArray(afterItems));
+            replacementNodes.push(afterList);
+        }
+
+        let tr = state.tr.replaceWith(
+            taskListPos,
+            taskListPos + taskListNode.nodeSize,
+            Fragment.fromArray(replacementNodes)
+        );
+        tr = tr.setSelection(
+            TextSelection.create(tr.doc, Math.min(paragraphPos + 1, tr.doc.content.size))
+        );
+        this.editor.view.dispatch(tr.scrollIntoView());
+        return true;
+    }
+
+    applyHeadingLevelToSplitTasks(headingLevel) {
+        return false;
+    }
+
+    exitEmptyTaskItem(taskContext) {
+        if (!taskContext?.node || taskContext.node.type?.name !== 'taskItem') {
+            return false;
+        }
+
+        if (!isTaskItemEffectivelyEmpty(taskContext.node)) {
+            return false;
+        }
+
+        const { state } = this.editor;
+        const { selection } = state;
+        const { $from } = selection;
+
+        let taskListDepth = null;
+        for (let depth = taskContext.depth - 1; depth >= 0; depth--) {
+            if ($from.node(depth)?.type?.name === 'taskList') {
+                taskListDepth = depth;
+                break;
+            }
+        }
+
+        if (!Number.isInteger(taskListDepth) || taskListDepth < 0) {
+            return false;
+        }
+
+        const taskListNode = $from.node(taskListDepth);
+        const taskListPos = $from.before(taskListDepth);
+        const taskItemIndex = $from.index(taskListDepth);
+        const paragraphType = state.schema.nodes.paragraph;
+        if (!paragraphType) {
+            return false;
+        }
+
+        const beforeItems = [];
+        const afterItems = [];
+        taskListNode.forEach((child, _offset, index) => {
+            if (index < taskItemIndex) {
+                beforeItems.push(child);
+            } else if (index > taskItemIndex) {
+                afterItems.push(child);
+            }
+        });
+
+        const replacementNodes = [];
+        const taskListType = taskListNode.type;
+        let paragraphPos = taskListPos;
+
+        if (beforeItems.length) {
+            const beforeList = taskListType.create(taskListNode.attrs, Fragment.fromArray(beforeItems));
+            replacementNodes.push(beforeList);
+            paragraphPos += beforeList.nodeSize;
+        }
+
+        replacementNodes.push(paragraphType.create());
+
+        if (afterItems.length) {
+            const afterList = taskListType.create(taskListNode.attrs, Fragment.fromArray(afterItems));
+            replacementNodes.push(afterList);
+        }
+
+        let tr = state.tr.replaceWith(
+            taskListPos,
+            taskListPos + taskListNode.nodeSize,
+            Fragment.fromArray(replacementNodes)
+        );
+        tr = tr.setSelection(
+            TextSelection.create(tr.doc, Math.min(paragraphPos + 1, tr.doc.content.size))
+        );
+        this.editor.view.dispatch(tr.scrollIntoView());
+        return true;
+    }
+
+    handleEmptyParagraphEnter() {
+        const { state } = this.editor;
+        const { selection } = state;
+        if (!selection?.empty) {
+            return false;
+        }
+
+        const { $from } = selection;
+        const parent = $from?.parent;
+        if (parent?.type?.name !== 'paragraph') {
+            return false;
+        }
+
+        for (let depth = $from.depth; depth >= 0; depth--) {
+            const ancestor = $from.node(depth);
+            if (ancestor?.type?.name === 'taskItem' || ancestor?.type?.name === 'heading') {
+                return false;
+            }
+        }
+
+        if (String(parent.textContent || '').trim()) {
+            return false;
+        }
+
+        const paragraphDepth = $from.depth;
+        const paragraphPos = $from.before(paragraphDepth);
+        const insertPos = $from.after(paragraphDepth);
+        const paragraphType = state.schema.nodes.paragraph;
+        if (!paragraphType) {
+            return false;
+        }
+
+        let tr = state.tr.insert(insertPos, paragraphType.create());
+        tr = tr.setSelection(TextSelection.create(tr.doc, Math.min(insertPos + 1, tr.doc.content.size)));
+        this.editor.view.dispatch(tr.scrollIntoView());
+        return true;
+    }
+
     replaceLines(startLine, endLine, newLines, options = {}) {
         const textblockOrder = Number.isInteger(options.textblockOrder)
             ? options.textblockOrder
             : this.getCurrentTextblockOrder();
         const restoreByTextblockOrder = options.restoreByTextblockOrder !== false;
+        const preserveViewport = Boolean(options.preserveViewport);
+        const restoreCursorAtLineEnd = Boolean(options.restoreCursorAtLineEnd);
         const lines = this.currentMarkdown.split('\n');
         const nextLines = [
             ...lines.slice(0, Math.max(startLine - 1, 0)),
@@ -3309,7 +4496,23 @@ class KangarooWysiwygEditor {
             nextMarkdown += '\n';
         }
 
-        this.setValue(nextMarkdown, { emitChange: true });
+        this.setValue(nextMarkdown, {
+            emitChange: true,
+            preserveSelection: preserveViewport && !restoreCursorAtLineEnd,
+            preserveViewport
+        });
+        if (restoreCursorAtLineEnd) {
+            this.refreshLineMap();
+            if (this.focusLineEnd(startLine, {
+                preferredText: options.preferredText ?? newLines[0] ?? '',
+                preferredKind: options.preferredKind
+            })) {
+                return;
+            }
+        }
+        if (preserveViewport) {
+            return;
+        }
         if (restoreByTextblockOrder && this.jumpToTextblockOrder(textblockOrder)) {
             return;
         }
@@ -3336,6 +4539,7 @@ class KangarooWysiwygEditor {
             ? options.textblockOrder
             : this.getCurrentTextblockOrder();
         const restoreByTextblockOrder = options.restoreByTextblockOrder !== false;
+        const preserveViewport = Boolean(options.preserveViewport);
         const uniqueLines = Array.from(new Set(lineNumbers.filter(Boolean))).sort((a, b) => a - b);
         if (!uniqueLines.length) {
             return false;
@@ -3353,12 +4557,19 @@ class KangarooWysiwygEditor {
             }
         }
 
-        let nextMarkdown = lines.join('\n');
+        let nextMarkdown = stripTaskCompletionTimestampsFromMarkdown(lines.join('\n'));
         if (this.currentMarkdown.endsWith('\n') && !nextMarkdown.endsWith('\n')) {
             nextMarkdown += '\n';
         }
 
-        this.setValue(nextMarkdown, { emitChange: true });
+        this.setValue(nextMarkdown, {
+            emitChange: true,
+            preserveSelection: preserveViewport,
+            preserveViewport
+        });
+        if (preserveViewport) {
+            return true;
+        }
         if (restoreByTextblockOrder && this.jumpToTextblockOrder(textblockOrder)) {
             return true;
         }
@@ -3418,6 +4629,40 @@ class KangarooWysiwygEditor {
 
         this.editor.chain().focus().setTextSelection(position).run();
         this.scrollPositionIntoView(position);
+    }
+
+    focusLineEnd(lineNumber, options = {}) {
+        const block = this.findBlockForLine(lineNumber, options);
+        if (!block || typeof block.pos !== 'number') {
+            return false;
+        }
+
+        const position = Math.min(block.pos + Math.max(block.nodeSize - 1, 1), this.editor.state.doc.content.size);
+        if (typeof position !== 'number') {
+            return false;
+        }
+
+        this.editor.chain().focus(undefined, {
+            scrollIntoView: false
+        }).setTextSelection(position).run();
+        return true;
+    }
+
+    focusLineEnd(lineNumber, options = {}) {
+        const block = this.findBlockForLine(lineNumber, options);
+        if (!block || typeof block.pos !== 'number') {
+            return false;
+        }
+
+        const position = Math.min(block.pos + Math.max(block.nodeSize - 1, 1), this.editor.state.doc.content.size);
+        if (typeof position !== 'number') {
+            return false;
+        }
+
+        this.editor.chain().focus(undefined, {
+            scrollIntoView: false
+        }).setTextSelection(position).run();
+        return true;
     }
 
     jumpToAnchor(kind, kindIndex, options = {}) {
@@ -3627,7 +4872,7 @@ class KangarooWysiwygEditor {
         return this.docKindAnchors.task.map((entry) => ({
             lineNumber: entry.lineNumber || 1,
             checked: Boolean(entry.checked),
-            text: entry.displayText || '',
+            text: stripTaskCompletionTimestamp(entry.displayText || ''),
             kindIndex: entry.kindIndex
         }));
     }
@@ -3642,7 +4887,7 @@ class KangarooWysiwygEditor {
         let didUpdate = false;
 
         for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-            const match = lines[lineIndex].match(/^(\s*)([-+*])\s+\[([ xX])\]\s*(.*)$/);
+            const match = lines[lineIndex].match(/^(\s*)([-+*]|\d+\.)\s+\[([ xX])\]\s*(.*)$/);
             if (!match) continue;
 
             if (currentTaskIndex === index) {
@@ -3667,8 +4912,45 @@ class KangarooWysiwygEditor {
             nextMarkdown += '\n';
         }
 
-        this.setValue(nextMarkdown, { emitChange: true });
+        this.setValue(nextMarkdown, { emitChange: true, preserveSelection: true });
         return true;
+    }
+
+    placeCursorAtTaskTextStart(taskItemName = 'taskItem') {
+        const taskContext = findTaskItemSelectionContext(this.editor.state, taskItemName);
+        if (!taskContext) {
+            return false;
+        }
+
+        const firstTextblock = findFirstTextblockInNode(taskContext.node, taskContext.pos);
+        if (!firstTextblock?.node) {
+            return false;
+        }
+
+        const targetPos = Math.min(firstTextblock.pos + 1, this.editor.state.doc.content.size);
+        return this.editor.chain().focus(undefined, {
+            scrollIntoView: false
+        }).setTextSelection(targetPos).run();
+    }
+
+    placeCursorAtTaskTextEnd(taskItemName = 'taskItem') {
+        const taskContext = findTaskItemSelectionContext(this.editor.state, taskItemName);
+        if (!taskContext) {
+            return false;
+        }
+
+        const firstTextblock = findFirstTextblockInNode(taskContext.node, taskContext.pos);
+        if (!firstTextblock?.node) {
+            return false;
+        }
+
+        const targetPos = Math.min(
+            firstTextblock.pos + firstTextblock.node.content.size + 1,
+            this.editor.state.doc.content.size
+        );
+        return this.editor.chain().focus(undefined, {
+            scrollIntoView: false
+        }).setTextSelection(targetPos).run();
     }
 
     getAttachmentReferences() {
@@ -3719,16 +5001,25 @@ class KangarooWysiwygEditor {
     toggleTodoSelection() {
         const currentBlock = this.getCurrentTextblockContext();
         if (currentBlock && this.editor.state.selection.empty) {
-            const headingLevel = currentBlock.node?.type?.name === 'heading'
-                ? clampNumber(Number(currentBlock.node.attrs?.level || 0), 0, 6)
-                : 0;
-            const didToggle = this.editor.chain().focus(undefined, {
-                scrollIntoView: false
-            }).toggleTaskList().run();
-            if (didToggle && headingLevel > 0) {
-                this.setTaskItemHeadingLevel(headingLevel);
+            const lineNumber = this.getAnchorLineFromCursor();
+            const currentLine = this.getLineText(lineNumber);
+            const nextLine = isTodoMarkdownLine(currentLine)
+                ? stripTodoLineToParagraph(currentLine, currentLine)
+                : normalizeTodoLine(currentLine, false);
+
+            if (nextLine === currentLine) {
+                return true;
             }
-            return didToggle;
+
+            this.replaceLines(lineNumber, lineNumber, [nextLine], {
+                preferredKind: isTodoMarkdownLine(currentLine) ? 'paragraph' : 'task',
+                preferredText: normalizeMarkdownLineForMatch(nextLine),
+                textblockOrder: this.getCurrentTextblockOrder(),
+                restoreByTextblockOrder: false,
+                preserveViewport: true,
+                restoreCursorAtLineEnd: true
+            });
+            return true;
         }
 
         const { startLine, endLine } = this.getSelectionLineRange();
@@ -3743,13 +5034,9 @@ class KangarooWysiwygEditor {
 
             selectedEntries.forEach((entry, index) => {
                 const currentLine = this.getLineText(entry.lineNumber);
-                const parsedHeading = parseAnyHeadingMarkdownLine(currentLine);
-                const displayText = parsedHeading
-                    ? `${'#'.repeat(parsedHeading.level)} ${entry.text}`.trim()
-                    : entry.text;
                 const nextLine = allSelectedAreTasks
                     ? stripTodoLineToParagraph(currentLine, entry.text)
-                    : createTodoLineFromText(displayText, false);
+                    : normalizeTodoLine(currentLine, false);
 
                 if (allSelectedAreTasks && index > 0) {
                     replacementLines.push('');
@@ -3765,7 +5052,8 @@ class KangarooWysiwygEditor {
                     preferredKind: allSelectedAreTasks ? 'paragraph' : 'task',
                     preferredText: selectedEntries[0]?.text || '',
                     textblockOrder: this.getCurrentTextblockOrder(),
-                    restoreByTextblockOrder: false
+                    restoreByTextblockOrder: false,
+                    preserveViewport: true
                 }
             );
             return true;
@@ -3780,7 +5068,9 @@ class KangarooWysiwygEditor {
             preferredText: nextLines[0] || '',
             preferredKind: 'task',
             textblockOrder: this.getCurrentTextblockOrder(),
-            restoreByTextblockOrder: false
+            restoreByTextblockOrder: false,
+            preserveViewport: true,
+            restoreCursorAtLineEnd: true
         });
         return true;
     }
@@ -3809,6 +5099,7 @@ class KangarooWysiwygEditor {
         }
 
         const updates = [];
+        const paragraphType = this.editor.state.schema.nodes.paragraph;
         this.editor.state.doc.descendants((node, pos) => {
             if (node?.type?.name !== 'taskItem') {
                 return true;
@@ -3826,18 +5117,37 @@ class KangarooWysiwygEditor {
                 return true;
             }
 
-            const parsedHeading = parseTaskHeadingText(firstTextblock.textContent || '');
+            const parsedHeading = firstTextblock.type?.name === 'heading'
+                ? {
+                    level: clampNumber(Number(firstTextblock.attrs?.level || 0), 1, 6),
+                    text: String(firstTextblock.textContent || '').trim()
+                }
+                : parseTaskHeadingText(firstTextblock.textContent || '');
+            const currentHeadingLevel = clampNumber(Number(node.attrs?.headingLevel || 0), 0, 6);
             if (!parsedHeading) {
                 return true;
             }
 
+            const currentTextContent = String(firstTextblock.textContent || '');
+            const nextText = parsedHeading.text;
+            const nextHeadingLevel = clampNumber(Number(parsedHeading.level || 0), 0, 6);
+            const needsParagraphConversion = paragraphType
+                && firstTextblock.type?.name !== 'paragraph';
+            const needsTextUpdate = currentTextContent !== nextText;
+            const needsHeadingLevelUpdate = currentHeadingLevel !== nextHeadingLevel;
+
+            if (!needsParagraphConversion && !needsTextUpdate && !needsHeadingLevelUpdate) {
+                return true;
+            }
+
             updates.push({
-                taskPos: pos,
-                taskNode: node,
+                taskItemPos: pos,
+                nextHeadingLevel,
                 textblockPos: firstTextblockPos,
                 textContentSize: firstTextblock.content.size,
-                headingLevel: parsedHeading.level,
-                nextText: parsedHeading.text
+                currentTextContent,
+                needsParagraphConversion,
+                nextText
             });
             return true;
         });
@@ -3849,14 +5159,19 @@ class KangarooWysiwygEditor {
         this.isApplyingTaskHeadingNormalization = true;
         try {
             let tr = this.editor.state.tr;
-            updates.sort((a, b) => b.taskPos - a.taskPos).forEach((entry) => {
-                tr = tr.setNodeMarkup(entry.taskPos, undefined, {
-                    ...entry.taskNode.attrs,
-                    headingLevel: entry.headingLevel
+            updates.sort((a, b) => b.textblockPos - a.textblockPos).forEach((entry) => {
+                tr = tr.setNodeMarkup(entry.taskItemPos, undefined, {
+                    ...tr.doc.nodeAt(entry.taskItemPos)?.attrs,
+                    headingLevel: entry.nextHeadingLevel
                 });
-                const textFrom = entry.textblockPos + 1;
-                const textTo = textFrom + entry.textContentSize;
-                tr = tr.insertText(entry.nextText, textFrom, textTo);
+                if (paragraphType && entry.needsParagraphConversion) {
+                    tr = tr.setNodeMarkup(entry.textblockPos, paragraphType, {});
+                }
+                if (entry.currentTextContent !== entry.nextText) {
+                    const textFrom = entry.textblockPos + 1;
+                    const textTo = textFrom + entry.textContentSize;
+                    tr = tr.insertText(entry.nextText, textFrom, textTo);
+                }
             });
             this.editor.view.dispatch(tr);
             return true;
@@ -3866,27 +5181,48 @@ class KangarooWysiwygEditor {
     }
 
     collectTaskHeadingLevels() {
-        const levels = [];
+        const headingLevels = [];
         this.editor.state.doc.descendants((node) => {
-            if (node?.type?.name === 'taskItem') {
-                levels.push(clampNumber(Number(node.attrs?.headingLevel || 0), 0, 6));
+            if (node?.type?.name !== 'taskItem') {
+                return true;
             }
+            headingLevels.push(clampNumber(Number(node.attrs?.headingLevel || 0), 0, 6));
             return true;
         });
-        return levels;
+        return headingLevels;
     }
 
     syncMarkdown() {
-        this.currentMarkdown = applyTaskHeadingLevelsToMarkdown(
+        const syncedMarkdown = stripTaskCompletionTimestampsFromMarkdown(applyTaskHeadingLevelsToMarkdown(
             normalizeMarkdown(this.editor.getMarkdown()),
             this.collectTaskHeadingLevels()
-        );
+        ));
+        if (syncedMarkdown !== this.currentMarkdown) {
+            this.currentMarkdown = syncedMarkdown;
+        }
+        return this.currentMarkdown;
     }
 
     emitChange() {
         for (const listener of this.listeners) {
             listener();
         }
+    }
+
+    scheduleRefreshLineMap() {
+        if (this.lineMapRefreshTimer) return;
+        this.lineMapRefreshTimer = window.setTimeout(() => {
+            this.lineMapRefreshTimer = null;
+            this.refreshLineMap();
+        }, 90);
+    }
+
+    scheduleRefreshRangeSelectionHighlights() {
+        if (this.rangeSelectionHighlightFrame) return;
+        this.rangeSelectionHighlightFrame = window.requestAnimationFrame(() => {
+            this.rangeSelectionHighlightFrame = null;
+            this.refreshRangeSelectionHighlights();
+        });
     }
 
     scheduleMarkdownLinkConversion() {
@@ -4323,8 +5659,20 @@ class KangarooWysiwygEditor {
                 continue;
             }
 
+            const $from = this.editor.state.doc.resolve(range.from);
+            const depth = $from.depth;
+            const parent = $from.parent;
+            const parentStart = $from.start(depth);
+            const parentEnd = $from.end(depth);
+            const parentFrom = $from.before(depth);
+            const parentTo = $from.after(depth);
+
+            if (!parent?.isTextblock || range.from !== parentStart || range.to !== parentEnd) {
+                continue;
+            }
+
             const label = getAttachmentDisplayLabel(normalizedRelativeHref, range.text || '');
-            tr = tr.replaceRangeWith(range.from, range.to, this.editor.state.schema.nodes.kangarooAttachment.create({
+            tr = tr.replaceRangeWith(parentFrom, parentTo, this.editor.state.schema.nodes.kangarooAttachment.create({
                 href: normalizedRelativeHref,
                 label,
                 title: stripAttachmentIdentityFromTitle(range.attrs?.title || null),
@@ -4493,6 +5841,113 @@ class KangarooWysiwygEditor {
         return true;
     }
 
+    repairRenderedAttachmentNodesByAbsolutePath(oldAbsolutePath, newAbsolutePath) {
+        if (!this.root || !this.bundlePath) {
+            return false;
+        }
+
+        const previousAbsolutePath = path.resolve(String(oldAbsolutePath || ''));
+        const nextAbsolutePath = path.resolve(String(newAbsolutePath || ''));
+        if (!previousAbsolutePath || !nextAbsolutePath) {
+            return false;
+        }
+
+        const nextRelativeHref = normalizeLinkHref(path.relative(this.bundlePath, nextAbsolutePath));
+        if (!nextRelativeHref) {
+            return false;
+        }
+
+        const previousIdentity = getAttachmentIdentityFromPath(previousAbsolutePath);
+        const nextIdentity = getAttachmentIdentityFromPath(nextAbsolutePath) || previousIdentity;
+        const selection = this.editor.state.selection;
+        const selectionNodeType = selection?.node?.type?.name || '';
+        let tr = this.editor.state.tr.setMeta('addToHistory', false);
+        let didChange = false;
+
+        const updateNode = (nodeView, absolutePathHint = '') => {
+            const node = nodeView?.getNode?.() || null;
+            const pos = typeof nodeView?.getPos === 'function' ? nodeView.getPos() : null;
+            if (!node || typeof pos !== 'number') {
+                return false;
+            }
+
+            const typeName = node.type?.name || '';
+            if (!['kangarooAttachment', 'kangarooVideo', 'kangarooPdf'].includes(typeName)) {
+                return false;
+            }
+
+            const currentHref = normalizeLinkHref(node.attrs?.href || '').replace(/^\.?\//, '');
+            const resolvedPath = resolveLocalHref(currentHref, this.bundlePath) || '';
+            const currentAbsolutePath = path.resolve(String(absolutePathHint || resolvedPath || ''));
+            const currentIdentity = node.attrs?.identity || parseAttachmentIdentityFromTitle(node.attrs?.title || null) || (currentAbsolutePath ? getAttachmentIdentityFromPath(currentAbsolutePath) : null);
+            const matchesPath = currentAbsolutePath === previousAbsolutePath;
+            const matchesIdentity = Boolean(previousIdentity) && currentIdentity === previousIdentity;
+
+            if (!matchesPath && !matchesIdentity) {
+                return false;
+            }
+
+            const nextLabel = safeDecodeUri(path.basename(nextRelativeHref)) || decodeLinkLabelFromHref(nextRelativeHref);
+            const nextAttrs = {
+                ...node.attrs,
+                href: nextRelativeHref,
+                label: nextLabel,
+                identity: nextIdentity
+            };
+
+            if (typeName === 'kangarooPdf') {
+                nextAttrs.title = mergePdfWidthIntoTitle(
+                    mergeAttachmentIdentityIntoTitle(
+                        stripAttachmentIdentityFromTitle(stripPdfWidthFromTitle(node.attrs?.title || null)),
+                        nextIdentity
+                    ),
+                    node.attrs?.width
+                );
+                nextAttrs.width = clampPdfPreviewWidth(node.attrs?.width);
+            } else {
+                nextAttrs.title = mergeAttachmentIdentityIntoTitle(
+                    stripAttachmentIdentityFromTitle(node.attrs?.title || null),
+                    nextIdentity
+                );
+            }
+
+            tr = tr.setNodeMarkup(pos, undefined, nextAttrs);
+            didChange = true;
+            return true;
+        };
+
+        for (const element of Array.from(this.root.querySelectorAll('[data-kangaroo-attachment], [data-kangaroo-video], [data-kangaroo-pdf]'))) {
+            const nodeView = element.__kangarooAttachmentNodeView
+                || element.__kangarooVideoNodeView
+                || element.__kangarooPdfNodeView
+                || null;
+            if (!nodeView) {
+                continue;
+            }
+
+            const absolutePathHint = String(
+                element.getAttribute('data-kangaroo-path')
+                || nodeView.getInfo?.()?.absolutePath
+                || ''
+            ).trim();
+            if (updateNode(nodeView, absolutePathHint)) {
+                continue;
+            }
+        }
+
+        if (!didChange) {
+            return false;
+        }
+
+        this.editor.view.dispatch(tr);
+        this.syncMarkdown();
+        this.refreshLineMap();
+        this.refreshLinkDomState(true);
+        this.refreshAttachmentNodeLabels(true);
+        this.refreshRangeSelectionHighlights();
+        return true;
+    }
+
     syncLinkHrefToVisibleText() {
         const linkMark = this.editor.state.schema.marks.link;
         if (!linkMark) return false;
@@ -4529,6 +5984,10 @@ class KangarooWysiwygEditor {
     }
 
     refreshLineMap() {
+        if (this.lastLineMapMarkdown === this.currentMarkdown && this.lineBlocks) {
+            return this.lineBlocks;
+        }
+
         const normalizedLines = this.currentMarkdown.split('\n').map(normalizeMarkdownLineForMatch);
         const semanticAnchors = buildMarkdownSemanticAnchors(this.currentMarkdown);
         this.docKindAnchors = buildDocKindAnchors(this.editor, semanticAnchors);
@@ -4557,6 +6016,24 @@ class KangarooWysiwygEditor {
 
         for (const block of blocks) {
             const blockText = block.normalizedText;
+            if (block.kind === 'task') {
+                const taskAnchor = semanticAnchors.tasks[taskCursor++];
+                if (taskAnchor) {
+                    cursor = Math.max(cursor, taskAnchor.lineNumber);
+                    nextBlocks.push({
+                        lineNumber: taskAnchor.lineNumber,
+                        normalizedText: blockText,
+                        displayText: block.displayText,
+                        pos: block.pos,
+                        nodeSize: block.nodeSize,
+                        isTextblock: block.isTextblock,
+                        kind: block.kind,
+                        kindIndex: block.kindIndex
+                    });
+                    continue;
+                }
+            }
+
             if (!blockText && block.isTextblock) {
                 let emptyLineIndex = -1;
                 for (let lineIndex = cursor; lineIndex < normalizedLines.length; lineIndex++) {
@@ -4589,6 +6066,7 @@ class KangarooWysiwygEditor {
                 const headingMatch = findNextHeadingSemanticAnchor(semanticAnchors.headings, headingCursor, block.level);
                 if (headingMatch) {
                     headingCursor = headingMatch.nextIndex;
+                    cursor = Math.max(cursor, headingMatch.anchor.lineNumber);
                     nextBlocks.push({
                         lineNumber: headingMatch.anchor.lineNumber,
                         normalizedText: blockText,
@@ -4604,26 +6082,10 @@ class KangarooWysiwygEditor {
                 }
             }
 
-            if (block.kind === 'task') {
-                const taskAnchor = semanticAnchors.tasks[taskCursor++];
-                if (taskAnchor) {
-                    nextBlocks.push({
-                        lineNumber: taskAnchor.lineNumber,
-                        normalizedText: blockText,
-                        displayText: block.displayText,
-                        pos: block.pos,
-                        nodeSize: block.nodeSize,
-                        isTextblock: block.isTextblock,
-                        kind: block.kind,
-                        kindIndex: block.kindIndex
-                    });
-                    continue;
-                }
-            }
-
             if (block.kind === 'attachment') {
                 const attachmentAnchor = semanticAnchors.attachments[attachmentCursor++];
                 if (attachmentAnchor) {
+                    cursor = Math.max(cursor, attachmentAnchor.lineNumber);
                     nextBlocks.push({
                         lineNumber: attachmentAnchor.lineNumber,
                         normalizedText: blockText,
@@ -4670,6 +6132,8 @@ class KangarooWysiwygEditor {
             task: nextBlocks.filter((entry) => entry.kind === 'task').sort((a, b) => a.kindIndex - b.kindIndex),
             attachment: nextBlocks.filter((entry) => entry.kind === 'attachment').sort((a, b) => a.kindIndex - b.kindIndex)
         };
+        this.lastLineMapMarkdown = this.currentMarkdown;
+        return this.lineBlocks;
     }
 
     resolveDisplaySource(src) {
@@ -4703,36 +6167,122 @@ class KangarooWysiwygEditor {
         this.editor.view.dispatch(this.editor.state.tr);
     }
 
-    refreshPdfs() {}
+    refreshPdfs() {
+        this.editor.view.dispatch(this.editor.state.tr);
+    }
 
-    refreshAttachmentNodeLabels() {
+    refreshAttachmentNodeLabels(force = false) {
         if (!this.root) return;
+        const renderKey = `${this.bundlePath || ''}::${this.currentMarkdown}`;
+        if (!force && this.lastAttachmentNodeLabelsKey === renderKey) {
+            return;
+        }
 
-        const refreshNode = (selector, labelSelector) => {
+        const refreshNode = (selector, labelSelector, options = {}) => {
+            const {
+                baseClass,
+                defaultKind,
+                defaultBadge
+            } = options;
             const elements = Array.from(this.root.querySelectorAll(selector));
             for (const element of elements) {
                 const href = String(element.getAttribute('data-href') || '').trim();
                 if (!href) continue;
                 const nextLabel = getAttachmentDisplayLabel(href, element.getAttribute('data-label') || '');
+                const displayMeta = this.resolveLinkDisplayMeta(href);
+                const fallbackAbsolutePath = resolvePreviewLinkTarget(href)?.value || '';
+                const selectionClasses = ['ProseMirror-selectednode', 'is-selected'].filter((className) => element.classList.contains(className));
+                const nextKind = displayMeta.kind || defaultKind;
+
+                element.className = [baseClass, `${baseClass.replace(/-card$/, '')}-${nextKind}`, ...selectionClasses].join(' ').trim();
+                element.setAttribute('data-link-kind', nextKind);
+                element.setAttribute('data-kangaroo-path', displayMeta.absolutePath || fallbackAbsolutePath || '');
+                element.setAttribute('title', displayMeta.title || href || '');
                 element.setAttribute('data-label', nextLabel);
                 const labelElement = element.querySelector(labelSelector);
                 if (labelElement) {
                     labelElement.textContent = nextLabel;
                 }
+                const badgeElement = element.querySelector('.kangaroo-attachment-badge, .kangaroo-video-badge, .kangaroo-pdf-badge');
+                if (badgeElement) {
+                    badgeElement.textContent = displayMeta.badge || defaultBadge;
+                }
+
                 const mediaElement = element.querySelector('[data-kangaroo-pdf-element], [data-kangaroo-video-element]');
                 if (mediaElement) {
                     mediaElement.setAttribute('alt', nextLabel);
                 }
+
+                const videoElement = element.querySelector('[data-kangaroo-video-element]');
+                if (videoElement) {
+                    const nextSrc = displayMeta.absolutePath ? this.resolveDisplaySource(href) : '';
+                    if (nextSrc) {
+                        videoElement.setAttribute('src', nextSrc);
+                        videoElement.src = nextSrc;
+                    } else {
+                        videoElement.removeAttribute('src');
+                        videoElement.src = '';
+                    }
+                }
+
+                const pdfElement = element.querySelector('[data-kangaroo-pdf-element]');
+                const pdfViewer = element.querySelector('[data-kangaroo-pdf-viewer]');
+                if (pdfElement && pdfViewer) {
+                    const nextSrc = this.resolveDisplaySource(href);
+                    pdfElement.setAttribute('alt', nextLabel);
+                    pdfElement.dataset.pdfPreviewSource = nextSrc || '';
+
+                    if (!nextSrc) {
+                        pdfElement.removeAttribute('src');
+                        pdfElement.src = '';
+                        pdfViewer.setAttribute('data-pdf-fallback', nextLabel || defaultBadge);
+                    } else {
+                        pdfViewer.removeAttribute('data-pdf-fallback');
+                        buildPdfPreviewDataUrl(nextSrc).then((dataUrl) => {
+                            if (!dataUrl || pdfElement.dataset.pdfPreviewSource !== nextSrc) {
+                                return;
+                            }
+                            if (pdfElement.getAttribute('src') !== dataUrl) {
+                                pdfElement.setAttribute('src', dataUrl);
+                                pdfElement.src = dataUrl;
+                            }
+                            pdfViewer.removeAttribute('data-pdf-fallback');
+                        }).catch(() => {
+                            if (pdfElement.dataset.pdfPreviewSource === nextSrc) {
+                                pdfElement.removeAttribute('src');
+                                pdfElement.src = '';
+                                pdfViewer.setAttribute('data-pdf-fallback', nextLabel || defaultBadge);
+                            }
+                        });
+                    }
+                }
             }
         };
 
-        refreshNode('[data-kangaroo-attachment]', '.kangaroo-attachment-label');
-        refreshNode('[data-kangaroo-video]', '.kangaroo-video-label');
-        refreshNode('[data-kangaroo-pdf]', '.kangaroo-pdf-label');
+        refreshNode('[data-kangaroo-attachment]', '.kangaroo-attachment-label', {
+            baseClass: 'kangaroo-attachment-card',
+            defaultKind: 'attachment-file',
+            defaultBadge: '文件'
+        });
+        refreshNode('[data-kangaroo-video]', '.kangaroo-video-label', {
+            baseClass: 'kangaroo-video-card',
+            defaultKind: 'attachment-video',
+            defaultBadge: '视频'
+        });
+        refreshNode('[data-kangaroo-pdf]', '.kangaroo-pdf-label', {
+            baseClass: 'kangaroo-pdf-card',
+            defaultKind: 'attachment-pdf',
+            defaultBadge: 'PDF'
+        });
+        this.lastAttachmentNodeLabelsKey = renderKey;
     }
 
-    refreshLinkDomState() {
+    refreshLinkDomState(force = false) {
         if (!this.root) return;
+        const renderKey = `${this.bundlePath || ''}::${this.currentMarkdown}`;
+        if (!force && this.lastLinkDomStateKey === renderKey) {
+            return;
+        }
 
         const apply = () => {
             const links = Array.from(this.root.querySelectorAll('a[href]'));
@@ -4761,7 +6311,8 @@ class KangarooWysiwygEditor {
             }
 
             this.updateSelectedLinkOverlay();
-            this.refreshAttachmentNodeLabels();
+            this.refreshAttachmentNodeLabels(force);
+            this.lastLinkDomStateKey = renderKey;
         };
 
         window.requestAnimationFrame(apply);
@@ -4771,16 +6322,34 @@ class KangarooWysiwygEditor {
         const rootElement = this.root?.querySelector?.('.ProseMirror') || this.root;
         if (!rootElement) return;
 
+        const { selection } = this.editor.state;
+        const selectionNodeType = selection?.node?.type?.name || '';
+        if (
+            this.lastRangeSelectionMarkdown === this.currentMarkdown
+            && this.lastRangeSelectionFrom === selection?.from
+            && this.lastRangeSelectionTo === selection?.to
+            && this.lastRangeSelectionNodeType === selectionNodeType
+        ) {
+            return;
+        }
+
         for (const element of Array.from(rootElement.querySelectorAll('.is-range-selected'))) {
             element.classList.remove('is-range-selected');
         }
 
-        const { selection } = this.editor.state;
         if (!selection || selection.empty) {
+            this.lastRangeSelectionMarkdown = this.currentMarkdown;
+            this.lastRangeSelectionFrom = selection?.from ?? null;
+            this.lastRangeSelectionTo = selection?.to ?? null;
+            this.lastRangeSelectionNodeType = selectionNodeType;
             return;
         }
 
         if (selection.node?.type?.name === 'image' || selection.node?.type?.name === 'kangarooAttachment' || selection.node?.type?.name === 'kangarooVideo' || selection.node?.type?.name === 'kangarooPdf') {
+            this.lastRangeSelectionMarkdown = this.currentMarkdown;
+            this.lastRangeSelectionFrom = selection.from;
+            this.lastRangeSelectionTo = selection.to;
+            this.lastRangeSelectionNodeType = selectionNodeType;
             return;
         }
 
@@ -4850,6 +6419,11 @@ class KangarooWysiwygEditor {
                 container.classList.add('is-range-selected');
             }
         }
+
+        this.lastRangeSelectionMarkdown = this.currentMarkdown;
+        this.lastRangeSelectionFrom = selection.from;
+        this.lastRangeSelectionTo = selection.to;
+        this.lastRangeSelectionNodeType = selectionNodeType;
     }
 
     getCurrentTextblockElement() {
@@ -5537,6 +7111,26 @@ class KangarooWysiwygEditor {
         return true;
     }
 
+    insertParagraphAfterSelectedImageNode() {
+        const selected = this.selectedImageNodeView;
+        const pos = selected?.getPos?.();
+        if (typeof pos === 'number') {
+            this.editor.chain().setNodeSelection(pos).focus(undefined, {
+                scrollIntoView: false
+            }).run();
+        }
+
+        const didInsert = insertParagraphAfterSelectedNode(this.editor, 'image');
+        if (didInsert) {
+            this.clearSelectedImageNode();
+            this.syncMarkdown();
+            this.refreshLineMap();
+            this.emitChange();
+        }
+
+        return didInsert;
+    }
+
     resolveImagePath(src) {
         if (!src) return null;
         const decodedSrc = normalizeLinkHref(src);
@@ -5956,7 +7550,7 @@ class SimpleTiptapKangarooEditor {
 
         this.editor = new Editor({
             element: this.root,
-            content: this.currentMarkdown,
+            content: prepareMarkdownForEditorParsing(this.currentMarkdown),
             contentType: 'markdown',
             autofocus: false,
             extensions: [
@@ -5991,6 +7585,10 @@ class SimpleTiptapKangarooEditor {
                 attributes: {
                     class: 'kangaroo-prosemirror simple-tiptap-prosemirror'
                 }
+                ,
+                clipboardTextSerializer: (slice) => serializeClipboardSliceToMarkdown(this, slice, {
+                    stripTaskTimestamps: true
+                })
             },
             onCreate: () => {
                 this.syncMarkdown();
@@ -5999,7 +7597,13 @@ class SimpleTiptapKangarooEditor {
                 this.emitSelectionChange();
             },
             onUpdate: () => {
-                this.syncMarkdown();
+                const previousMarkdown = this.currentMarkdown;
+                const nextMarkdown = stripTaskCompletionTimestampsFromMarkdown(normalizeMarkdown(this.editor.getMarkdown()));
+                if (nextMarkdown === previousMarkdown) {
+                    return;
+                }
+
+                this.currentMarkdown = nextMarkdown;
                 this.emitChange();
             }
         });
@@ -6010,7 +7614,14 @@ class SimpleTiptapKangarooEditor {
     }
 
     syncMarkdown() {
-        this.currentMarkdown = normalizeMarkdown(this.editor.getMarkdown());
+        const syncedMarkdown = applyTaskHeadingLevelsToMarkdown(
+            normalizeMarkdown(this.editor.getMarkdown()),
+            this.collectTaskHeadingLevels()
+        );
+        if (syncedMarkdown !== this.currentMarkdown) {
+            this.currentMarkdown = syncedMarkdown;
+        }
+        return this.currentMarkdown;
     }
 
     emitChange() {
@@ -6048,7 +7659,7 @@ class SimpleTiptapKangarooEditor {
 
     getLiveMarkdownSnapshot() {
         try {
-            return normalizeMarkdown(this.editor?.getMarkdown?.() || this.currentMarkdown);
+            return this.currentMarkdown;
         } catch {
             return this.currentMarkdown;
         }
@@ -6083,13 +7694,37 @@ class SimpleTiptapKangarooEditor {
     }
 
     setValue(markdown, options = {}) {
-        this.currentMarkdown = normalizeMarkdown(markdown);
+        const { preserveSelection = false } = options;
+        const nextMarkdown = normalizeMarkdown(markdown);
+        const liveMarkdown = normalizeMarkdown(this.editor?.getMarkdown?.() || '');
+        const selectionSnapshot = preserveSelection
+            ? {
+                from: this.editor?.state?.selection?.from ?? 1,
+                to: this.editor?.state?.selection?.to ?? 1
+            }
+            : null;
+
+        if (nextMarkdown === this.currentMarkdown && liveMarkdown === this.currentMarkdown) {
+            clearBrowserSelection();
+            if (selectionSnapshot) {
+                this.restoreSelectionSnapshot(selectionSnapshot, { scrollIntoView: false });
+            } else {
+                resetEditorSelectionToDocumentStart(this.editor);
+            }
+            return;
+        }
+
+        this.currentMarkdown = nextMarkdown;
         clearBrowserSelection();
-        this.editor.commands.setContent(this.currentMarkdown, {
+        this.editor.commands.setContent(prepareMarkdownForEditorParsing(this.currentMarkdown), {
             contentType: 'markdown',
             emitUpdate: false
         });
-        resetEditorSelectionToDocumentStart(this.editor);
+        if (selectionSnapshot) {
+            this.restoreSelectionSnapshot(selectionSnapshot, { scrollIntoView: false });
+        } else {
+            resetEditorSelectionToDocumentStart(this.editor);
+        }
         this.syncMarkdown();
         if (options.emitChange) {
             this.emitChange();
@@ -6097,6 +7732,11 @@ class SimpleTiptapKangarooEditor {
     }
 
     refreshDisplayState() {
+        const liveMarkdown = normalizeMarkdown(this.editor?.getMarkdown?.() || '');
+        if (liveMarkdown === this.currentMarkdown) {
+            return false;
+        }
+
         this.setValue(this.currentMarkdown, { emitChange: false });
     }
 
@@ -6139,7 +7779,7 @@ class SimpleTiptapKangarooEditor {
 
     insertMarkdown(markdown) {
         if (!markdown) return;
-        this.editor.chain().focus(undefined, { scrollIntoView: false }).insertContent(markdown, { contentType: 'markdown' }).run();
+        return insertMarkdownWithImageFallback(this, markdown, { scrollIntoView: false });
     }
 
     insertHtml(html) {
@@ -6164,15 +7804,12 @@ class SimpleTiptapKangarooEditor {
         const targetSrc = String(src || '').trim();
         if (!targetSrc) return false;
         const chain = this.editor.chain().focus(undefined, { scrollIntoView: false }).insertContent({
-            type: 'paragraph',
-            content: [{
-                type: 'image',
-                attrs: {
-                    src: targetSrc,
-                    alt: options.alt || 'image',
-                    title: options.title || null
-                }
-            }]
+            type: 'image',
+            attrs: {
+                src: targetSrc,
+                alt: options.alt || 'image',
+                title: options.title || null
+            }
         });
         if (options.insertTrailingParagraph) {
             chain.enter();
@@ -6217,6 +7854,17 @@ class SimpleTiptapKangarooEditor {
     }
 
     toggleHeading(level) {
+        const lineNumber = this.getAnchorLineFromCursor();
+        const currentLine = this.getLineText(lineNumber);
+        if (isTodoMarkdownLine(currentLine)) {
+            const nextLine = updateTodoHeadingMarkdownLine(currentLine, level);
+            if (nextLine && nextLine !== currentLine) {
+                this.replaceLines(lineNumber, lineNumber, [nextLine]);
+                return true;
+            }
+            return true;
+        }
+
         return this.editor.chain().focus(undefined, { scrollIntoView: false }).toggleHeading({ level: clampNumber(Number(level), 1, 6) }).run();
     }
 
@@ -6257,8 +7905,8 @@ class SimpleTiptapKangarooEditor {
 
     getToolbarState() {
         return {
-            canUndo: this.editor.can().chain().focus(undefined, { scrollIntoView: false }).undo().run(),
-            canRedo: this.editor.can().chain().focus(undefined, { scrollIntoView: false }).redo().run(),
+            canUndo: false,
+            canRedo: false,
             headingLevel: [1, 2, 3, 4, 5, 6].find((level) => this.editor.isActive('heading', { level })) || 0,
             bulletList: this.editor.isActive('bulletList'),
             orderedList: this.editor.isActive('orderedList'),
@@ -6270,7 +7918,19 @@ class SimpleTiptapKangarooEditor {
     }
 
     toggleTodoSelection() {
-        return this.toggleTaskList();
+        const lineNumber = this.getAnchorLineFromCursor();
+        const currentLine = this.getLineText(lineNumber);
+        const nextLine = isTodoMarkdownLine(currentLine)
+            ? stripTodoLineToParagraph(currentLine, currentLine)
+            : normalizeTodoLine(currentLine, false);
+        if (nextLine === currentLine) {
+            return true;
+        }
+        this.replaceLines(lineNumber, lineNumber, [nextLine], {
+            preserveViewport: true,
+            restoreCursorAtLineEnd: true
+        });
+        return true;
     }
 
     getAnchorLineFromCursor() {
@@ -6401,11 +8061,10 @@ class SimpleTiptapKangarooEditor {
         for (let index = 0; index < lines.length; index++) {
             const match = lines[index].match(/^(\s*)([-+*]|\d+\.)\s+\[([ xX])\]\s*(.*)$/);
             if (!match) continue;
-            const parsedHeading = parseTaskHeadingText(match[4] || '');
             todos.push({
                 lineNumber: index + 1,
                 checked: String(match[3] || '').toLowerCase() === 'x',
-                text: parsedHeading ? parsedHeading.text : String(match[4] || '').trim(),
+                text: stripTaskCompletionTimestamp(String(match[4] || '').trim()),
                 kindIndex: kindIndex++
             });
         }
@@ -6434,7 +8093,11 @@ class SimpleTiptapKangarooEditor {
         }
 
         if (!changed) return false;
-        this.setValue(lines.join('\n'), { emitChange: true });
+        this.setValue(lines.join('\n'), {
+            emitChange: true,
+            preserveSelection: true,
+            preserveViewport: true
+        });
         return true;
     }
 
@@ -6633,8 +8296,279 @@ function normalizeMarkdown(markdown) {
     return canonicalizeMarkdownResourceLinks(String(markdown || '').replace(/\r\n/g, '\n'));
 }
 
+function prepareMarkdownForEditorParsing(markdown) {
+    const normalized = normalizeMarkdown(markdown);
+    const lines = normalized.split('\n');
+    const isBlankLine = (line) => !String(line || '').trim();
+    const isQuoteLine = (line) => /^\s*>/.test(String(line || ''));
+    const isBareQuoteLine = (line) => /^\s*>\s*$/.test(String(line || ''));
+    const getQuoteMarkerPrefix = (line) => {
+        const text = String(line || '');
+        const match = text.match(/^(\s*(?:>\s*)+)/);
+        if (match?.[1]) {
+            return `${match[1].replace(/\s+$/, '')} `;
+        }
+        return text.startsWith('>') ? '> ' : '';
+    };
+    const findPrevNonBlankIndex = (startIndex) => {
+        for (let index = startIndex; index >= 0; index--) {
+            if (!isBlankLine(lines[index])) return index;
+        }
+        return -1;
+    };
+    const findNextNonBlankIndex = (startIndex) => {
+        for (let index = startIndex; index < lines.length; index++) {
+            if (!isBlankLine(lines[index])) return index;
+        }
+        return -1;
+    };
+
+    const nextLines = [];
+    for (let index = 0; index < lines.length; index++) {
+        const line = lines[index];
+
+        if (isBareQuoteLine(line)) {
+            nextLines.push(`${getQuoteMarkerPrefix(line) || '> '}`);
+            continue;
+        }
+
+        if (isBlankLine(line)) {
+            const prevIndex = findPrevNonBlankIndex(index - 1);
+            const nextIndex = findNextNonBlankIndex(index + 1);
+            if (prevIndex >= 0 && nextIndex >= 0 && isQuoteLine(lines[prevIndex]) && isQuoteLine(lines[nextIndex])) {
+                nextLines.push(`${getQuoteMarkerPrefix(lines[prevIndex]) || getQuoteMarkerPrefix(lines[nextIndex]) || '> '}`);
+                while (index + 1 < lines.length && (isBlankLine(lines[index + 1]) || isBareQuoteLine(lines[index + 1]))) {
+                    index += 1;
+                }
+                continue;
+            }
+        }
+
+        const emptyTaskMatch = String(line || '').match(/^(\s*)([-+*]|\d+\.)\s+\[([ xX])\]\s*$/);
+        if (emptyTaskMatch) {
+            nextLines.push(`${emptyTaskMatch[1]}${emptyTaskMatch[2]} [${emptyTaskMatch[3]}] `);
+            continue;
+        }
+
+        nextLines.push(line);
+    }
+
+    return nextLines.join('\n');
+}
+
 function normalizePastedMarkdown(markdown) {
     return normalizeMarkdown(markdown).replace(/\u00a0/g, ' ');
+}
+
+function escapeHtmlText(value) {
+    return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function splitMarkdownAroundImageSyntax(markdown) {
+    const text = String(markdown || '');
+    if (!text) {
+        return [];
+    }
+
+    const parts = [];
+    const imagePattern = /!\[([^\]]*)\]\(([^)]+)\)/g;
+    let lastIndex = 0;
+    let match = null;
+
+    while ((match = imagePattern.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+            parts.push({
+                type: 'markdown',
+                text: text.slice(lastIndex, match.index)
+            });
+        }
+
+        parts.push({
+            type: 'image',
+            alt: match[1] || '',
+            src: match[2] || ''
+        });
+        lastIndex = imagePattern.lastIndex;
+    }
+
+    if (lastIndex < text.length) {
+        parts.push({
+            type: 'markdown',
+            text: text.slice(lastIndex)
+        });
+    }
+
+    return parts;
+}
+
+function shouldRenderStandaloneQuoteMarkdownAsHtml(markdown) {
+    const normalized = normalizePastedMarkdown(markdown);
+    const lines = normalized.split('\n');
+    let hasQuoteLine = false;
+    let hasBlankQuoteLine = false;
+
+    for (const line of lines) {
+        if (!String(line || '').trim()) {
+            continue;
+        }
+
+        if (!/^\s*>/.test(String(line || ''))) {
+            return false;
+        }
+
+        hasQuoteLine = true;
+        if (/^\s*>\s*$/.test(String(line || ''))) {
+            hasBlankQuoteLine = true;
+        }
+    }
+
+    return hasQuoteLine && hasBlankQuoteLine;
+}
+
+function convertStandaloneQuoteMarkdownToHtml(markdown) {
+    const normalized = normalizePastedMarkdown(markdown);
+    const lines = normalized.split('\n');
+    const paragraphs = [];
+    let currentParagraphLines = [];
+
+    const flushParagraph = () => {
+        if (!currentParagraphLines.length) {
+            return;
+        }
+        paragraphs.push(`<p>${currentParagraphLines.join('<br>')}</p>`);
+        currentParagraphLines = [];
+    };
+
+    for (const line of lines) {
+        const text = String(line || '');
+        if (!text.trim()) {
+            continue;
+        }
+
+        const bareQuoteMatch = text.match(/^\s*>\s*$/);
+        if (bareQuoteMatch) {
+            flushParagraph();
+            continue;
+        }
+
+        const quoteMatch = text.match(/^\s*>\s?(.*)$/);
+        if (!quoteMatch) {
+            return '';
+        }
+
+        currentParagraphLines.push(escapeHtmlText(quoteMatch[1] || ''));
+    }
+
+    flushParagraph();
+    if (!paragraphs.length) {
+        return '';
+    }
+
+    return `<blockquote>${paragraphs.join('')}</blockquote>`;
+}
+
+function insertMarkdownWithImageFallback(editorInstance, markdown, { scrollIntoView = false } = {}) {
+    const editor = editorInstance?.editor;
+    if (!editor) {
+        return false;
+    }
+
+    const normalizedMarkdown = normalizePastedMarkdown(markdown);
+    if (!normalizedMarkdown) {
+        return false;
+    }
+
+    if (shouldRenderStandaloneQuoteMarkdownAsHtml(normalizedMarkdown)) {
+        const quoteHtml = convertStandaloneQuoteMarkdownToHtml(normalizedMarkdown);
+        if (quoteHtml) {
+            const didInsertQuoteHtml = editor.chain().focus(undefined, { scrollIntoView }).insertContent(quoteHtml).run();
+            if (didInsertQuoteHtml) {
+                return true;
+            }
+        }
+    }
+
+    const hasImageSyntax = /!\[[^\]]*]\([^)]+\)/.test(normalizedMarkdown);
+    if (hasImageSyntax) {
+        const parts = splitMarkdownAroundImageSyntax(normalizedMarkdown);
+        if (parts.length > 1) {
+            let insertedAnyPart = false;
+
+            for (const part of parts) {
+                if (part.type === 'image') {
+                    const didInsertImage = editor.chain().focus(undefined, { scrollIntoView }).insertContent({
+                        type: 'image',
+                        attrs: {
+                            src: part.src,
+                            alt: part.alt || 'image',
+                            title: null
+                        }
+                    }).run();
+                    if (didInsertImage) {
+                        insertedAnyPart = true;
+                        continue;
+                    }
+
+                    const fallbackImageText = `![${part.alt || 'image'}](${part.src || ''})`;
+                    const didInsertImageText = editor.chain().focus(undefined, { scrollIntoView }).insertContent(fallbackImageText).run();
+                    if (didInsertImageText) {
+                        insertedAnyPart = true;
+                    }
+                    continue;
+                }
+
+                const chunkMarkdown = prepareMarkdownForEditorParsing(part.text || '');
+                if (!chunkMarkdown) {
+                    continue;
+                }
+
+                const didInsertChunk = editor.chain().focus(undefined, { scrollIntoView }).insertContent(chunkMarkdown, {
+                    contentType: 'markdown'
+                }).run();
+                if (!didInsertChunk) {
+                    const didInsertChunkText = editor.chain().focus(undefined, { scrollIntoView }).insertContent(part.text || '').run();
+                    if (didInsertChunkText) {
+                        insertedAnyPart = true;
+                    }
+                    continue;
+                }
+
+                insertedAnyPart = true;
+            }
+
+            if (insertedAnyPart) {
+                return true;
+            }
+        }
+    }
+
+    const preparedMarkdown = prepareMarkdownForEditorParsing(normalizedMarkdown);
+    const didInsertMarkdown = editor.chain().focus(undefined, { scrollIntoView }).insertContent(preparedMarkdown, {
+        contentType: 'markdown'
+    }).run();
+    if (didInsertMarkdown) {
+        return true;
+    }
+
+    const didInsertPlainText = editor.chain().focus(undefined, { scrollIntoView }).insertContent(normalizedMarkdown).run();
+    if (didInsertPlainText) {
+        if (typeof editorInstance.setValue === 'function') {
+            editorInstance.setValue(editorInstance.getValue?.() || normalizedMarkdown, {
+                forceRebuild: true,
+                preserveSelection: true,
+                preserveViewport: true
+            });
+        }
+        return true;
+    }
+
+    return editor.chain().focus(undefined, { scrollIntoView }).insertContent({
+        type: 'text',
+        text: normalizedMarkdown
+    }).run();
 }
 
 function shouldInterpretPastedTextAsMarkdown(text) {
@@ -6941,6 +8875,9 @@ function buildPdfPreviewSrc(src) {
 async function buildPdfPreviewDataUrl(src) {
     const normalized = String(src || '').trim();
     if (!normalized) return '';
+    if (pdfPreviewDataUrlCache.has(normalized)) {
+        return pdfPreviewDataUrlCache.get(normalized) || '';
+    }
 
     let filePath = '';
     try {
@@ -6964,7 +8901,9 @@ async function buildPdfPreviewDataUrl(src) {
                 height: Math.round(1200 * 1.4142)
             });
             if (thumbnail && !thumbnail.isEmpty()) {
-                return thumbnail.toDataURL();
+                const dataUrl = thumbnail.toDataURL();
+                pdfPreviewDataUrlCache.set(normalized, dataUrl);
+                return dataUrl;
             }
         }
     } catch {
@@ -6974,7 +8913,9 @@ async function buildPdfPreviewDataUrl(src) {
     try {
         const fallback = nativeImage.createFromPath(filePath);
         if (fallback && !fallback.isEmpty()) {
-            return fallback.toDataURL();
+            const dataUrl = fallback.toDataURL();
+            pdfPreviewDataUrlCache.set(normalized, dataUrl);
+            return dataUrl;
         }
     } catch {
         return '';
@@ -7045,7 +8986,7 @@ function collectDocumentAnchors(editor) {
                     ? normalizeComparableText((node.attrs?.label || getPathTail(node.attrs?.href || '')).trim())
                 : normalizeComparableText(node.textContent || '');
 
-        if (!normalizedText) {
+        if (!normalizedText && !node.isTextblock) {
             return true;
         }
 
@@ -7059,7 +9000,9 @@ function collectDocumentAnchors(editor) {
                     ? String(node.attrs?.label || getPathTail(node.attrs?.href || '')).trim()
                     : type === 'kangarooVideo'
                         ? String(node.attrs?.label || getPathTail(node.attrs?.href || '')).trim()
-                    : String(node.textContent || '').trim(),
+                        : type === 'kangarooPdf'
+                            ? String(node.attrs?.label || getPathTail(node.attrs?.href || '')).trim()
+                            : String(node.textContent || '').trim(),
             normalizedText,
             kind,
             level: type === 'heading' ? Number(node.attrs?.level || 1) : null
@@ -7425,7 +9368,7 @@ function normalizeMarkdownLineForMatch(line) {
     let text = String(line || '').trim();
     if (!text) return '';
 
-    text = text.replace(/^#{1,6}\s+/, '');
+    text = text.replace(/^#{1,6}(?:\s+|$)/, '');
     text = text.replace(/^>\s?/, '');
     text = text.replace(/^(?:[-+*]|\d+\.)\s+\[[ xX]\]\s+/, '');
     text = text.replace(/^(?:[-+*]|\d+\.)\s+/, '');
@@ -7460,8 +9403,8 @@ function normalizeTodoLine(line, checked = false) {
 }
 
 function parseTaskHeadingText(text) {
-    const rawText = String(text || '');
-    const match = rawText.match(/^\s*(#{1,6})\s+(.+?)\s*$/);
+    const rawText = stripTaskCompletionTimestamp(String(text || ''));
+    const match = rawText.match(/^\s*(#{1,6})(?:\s+(.+?)\s*)?$/);
     if (!match) return null;
 
     return {
@@ -7470,29 +9413,57 @@ function parseTaskHeadingText(text) {
     };
 }
 
-function parseTodoHeadingMarkdownLine(line) {
-    const match = String(line || '').match(/^(\s*)([-+*]|\d+\.)\s+\[([ xX])\]\s+(#{1,6})\s+(.+?)\s*$/);
-    if (!match) return null;
+function findTaskItemSelectionContext(state, taskItemName = 'taskItem') {
+    const { selection } = state || {};
+    const { $from } = selection || {};
+    if (!$from) {
+        return null;
+    }
 
-    return {
-        indent: match[1] || '',
-        bullet: match[2] || '-',
-        checked: String(match[3] || '').toLowerCase() === 'x',
-        level: clampNumber((match[4] || '').length, 1, 6),
-        text: String(match[5] || '').trim()
-    };
-}
+    for (let depth = $from.depth; depth >= 0; depth--) {
+        const node = $from.node(depth);
+        if (node?.type?.name !== taskItemName) {
+            continue;
+        }
 
-function parseAnyHeadingMarkdownLine(line) {
-    const todoHeading = parseTodoHeadingMarkdownLine(line);
-    if (todoHeading) {
         return {
-            level: todoHeading.level,
-            text: todoHeading.text,
-            task: true
+            depth,
+            node,
+            pos: $from.before(depth)
         };
     }
 
+    return null;
+}
+
+function isTaskItemEffectivelyEmpty(node) {
+    if (!node || node.type?.name !== 'taskItem') {
+        return false;
+    }
+
+    let hasVisibleText = false;
+    let hasNestedContent = false;
+
+    node.forEach((child, index) => {
+        if (index === 0 && child?.type?.name === 'paragraph') {
+            if (String(child.textContent || '').trim()) {
+                hasVisibleText = true;
+            }
+            return;
+        }
+
+        if (child?.isTextblock && String(child.textContent || '').trim()) {
+            hasVisibleText = true;
+            return;
+        }
+
+        hasNestedContent = true;
+    });
+
+    return !hasVisibleText && !hasNestedContent;
+}
+
+function parseAnyHeadingMarkdownLine(line) {
     const headingMatch = String(line || '').match(/^(#{1,6})\s+(.+?)\s*$/);
     if (!headingMatch) return null;
 
@@ -7540,6 +9511,28 @@ function isTodoMarkdownLine(line) {
     return /^(\s*)[-+*]\s+\[([ xX])\]\s*(.*)$/.test(String(line || ''));
 }
 
+function updateTodoHeadingMarkdownLine(line, headingLevel = 0) {
+    const taskMatch = String(line || '').match(/^(\s*)([-+*]|\d+\.)\s+\[([ xX])\]\s*(.*)$/);
+    if (!taskMatch) {
+        return null;
+    }
+
+    const nextHeadingLevel = clampNumber(Number(headingLevel || 0), 0, 6);
+    const rawText = String(taskMatch[4] || '');
+    const parsedHeading = parseTaskHeadingText(rawText);
+    const currentHeadingLevel = parsedHeading ? clampNumber(Number(parsedHeading.level || 0), 0, 6) : 0;
+    const baseText = parsedHeading ? parsedHeading.text : rawText;
+    if (!baseText && nextHeadingLevel > 0) {
+        return `${taskMatch[1]}${taskMatch[2]} [${taskMatch[3]}] ${'#'.repeat(nextHeadingLevel)}`;
+    }
+    const shouldRemoveHeading = nextHeadingLevel <= 0 || currentHeadingLevel === nextHeadingLevel;
+    const nextText = shouldRemoveHeading
+        ? baseText
+        : `${'#'.repeat(nextHeadingLevel)} ${baseText}`.trim();
+
+    return `${taskMatch[1]}${taskMatch[2]} [${taskMatch[3]}] ${nextText}`.trimEnd();
+}
+
 function applyTaskHeadingLevelsToMarkdown(markdown, headingLevels = []) {
     const lines = String(markdown || '').split('\n');
     let taskIndex = 0;
@@ -7549,20 +9542,158 @@ function applyTaskHeadingLevelsToMarkdown(markdown, headingLevels = []) {
         if (!match) continue;
 
         const headingLevel = clampNumber(Number(headingLevels[taskIndex] || 0), 0, 6);
-        let taskText = String(match[4] || '').trim();
+        const rawTaskText = String(match[4] || '');
+        let taskText = rawTaskText;
         const existingHeading = parseTaskHeadingText(taskText);
         if (headingLevel > 0) {
             if (existingHeading) {
                 taskText = existingHeading.text;
             }
-            taskText = `${'#'.repeat(headingLevel)} ${taskText}`.trim();
+            if (taskText) {
+                taskText = `${'#'.repeat(headingLevel)} ${taskText}`.trim();
+            } else {
+                taskText = '#'.repeat(headingLevel);
+            }
         }
 
-        lines[index] = `${match[1]}${match[2]} [${match[3]}] ${taskText}`.trimEnd();
+        lines[index] = `${match[1]}${match[2]} [${match[3]}] ${taskText}`;
         taskIndex += 1;
     }
 
     return lines.join('\n');
+}
+
+const TASK_COMPLETION_TIMESTAMP_REGEX = /\s*@\+(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)\s*$/;
+
+function stripTaskCompletionTimestamp(text, options = {}) {
+    const { trimTrailing = true } = options;
+    const stripped = String(text || '').replace(TASK_COMPLETION_TIMESTAMP_REGEX, '');
+    return trimTrailing ? stripped.trimEnd() : stripped;
+}
+
+function stripTaskCompletionTimestampsFromMarkdown(markdown) {
+    const lines = String(markdown || '').split('\n');
+    const nextLines = lines.map((line) => {
+        const match = String(line || '').match(/^(\s*)([-+*]|\d+\.)\s+\[([ xX])\]\s*(.*)$/);
+        if (!match) {
+            return line;
+        }
+
+        const visibleText = stripTaskCompletionTimestamp(String(match[4] || ''), { trimTrailing: false });
+        return `${match[1]}${match[2]} [${match[3]}] ${visibleText}`;
+    });
+
+    let nextMarkdown = nextLines.join('\n');
+    if (String(markdown || '').endsWith('\n') && !nextMarkdown.endsWith('\n')) {
+        nextMarkdown += '\n';
+    }
+    return nextMarkdown;
+}
+
+function serializeClipboardSliceToMarkdown(editorInstance, slice, { stripTaskTimestamps = false } = {}) {
+    if (!slice) {
+        return '';
+    }
+
+    const markdownManager = editorInstance?.editor?.markdown || editorInstance?.editor?.storage?.manager || null;
+    if (!markdownManager || typeof markdownManager.serialize !== 'function') {
+        return '';
+    }
+
+    try {
+        const sliceJson = typeof slice.toJSON === 'function' ? slice.toJSON() : null;
+        const content = sliceJson?.content || slice?.content?.toJSON?.() || [];
+        const sliceContainsMediaNode = (nodes = []) => {
+            for (const node of nodes) {
+                if (!node || typeof node !== 'object') continue;
+                if (node.type === 'image' || node.type === 'kangarooAttachment' || node.type === 'kangarooVideo' || node.type === 'kangarooPdf') {
+                    return true;
+                }
+                if (Array.isArray(node.content) && sliceContainsMediaNode(node.content)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const serializeContent = (nodes) => markdownManager.serialize({
+            type: 'doc',
+            content: nodes
+        });
+        const trimBoundaryWhitespaceNodes = (nodes = []) => {
+            if (!Array.isArray(nodes) || !nodes.length) {
+                return nodes;
+            }
+
+            const nextNodes = nodes.map((node) => {
+                if (!node || typeof node !== 'object') {
+                    return node;
+                }
+
+                if (Array.isArray(node.content)) {
+                    return {
+                        ...node,
+                        content: trimBoundaryWhitespaceNodes(node.content)
+                    };
+                }
+
+                return node;
+            });
+
+            let start = 0;
+            let end = nextNodes.length;
+            while (start < end) {
+                const node = nextNodes[start];
+                if (node?.type === 'text' && !String(node.text || '').trim()) {
+                    start += 1;
+                    continue;
+                }
+                break;
+            }
+            while (end > start) {
+                const node = nextNodes[end - 1];
+                if (node?.type === 'text' && !String(node.text || '').trim()) {
+                    end -= 1;
+                    continue;
+                }
+                break;
+            }
+
+            return nextNodes.slice(start, end);
+        };
+
+        const normalizeClipboardMarkdown = (value) => normalizeMarkdown(value || '').replace(/[ \t]+$/g, '');
+        const serializeWithFallback = (nodes) => {
+            try {
+                return normalizeClipboardMarkdown(serializeContent(nodes) || '');
+            } catch {
+                return '';
+            }
+        };
+
+        if (sliceContainsMediaNode(content)) {
+            const directSerialized = serializeContent(content) || '';
+            const normalizedDirect = normalizeMarkdown(directSerialized || '');
+            return stripTaskTimestamps
+                ? stripTaskCompletionTimestampsFromMarkdown(normalizedDirect)
+                : normalizedDirect;
+        }
+
+        const originalSerialized = serializeWithFallback(content);
+        const cleanedContent = trimBoundaryWhitespaceNodes(content);
+        const cleanedSerialized = cleanedContent !== content ? serializeWithFallback(cleanedContent) : '';
+        const normalized = cleanedSerialized && (
+            !originalSerialized
+            || originalSerialized === cleanedSerialized
+            || /\s$/.test(originalSerialized)
+        )
+            ? cleanedSerialized
+            : originalSerialized;
+        return stripTaskTimestamps
+            ? stripTaskCompletionTimestampsFromMarkdown(normalized)
+            : normalized;
+    } catch {
+        return '';
+    }
 }
 
 function isImageMarkdownLine(line) {
@@ -7608,6 +9739,34 @@ function isEffectivelyEmptyTextblockNode(node) {
     }
 
     return !String(node.textContent || '').trim();
+}
+
+function isParagraphBreakOnlyNode(node) {
+    if (node?.type?.name !== 'paragraph') {
+        return false;
+    }
+
+    if (!node.childCount) {
+        return true;
+    }
+
+    let hasBreak = false;
+    let hasVisibleContent = false;
+
+    node.forEach((child) => {
+        if (child.type?.name === 'hardBreak') {
+            hasBreak = true;
+            return;
+        }
+
+        if (child.isText && !String(child.text || '').trim()) {
+            return;
+        }
+
+        hasVisibleContent = true;
+    });
+
+    return !hasVisibleContent && (hasBreak || !String(node.textContent || '').trim());
 }
 
 function getAdjacentProseMirrorTextblock(element, direction = 1) {

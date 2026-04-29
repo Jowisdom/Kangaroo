@@ -1,7 +1,7 @@
 {
-  "name": "textbundle-editor",
-  "version": "1.0.0",
-  "description": "Kangaroo is a local TextBundle editor for Markdown, attachments, and preview-based writing.",
+  "name": "kangaroo",
+  "version": "1.0.2",
+  "description": "Kangaroo is a local bundle editor for Markdown, attachments, and preview-based writing.",
   "homepage": "https://example.com/kangaroo",
   "author": {
     "name": "Wisdom",
@@ -10,14 +10,26 @@
   "main": "main.js",
   "type": "commonjs",
   "scripts": {
+    "predist": "node scripts/build-mac-clipboard-helper.js",
+    "predist:app": "node scripts/build-mac-clipboard-helper.js",
+    "predist:mac": "node scripts/build-mac-clipboard-helper.js",
     "start": "electron .",
     "dist": "electron-builder",
+    "dist:app": "electron-builder --dir",
+    "dist:mac": "electron-builder --mac --x64 --arm64",
+    "dist:win": "electron-builder --win --x64 --arm64",
     "dist:linux": "electron-builder --linux AppImage deb --arm64 --x64"
   },
   "build": {
     "appId": "com.yourname.kangaroo",
     "productName": "Kangaroo",
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
     "icon": "build/icon.png",
+    "compression": "maximum",
+    "electronLanguages": [
+      "en-US",
+      "zh-CN"
+    ],
     "directories": {
       "output": "dist"
     },
@@ -30,9 +42,29 @@
       "build/**/*",
       "theme-assets/**/*",
       "node_modules/**/*",
+      "scripts/build-mac-clipboard-helper.js",
+      "!node_modules/**/{test,tests,__tests__,powered-test,docs,doc,example,examples,.github,.vscode}/**",
+      "!node_modules/**/*.map",
+      "!node_modules/**/*.ts",
+      "!node_modules/**/*.tsx",
+      "!node_modules/**/*.coffee",
+      "!node_modules/**/src/**",
+      "!node_modules/**/coverage/**",
+      "!node_modules/**/benchmark{,s}/**",
+      "!node_modules/**/bench{,s}/**",
       "!dist{,/**}",
       "!.git{,/**}",
       "!.idea{,/**}"
+    ],
+    "extraResources": [
+      {
+        "from": "build/copy-file-to-clipboard",
+        "to": "copy-file-to-clipboard"
+      },
+      {
+        "from": "build/copy-file-to-clipboard.app",
+        "to": "copy-file-to-clipboard.app"
+      }
     ],
     "win": {
       "target": [
@@ -52,11 +84,12 @@
       "category": "Utility",
       "maintainer": "Wisdom <wisdom@example.com>",
       "mimeTypes": [
+        "application/x-kangaroo",
         "application/x-textbundle"
       ],
       "desktop": {
         "entry": {
-          "MimeType": "application/x-textbundle;"
+          "MimeType": "application/x-kangaroo;application/x-textbundle;"
         }
       }
     },
@@ -66,8 +99,9 @@
       "extendInfo": {
         "CFBundleDocumentTypes": [
           {
-            "CFBundleTypeName": "TextBundle Document",
+            "CFBundleTypeName": "Kangaroo Document",
             "CFBundleTypeExtensions": [
+              "kangaroo",
               "textbundle"
             ],
             "CFBundleTypeRole": "Editor",
@@ -79,10 +113,19 @@
     },
     "fileAssociations": [
       {
+        "ext": "kangaroo",
+        "name": "Kangaroo Document",
+        "role": "Editor",
+        "description": "Kangaroo Document",
+        "mimeType": "application/x-kangaroo",
+        "isPackage": true,
+        "rank": "Owner"
+      },
+      {
         "ext": "textbundle",
         "name": "TextBundle Document",
         "role": "Editor",
-        "description": "Kangaroo TextBundle Document",
+        "description": "Legacy Kangaroo TextBundle Document",
         "mimeType": "application/x-textbundle",
         "isPackage": true,
         "rank": "Owner"
@@ -90,7 +133,7 @@
     ]
   },
   "devDependencies": {
-    "electron": "^41.0.4",
+    "electron": "^41.3.0",
     "electron-builder": "^26.8.1"
   },
   "dependencies": {
