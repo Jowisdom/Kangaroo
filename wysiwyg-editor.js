@@ -1,18 +1,444 @@
 const fs = require('fs');
 const { nativeImage, ipcRenderer } = require('electron');
-const { Editor, Extension, Node: TiptapNode, mergeAttributes, getMarkRange, getRenderedAttributes, renderNestedMarkdownContent } = require('@tiptap/core');
+const { Editor, Extension, Node: TiptapNode, mergeAttributes, getMarkRange, getRenderedAttributes, nodeInputRule, renderNestedMarkdownContent } = require('@tiptap/core');
 const { StarterKit } = require('@tiptap/starter-kit');
+const { GapCursor } = require('@tiptap/extension-gapcursor');
+const { GapCursor: ProseMirrorGapCursor } = require('prosemirror-gapcursor');
 const { Underline } = require('@tiptap/extension-underline');
 const { Link } = require('@tiptap/extension-link');
 const { Image } = require('@tiptap/extension-image');
 const { TaskList, TaskItem } = require('@tiptap/extension-list');
 const { Markdown } = require('@tiptap/markdown');
-const { Plugin, Selection, TextSelection } = require('@tiptap/pm/state');
+const { Plugin, Selection, TextSelection, NodeSelection } = require('@tiptap/pm/state');
 const { Fragment } = require('@tiptap/pm/model');
 const path = require('path');
 const { pathToFileURL, fileURLToPath } = require('url');
 
 const pdfPreviewDataUrlCache = new Map();
+const MARKDOWN_IMAGE_INPUT_RULE = /(?:^|\s)(!\[(.+|:?)]\((\S+)(?:(?:\s+)["'](\S+)["'])?\))$/;
+
+function cloneSerializableValue(value) {
+    if (value == null) return null;
+
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch {
+        return null;
+    }
+}
+
+function generateStableNodeId(prefix = 'node') {
+    const rawId = typeof globalThis !== 'undefined' && globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID()
+        : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    return `${prefix}-${rawId}`;
+}
+
+function setSelectionNearPosition(editor, position, bias = 1) {
+    const state = editor?.state;
+    const view = editor?.view;
+    const doc = state?.doc;
+    if (!state || !view || !doc || typeof position !== 'number' || !Number.isFinite(position)) {
+        return false;
+    }
+
+    const targetPos = Math.max(0, Math.min(Math.floor(position), doc.content.size));
+
+    try {
+        const selection = Selection.near(doc.resolve(targetPos), bias);
+        editor.chain().focus(undefined, {
+            scrollIntoView: false
+        }).command(({ tr }) => {
+            tr.setSelection(selection);
+            return true;
+        }).run();
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function setTextSelectionNearPosition(editor, position, bias = 1) {
+    const state = editor?.state;
+    const view = editor?.view;
+    const doc = state?.doc;
+    if (!state || !view || !doc || typeof position !== 'number' || !Number.isFinite(position)) {
+        return false;
+    }
+
+    const targetPos = Math.max(0, Math.min(Math.floor(position), doc.content.size));
+
+    try {
+        const selection = TextSelection.near(doc.resolve(targetPos), bias);
+        editor.chain().focus(undefined, {
+            scrollIntoView: false
+        }).command(({ tr }) => {
+            tr.setSelection(selection);
+            return true;
+        }).run();
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function getEdgeHitSideFromClientX(clientX, rect, options = {}) {
+    if (!rect) return '';
+
+    const minPadding = Number.isFinite(options.minPadding) ? options.minPadding : 18;
+    const maxPadding = Number.isFinite(options.maxPadding) ? options.maxPadding : 40;
+    const ratio = Number.isFinite(options.ratio) ? options.ratio : 0.16;
+    const hitPadding = Math.max(
+        minPadding,
+        Math.min(maxPadding, Math.round(Math.max(rect.width, 1) * ratio))
+    );
+    const x = Number(clientX) || 0;
+
+    if (x <= rect.left + hitPadding) {
+        return 'before';
+    }
+
+    if (x >= rect.right - hitPadding) {
+        return 'after';
+    }
+
+    if (x < rect.left) {
+        return 'before';
+    }
+
+    if (x > rect.right) {
+        return 'after';
+    }
+
+    return '';
+}
+
+function placeCursorNearBlockNode(editor, pos, node, side = 'before') {
+    if (!editor || typeof pos !== 'number' || !Number.isFinite(pos) || !node?.nodeSize) {
+        return false;
+    }
+
+    const docSize = editor.state?.doc?.content?.size ?? 0;
+    const targetPos = side === 'after'
+        ? Math.min(pos + node.nodeSize, docSize)
+        : Math.max(0, pos);
+    const bias = side === 'after' ? 1 : -1;
+
+    if (setTextSelectionNearPosition(editor, targetPos, bias)) {
+        return true;
+    }
+
+    const paragraphType = editor.state?.schema?.nodes?.paragraph;
+    if (paragraphType) {
+        try {
+            const insertPos = side === 'after'
+                ? Math.min(pos + node.nodeSize, docSize)
+                : Math.max(0, pos);
+            const tr = editor.state.tr.insert(insertPos, paragraphType.create());
+            const selectionPos = Math.min(insertPos + 1, tr.doc.content.size);
+            tr.setSelection(TextSelection.create(tr.doc, selectionPos));
+            editor.view.dispatch(tr.scrollIntoView());
+            return true;
+        } catch {
+            // fall through to gap cursor
+        }
+    }
+
+    try {
+        const $target = editor.state.doc.resolve(targetPos);
+        let gapCursorPos = ProseMirrorGapCursor.valid($target)
+            ? $target
+            : ProseMirrorGapCursor.findFrom($target, side === 'after' ? 1 : -1, true);
+
+        if (!gapCursorPos) {
+            gapCursorPos = ProseMirrorGapCursor.findFrom($target, side === 'after' ? -1 : 1, true);
+        }
+
+        if (gapCursorPos) {
+            editor.chain().focus(undefined, {
+                scrollIntoView: false
+            }).command(({ tr }) => {
+                tr.setSelection(new ProseMirrorGapCursor(gapCursorPos));
+                return true;
+            }).run();
+            return true;
+        }
+    } catch {
+        // fall through to regular selection
+    }
+
+    return setSelectionNearPosition(editor, targetPos, bias);
+}
+
+function focusTaskBoundaryFromContext(editor, taskContext, preferAfter = false) {
+    if (!editor || !taskContext?.node || typeof taskContext.pos !== 'number') {
+        return false;
+    }
+
+    const boundaryPos = preferAfter
+        ? Math.min(taskContext.pos + taskContext.node.nodeSize, editor.state.doc.content.size)
+        : Math.max(0, taskContext.pos);
+    const bias = preferAfter ? 1 : -1;
+    return setSelectionNearPosition(editor, boundaryPos, bias);
+}
+
+function focusTaskBodyFromContext(editor, taskContext, preferEnd = false) {
+    if (!editor || !taskContext?.node) {
+        return false;
+    }
+
+    const firstTextblock = findFirstTextblockInNode(taskContext.node, taskContext.pos);
+    if (!firstTextblock?.node) {
+        return false;
+    }
+
+    const targetPos = preferEnd
+        ? Math.min(firstTextblock.pos + firstTextblock.node.content.size + 1, editor.state.doc.content.size)
+        : Math.min(firstTextblock.pos + 1, editor.state.doc.content.size);
+
+    try {
+        editor.chain().focus(undefined, {
+            scrollIntoView: false
+        }).setTextSelection(targetPos).run();
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function getTaskItemNodeByKindIndex(editor, kindIndex) {
+    const targetIndex = Number(kindIndex);
+    if (!editor?.state?.doc || !Number.isInteger(targetIndex) || targetIndex < 0) {
+        return null;
+    }
+
+    let currentIndex = 0;
+    let matched = null;
+    editor.state.doc.descendants((node, pos) => {
+        if (node?.type?.name !== 'taskItem') {
+            return true;
+        }
+
+        if (currentIndex === targetIndex) {
+            matched = { node, pos };
+            return false;
+        }
+
+        currentIndex += 1;
+        return true;
+    });
+
+    return matched;
+}
+
+function getTaskItemNodeByStableId(editor, stableId) {
+    const targetId = String(stableId || '').trim();
+    if (!editor?.state?.doc || !targetId) {
+        return null;
+    }
+
+    let currentIndex = 0;
+    let matched = null;
+    let matchCount = 0;
+    editor.state.doc.descendants((node, pos) => {
+        if (node?.type?.name !== 'taskItem') {
+            return true;
+        }
+
+        if (String(node.attrs?.id || '').trim() === targetId) {
+            matchCount += 1;
+            matched = { node, pos, kindIndex: currentIndex };
+            if (matchCount > 1) {
+                matched = null;
+                return false;
+            }
+        }
+
+        currentIndex += 1;
+        return true;
+    });
+
+    return matchCount === 1 ? matched : null;
+}
+
+function findTodoItemForDeletion(editor, todo = {}) {
+    const todoItems = typeof editor?.getTodoItems === 'function'
+        ? editor.getTodoItems()
+        : [];
+    if (!Array.isArray(todoItems) || !todoItems.length) {
+        return null;
+    }
+
+    const stableId = String(todo?.stableId || '').trim();
+    if (stableId) {
+        const stableIdMatch = todoItems.find((item) => String(item?.stableId || '').trim() === stableId);
+        if (stableIdMatch) {
+            return stableIdMatch;
+        }
+    }
+
+    if (Number.isInteger(todo?.kindIndex)) {
+        const kindIndexMatch = todoItems.find((item) => Number.isInteger(item?.kindIndex) && item.kindIndex === todo.kindIndex);
+        if (kindIndexMatch) {
+            return kindIndexMatch;
+        }
+    }
+
+    if (Number.isInteger(todo?.lineNumber)) {
+        const lineMatch = todoItems.find((item) => Number.isInteger(item?.lineNumber) && item.lineNumber === todo.lineNumber);
+        if (lineMatch) {
+            return lineMatch;
+        }
+    }
+
+    const preferredText = String(todo?.todoText || todo?.text || '').trim();
+    if (preferredText) {
+        const textMatch = todoItems.find((item) => String(item?.text || '').trim() === preferredText);
+        if (textMatch) {
+            return textMatch;
+        }
+    }
+
+    return todoItems[0] || null;
+}
+
+function deleteTodoItemFromEditor(editor, todo = {}) {
+    const stableId = String(todo?.stableId || '').trim();
+    const kindIndex = Number.isInteger(todo?.kindIndex) ? todo.kindIndex : null;
+    const lineNumber = Number.isInteger(todo?.lineNumber) ? todo.lineNumber : null;
+
+    let found = null;
+    if (stableId && typeof getTaskItemNodeByStableId === 'function') {
+        found = getTaskItemNodeByStableId(editor, stableId);
+    }
+    if (!found && Number.isInteger(kindIndex) && typeof getTaskItemNodeByKindIndex === 'function') {
+        found = getTaskItemNodeByKindIndex(editor, kindIndex);
+    }
+
+    if (!found && Number.isInteger(lineNumber) && typeof editor?.state?.doc?.descendants === 'function') {
+        let currentLine = 0;
+        editor.state.doc.descendants((node, pos) => {
+            if (node?.type?.name !== 'taskItem') {
+                return true;
+            }
+            const firstTextblock = findFirstTextblockInNode(node, pos);
+            const resolvedLine = firstTextblock?.pos && typeof editor.resolveLineFromPos === 'function'
+                ? editor.resolveLineFromPos(firstTextblock.pos)
+                : null;
+            currentLine += 1;
+            if (resolvedLine === lineNumber || currentLine === lineNumber) {
+                found = { node, pos, kindIndex: currentLine - 1 };
+                return false;
+            }
+            return true;
+        });
+    }
+
+    if (!found?.node || typeof found.pos !== 'number' || !found.node.nodeSize) {
+        return false;
+    }
+
+    const tr = editor.state.tr.delete(found.pos, found.pos + found.node.nodeSize).scrollIntoView();
+    editor.view.dispatch(tr);
+    return true;
+}
+
+function moveTodoItemWithinEditor(editor, sourceStableId, targetStableId, placeAfter = false) {
+    const sourceId = String(sourceStableId || '').trim();
+    const targetId = String(targetStableId || '').trim();
+    if (!editor?.state?.doc || !editor?.state?.tr || !editor?.view || !sourceId || !targetId || sourceId === targetId) {
+        return false;
+    }
+
+    const source = getTaskItemNodeByStableId(editor, sourceId);
+    const target = getTaskItemNodeByStableId(editor, targetId);
+    if (!source?.node || !target?.node || typeof source.pos !== 'number' || typeof target.pos !== 'number') {
+        return false;
+    }
+
+    const sourceNode = source.node;
+    const targetNode = target.node;
+    const sourcePos = source.pos;
+    const targetPos = target.pos;
+    const sourceSize = sourceNode.nodeSize || 0;
+    const targetSize = targetNode.nodeSize || 0;
+    if (!sourceSize || !targetSize) {
+        return false;
+    }
+
+    const tr = editor.state.tr;
+    tr.delete(sourcePos, sourcePos + sourceSize);
+
+    const adjustedTargetPos = sourcePos < targetPos
+        ? targetPos - sourceSize
+        : targetPos;
+    const insertPos = placeAfter
+        ? adjustedTargetPos + targetSize
+        : adjustedTargetPos;
+
+    tr.insert(insertPos, sourceNode);
+    try {
+        tr.setSelection(Selection.near(tr.doc.resolve(Math.min(insertPos + 1, tr.doc.content.size)), 1));
+    } catch {
+        // keep default selection when the inserted node cannot be resolved immediately
+    }
+    editor.view.dispatch(tr.scrollIntoView());
+    return true;
+}
+
+function collectTaskTodoItemsFromEditorState(editor, options = {}) {
+    const todos = [];
+    const resolveLineFromPos = typeof options.resolveLineFromPos === 'function'
+        ? options.resolveLineFromPos
+        : null;
+
+    if (!editor?.state?.doc) {
+        return todos;
+    }
+
+    let kindIndex = 0;
+    editor.state.doc.descendants((node, pos) => {
+        if (node?.type?.name !== 'taskItem') {
+            return true;
+        }
+
+        const textblockNode = getTaskItemPrimaryTextblock(node) || node;
+        let textblockPos = pos;
+        let foundOffset = null;
+        node.forEach((child, childOffset) => {
+            if (foundOffset != null) {
+                return;
+            }
+            if (child === textblockNode) {
+                foundOffset = childOffset;
+            }
+        });
+        if (foundOffset != null) {
+            textblockPos = pos + 1 + foundOffset;
+        }
+        const text = stripTaskCompletionTimestamp(String(textblockNode?.textContent || node.textContent || '').trim());
+        todos.push({
+            lineNumber: resolveLineFromPos ? resolveLineFromPos(textblockPos) || (kindIndex + 1) : (kindIndex + 1),
+            checked: Boolean(node.attrs?.checked),
+            text,
+            kindIndex,
+            stableId: String(node.attrs?.id || '').trim() || null,
+            taskItemPos: pos
+        });
+        kindIndex += 1;
+        return true;
+    });
+
+    return todos;
+}
+
+function getTaskItemPrimaryTextblock(node) {
+    if (!node || typeof node !== 'object' || !Array.isArray(node.content)) {
+        return null;
+    }
+
+    return node.content.find((child) => child?.isTextblock) || null;
+}
 
 function startSystemAttachmentDrag(targetPath, options = {}) {
     const normalizedPath = String(targetPath || '').trim();
@@ -194,6 +620,15 @@ const KangarooTaskItem = TaskItem.extend({
     addAttributes() {
         return {
             ...this.parent?.(),
+            id: {
+                default: null,
+                keepOnSplit: false,
+                parseHTML: (element) => String(element.getAttribute('data-kangaroo-id') || '').trim() || null,
+                renderHTML: (attributes) => {
+                    const id = String(attributes?.id || '').trim();
+                    return id ? { 'data-kangaroo-id': id } : {};
+                }
+            },
             headingLevel: {
                 default: 0,
                 keepOnSplit: true,
@@ -207,7 +642,43 @@ const KangarooTaskItem = TaskItem.extend({
     },
 
     addKeyboardShortcuts() {
-        return this.parent?.() || {};
+        const parentShortcuts = this.parent?.() || {};
+
+        const moveTaskBoundary = (preferAfter = false) => {
+            const { state } = this.editor;
+            const { selection } = state;
+            if (!selection?.empty) {
+                return false;
+            }
+
+            const taskContext = findTaskItemSelectionContext(state, 'taskItem');
+            if (!taskContext?.node) {
+                return false;
+            }
+
+            const firstTextblock = findFirstTextblockInNode(taskContext.node, taskContext.pos);
+            if (!firstTextblock?.node || selection.$from.parent !== firstTextblock.node) {
+                return false;
+            }
+
+            if (!preferAfter && selection.$from.parentOffset > 0) {
+                return false;
+            }
+
+            if (preferAfter && selection.$from.parentOffset < firstTextblock.node.content.size) {
+                return false;
+            }
+
+            return focusTaskBoundaryFromContext(this.editor, taskContext, preferAfter);
+        };
+
+        return {
+            ...parentShortcuts,
+            ArrowLeft: () => moveTaskBoundary(false),
+            Home: () => moveTaskBoundary(false),
+            ArrowRight: () => moveTaskBoundary(true),
+            End: () => moveTaskBoundary(true)
+        };
     },
 
     addNodeView() {
@@ -218,7 +689,7 @@ const KangarooTaskItem = TaskItem.extend({
             const checkbox = document.createElement('input');
             const content = document.createElement('div');
 
-            const applyTextSelection = (preferEnd = false) => {
+            const applyTaskBodySelection = (preferEnd = false) => {
                 if (typeof getPos !== 'function') {
                     return false;
                 }
@@ -229,25 +700,34 @@ const KangarooTaskItem = TaskItem.extend({
                 }
 
                 const currentNode = editor.state.doc.nodeAt(position);
-                const firstTextblock = findFirstTextblockInNode(currentNode, position);
-                if (!firstTextblock?.node) {
+                return focusTaskBodyFromContext(editor, {
+                    pos: position,
+                    node: currentNode
+                }, preferEnd);
+            };
+
+            const applyTaskBoundarySelection = (preferAfter = false) => {
+                if (typeof getPos !== 'function') {
                     return false;
                 }
 
-                const targetPos = preferEnd
-                    ? Math.min(firstTextblock.pos + firstTextblock.node.content.size + 1, editor.state.doc.content.size)
-                    : Math.min(firstTextblock.pos + 1, editor.state.doc.content.size);
+                const position = getPos();
+                if (typeof position !== 'number') {
+                    return false;
+                }
 
-                return editor.chain().focus(undefined, {
-                    scrollIntoView: false
-                }).setTextSelection(targetPos).run();
+                const currentNode = editor.state.doc.nodeAt(position);
+                return focusTaskBoundaryFromContext(editor, {
+                    pos: position,
+                    node: currentNode
+                }, preferAfter);
             };
 
             const insertTextIntoTask = (text) => {
                 if (!text) {
                     return false;
                 }
-                const didFocus = applyTextSelection(false);
+                const didFocus = applyTaskBodySelection(false);
                 if (!didFocus) {
                     return false;
                 }
@@ -283,7 +763,7 @@ const KangarooTaskItem = TaskItem.extend({
             checkbox.addEventListener('click', () => {
                 window.requestAnimationFrame(() => {
                     checkbox.blur();
-                    applyTextSelection(false);
+                    applyTaskBoundarySelection(false);
                 });
             });
             checkbox.addEventListener('keydown', (event) => {
@@ -293,13 +773,13 @@ const KangarooTaskItem = TaskItem.extend({
 
                 if (event.key === 'ArrowLeft' || event.key === 'Home') {
                     event.preventDefault();
-                    applyTextSelection(false);
+                    applyTaskBoundarySelection(false);
                     return;
                 }
 
                 if (event.key === 'ArrowRight' || event.key === 'End') {
                     event.preventDefault();
-                    applyTextSelection(true);
+                    applyTaskBoundarySelection(true);
                     return;
                 }
 
@@ -350,7 +830,7 @@ const KangarooTaskItem = TaskItem.extend({
 
                 window.requestAnimationFrame(() => {
                     checkbox.blur();
-                    applyTextSelection(false);
+                    applyTaskBoundarySelection(false);
                 });
             });
 
@@ -359,7 +839,7 @@ const KangarooTaskItem = TaskItem.extend({
                     return;
                 }
                 event.preventDefault();
-                applyTextSelection(false);
+                applyTaskBoundarySelection(false);
             });
 
             applyAttributes(listItem, this.options.HTMLAttributes);
@@ -534,10 +1014,10 @@ function insertParagraphAfterSelectedNode(editor, nodeTypeName) {
 
 const ResizableImage = Image.extend({
     inline() {
-        return false;
+        return true;
     },
     group() {
-        return 'block';
+        return 'inline';
     },
     addOptions() {
         return {
@@ -551,6 +1031,50 @@ const ResizableImage = Image.extend({
                 alwaysPreserveAspectRatio: true
             }
         };
+    },
+    addAttributes() {
+        return {
+            ...this.parent?.(),
+            id: {
+                default: null
+            }
+        };
+    },
+    parseHTML() {
+        const parentParseHTML = this.parent?.() || [];
+        const wrappedParseHTML = [
+            {
+                tag: 'span[data-kangaroo-image-line]',
+                getAttrs: (element) => ({
+                    id: String(element.getAttribute('data-kangaroo-id') || '').trim() || null
+                })
+            },
+            {
+                tag: 'figure[data-kangaroo-image-line]',
+                getAttrs: (element) => ({
+                    id: String(element.getAttribute('data-kangaroo-id') || '').trim() || null
+                })
+            }
+        ];
+
+        return [
+            ...wrappedParseHTML,
+            ...(Array.isArray(parentParseHTML)
+                ? parentParseHTML.map((entry) => ({
+                    ...entry,
+                    getAttrs: (element) => {
+                        const parentAttrs = typeof entry.getAttrs === 'function' ? entry.getAttrs(element) : {};
+                        if (parentAttrs === false) {
+                            return false;
+                        }
+                        return {
+                            ...(parentAttrs || {}),
+                            id: String(element.getAttribute('data-kangaroo-id') || '').trim() || null
+                        };
+                    }
+                }))
+                : parentParseHTML)
+        ];
     },
     atom: true,
     selectable: true,
@@ -568,10 +1092,15 @@ const ResizableImage = Image.extend({
             }
         }
 
-        return ['img', mergeAttributes(this.options.HTMLAttributes, HTMLAttributes, {
+        return ['span', mergeAttributes(this.options.HTMLAttributes, HTMLAttributes, {
+            'data-kangaroo-image-line': '',
+            'data-kangaroo-path': absolutePath,
+            'data-kangaroo-id': HTMLAttributes?.id || ''
+        }), ['span', { 'data-resize-wrapper': '' }, ['img', {
             src: resolvedSrc,
-            'data-kangaroo-path': absolutePath
-        })];
+            'data-kangaroo-path': absolutePath,
+            'data-kangaroo-id': HTMLAttributes?.id || ''
+        }]]];
     },
     renderMarkdown(node) {
         const src = node.attrs?.src || '';
@@ -607,25 +1136,99 @@ const ResizableImage = Image.extend({
             let startHeight = 0;
             let aspectRatio = 1;
 
-            const container = document.createElement('div');
+            const container = document.createElement('span');
             container.dataset.resizeContainer = '';
             container.dataset.node = this.name;
+            container.dataset.kangarooImageLine = '';
+            container.contentEditable = 'false';
             container.draggable = true;
+            container.style.display = 'inline-flex';
+            container.style.width = 'auto';
+            container.style.maxWidth = '100%';
+            container.style.alignItems = 'flex-start';
 
-            const wrapper = document.createElement('div');
+            const wrapper = document.createElement('span');
             wrapper.dataset.resizeWrapper = '';
+            wrapper.contentEditable = 'false';
             wrapper.style.position = 'relative';
             wrapper.style.display = 'inline-block';
             wrapper.style.maxWidth = '100%';
 
             const el = document.createElement('img');
+            el.contentEditable = 'false';
             const handle = document.createElement('div');
             handle.dataset.resizeHandle = 'bottom-right';
+            handle.contentEditable = 'false';
             const selectSelf = () => {
                 this.editor?.storage?.kangarooWysiwygInstance?.selectImageNode?.(nodeViewApi);
             };
             const deselectSelf = () => {
-                container.classList.remove('ProseMirror-selectednode', 'is-selected');
+                setImageSelectionClasses(container, {});
+            };
+            const placeCursorNearSelf = (side = 'before') => {
+                const pos = typeof getPos === 'function' ? getPos() : null;
+                if (typeof pos !== 'number' || !Number.isFinite(pos)) {
+                    return false;
+                }
+
+                this.editor?.storage?.kangarooWysiwygInstance?.clearCustomSelections?.();
+                const targetPos = side === 'after'
+                    ? Math.min(pos + currentNode.nodeSize, editor.state.doc.content.size)
+                    : Math.max(1, pos);
+
+                try {
+                    editor.chain().focus(undefined, {
+                        scrollIntoView: false
+                    }).setTextSelection(targetPos).run();
+                    return true;
+                } catch {
+                    const bias = side === 'after' ? 1 : -1;
+                    return setSelectionNearPosition(editor, targetPos, bias);
+                }
+            };
+            const getImageEdgeHitSide = (clientX) => {
+                const imageRect = el.getBoundingClientRect();
+                const hitPadding = Math.max(18, Math.min(40, Math.round(Math.max(imageRect.width, 1) * 0.16)));
+                const x = Number(clientX) || 0;
+
+                if (x <= imageRect.left + hitPadding) {
+                    return 'before';
+                }
+
+                if (x >= imageRect.right - hitPadding) {
+                    return 'after';
+                }
+
+                if (x < imageRect.left) {
+                    return 'before';
+                }
+
+                if (x > imageRect.right) {
+                    return 'after';
+                }
+
+                return '';
+            };
+            const handleImageEdgeClick = (event) => {
+                if (event.button !== 0) return false;
+                if (this.editor?.storage?.kangarooWysiwygInstance?.shouldSuppressClickSelection?.()) {
+                    return false;
+                }
+
+                const target = getEventTargetElement(event.target);
+                if (target?.closest?.('[data-resize-handle]')) {
+                    return false;
+                }
+
+                const side = getImageEdgeHitSide(event.clientX);
+                if (!side) {
+                    return false;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                return placeCursorNearSelf(side);
             };
 
             const applyNodeSelection = (preserveScroll = true) => {
@@ -717,12 +1320,36 @@ const ResizableImage = Image.extend({
 
             el.draggable = false;
             el.addEventListener('click', (event) => {
+                if (handleImageEdgeClick(event)) {
+                    return;
+                }
+
                 if (event.button !== 0) return;
                 if (this.editor?.storage?.kangarooWysiwygInstance?.shouldSuppressClickSelection?.()) {
                     return;
                 }
                 applyNodeSelection(true);
             });
+            container.addEventListener('mousedown', (event) => {
+                if (event.button !== 0) return;
+                if (event.target === handle || event.target === el) {
+                    return;
+                }
+
+                if (handleImageEdgeClick(event)) {
+                    return;
+                }
+
+                const side = getImageEdgeHitSide(event.clientX);
+                if (!side) {
+                    return;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                placeCursorNearSelf(side);
+            }, true);
 
             container.addEventListener('contextmenu', (event) => {
                 const instance = this.editor?.storage?.kangarooWysiwygInstance || null;
@@ -736,7 +1363,7 @@ const ResizableImage = Image.extend({
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
-                instance.selectImageNode(nodeViewApi);
+                instance.selectImageNode(nodeViewApi, { preserveScroll: true });
                 const handler = instance.imageInteractionHandlers?.onContextMenu;
                 if (typeof handler === 'function') {
                     handler(event, info);
@@ -769,13 +1396,24 @@ const ResizableImage = Image.extend({
                     event.dataTransfer.dropEffect = 'copy';
                 }
 
-                instance.selectImageNode(nodeViewApi);
+                window.__kangarooPendingEditorNodeDrag = {
+                    documentPath: window.currentPath ? path.resolve(window.currentPath) : '',
+                    sourcePath: path.resolve(info.absolutePath),
+                    pos: typeof info.pos === 'number' ? info.pos : null,
+                    kind: info.cardKind || 'image',
+                    nodeJSON: typeof currentNode?.toJSON === 'function'
+                        ? currentNode.toJSON()
+                        : null
+                };
+
+                instance.selectImageNode(nodeViewApi, { preserveScroll: true });
                 startSystemAttachmentDrag(info.absolutePath, {
                     copyBeforeDrag: Boolean(event.altKey)
                 });
             }, true);
 
             container.addEventListener('dragend', (event) => {
+                window.__kangarooPendingEditorNodeDrag = null;
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
             }, true);
@@ -805,7 +1443,7 @@ const ResizableImage = Image.extend({
 
             const nodeViewApi = {
                 select: () => {
-                    container.classList.add('ProseMirror-selectednode', 'is-selected');
+                    setImageSelectionClasses(container, { selected: true });
                 },
                 deselect: deselectSelf,
                 getPos,
@@ -890,14 +1528,16 @@ const ResizableImage = Image.extend({
 
 const KangarooImage = ResizableImage.extend({
     inline() {
-        return false;
+        return true;
     },
     group() {
-        return 'block';
+        return 'inline';
     },
     draggable: true,
     selectable: true,
     atom: true,
+    defining: true,
+    isolating: true,
     addCommands() {
         const parentCommands = this.parent?.() || {};
         return {
@@ -939,13 +1579,29 @@ const KangarooImage = ResizableImage.extend({
                 return commandChain.run();
             }
         };
+    },
+    addInputRules() {
+        return [
+            nodeInputRule({
+                find: MARKDOWN_IMAGE_INPUT_RULE,
+                type: this.type,
+                getAttributes: (match) => {
+                    const [, , alt, src, title] = match;
+                    return {
+                        src: normalizeMarkdownUrlLike(src || ''),
+                        alt: alt || 'image',
+                        title: title || null
+                    };
+                }
+            })
+        ];
     }
 });
 
 const KangarooAttachment = TiptapNode.create({
     name: 'kangarooAttachment',
-    inline: false,
-    group: 'block',
+    inline: true,
+    group: 'inline',
     atom: true,
     draggable: true,
     selectable: true,
@@ -972,6 +1628,9 @@ const KangarooAttachment = TiptapNode.create({
             identity: {
                 default: null
             },
+            id: {
+                default: null
+            },
             width: {
                 default: 560
             }
@@ -992,7 +1651,13 @@ const KangarooAttachment = TiptapNode.create({
                         return false;
                     }
 
-                    return { href, label, title, identity };
+                    return {
+                        href,
+                        label,
+                        title,
+                        identity,
+                        id: String(element.getAttribute('data-kangaroo-id') || '').trim() || null
+                    };
                 }
             }
         ];
@@ -1005,17 +1670,18 @@ const KangarooAttachment = TiptapNode.create({
             ? this.options.resolveDisplayMeta(href)
             : getLinkDisplayMeta(href);
 
-        return ['div', mergeAttributes(HTMLAttributes, {
+        return ['span', mergeAttributes(HTMLAttributes, {
             'data-kangaroo-attachment': '',
             'data-href': href,
             'data-label': label,
+            'data-kangaroo-id': HTMLAttributes?.id || '',
             'data-link-kind': displayMeta.kind || 'attachment-file',
             'data-kangaroo-path': displayMeta.absolutePath || '',
             title: stripAttachmentIdentityFromTitle(HTMLAttributes?.title || null) || displayMeta.title || href || '',
             class: `kangaroo-attachment-card kangaroo-attachment-${displayMeta.kind || 'attachment-file'}`
         }),
-            ['div', { class: 'kangaroo-attachment-shell', 'data-kangaroo-attachment-shell': '' },
-                ['div', { class: 'kangaroo-attachment-header', 'data-kangaroo-attachment-header': '' },
+            ['span', { class: 'kangaroo-attachment-shell', 'data-kangaroo-attachment-shell': '' },
+                ['span', { class: 'kangaroo-attachment-header', 'data-kangaroo-attachment-header': '' },
                     ['span', { class: 'kangaroo-attachment-icon', 'aria-hidden': 'true' }, displayMeta.icon || '📄'],
                     ['span', { class: 'kangaroo-attachment-label' }, label],
                     ['span', { class: 'kangaroo-attachment-badge', 'aria-hidden': 'true' }, displayMeta.badge || '文件']
@@ -1049,6 +1715,7 @@ const KangarooAttachment = TiptapNode.create({
                 const label = String(options.label || '').trim() || decodeLinkLabelFromHref(normalizedRelativePath);
                 const title = options.title || null;
                 const identity = options.identity || null;
+                const id = options.id || generateStableNodeId('att');
                 const { insertTrailingParagraph = true } = options;
                 const commandChain = chain().focus(undefined, {
                     scrollIntoView: false
@@ -1058,7 +1725,8 @@ const KangarooAttachment = TiptapNode.create({
                         href: normalizedRelativePath,
                         label,
                         title,
-                        identity
+                        identity,
+                        id
                     }
                 });
 
@@ -1073,17 +1741,18 @@ const KangarooAttachment = TiptapNode.create({
 
     addNodeView() {
         return ({ node, getPos }) => {
-            const container = document.createElement('div');
+            const container = document.createElement('span');
             container.dataset.kangarooAttachment = '';
             container.contentEditable = 'false';
             container.draggable = true;
+            let suppressNextClickSelection = false;
 
-            const shell = document.createElement('div');
+            const shell = document.createElement('span');
             shell.className = 'kangaroo-attachment-shell';
             shell.dataset.kangarooAttachmentShell = '';
             shell.contentEditable = 'false';
 
-            const header = document.createElement('div');
+            const header = document.createElement('span');
             header.className = 'kangaroo-attachment-header';
             header.dataset.kangarooAttachmentHeader = '';
             header.contentEditable = 'false';
@@ -1119,6 +1788,7 @@ const KangarooAttachment = TiptapNode.create({
                 container.className = `kangaroo-attachment-card kangaroo-attachment-${displayMeta.kind || 'attachment-file'}`;
                 container.setAttribute('data-href', href);
                 container.setAttribute('data-label', displayLabel);
+                container.setAttribute('data-kangaroo-id', String(updatedNode.attrs?.id || ''));
                 container.setAttribute('data-link-kind', displayMeta.kind || 'attachment-file');
                 container.setAttribute('data-kangaroo-path', displayMeta.absolutePath || fallbackAbsolutePath || '');
                 container.setAttribute('title', stripAttachmentIdentityFromTitle(updatedNode.attrs?.title || null) || displayMeta.title || href || '');
@@ -1126,6 +1796,43 @@ const KangarooAttachment = TiptapNode.create({
                 icon.textContent = displayMeta.icon || '📄';
                 label.textContent = displayLabel;
                 badge.textContent = displayMeta.badge || '文件';
+            };
+
+            const placeCursorNearSelf = (side = 'before') => {
+                const pos = typeof getPos === 'function' ? getPos() : null;
+                if (typeof pos !== 'number' || !Number.isFinite(pos)) {
+                    return false;
+                }
+
+                this.editor?.storage?.kangarooWysiwygInstance?.clearCustomSelections?.();
+                return placeCursorNearBlockNode(this.editor, pos, node, side);
+            };
+
+            const handleCardEdgePointerDown = (event) => {
+                if (event.button !== 0) return false;
+                const instance = getInstance();
+                if (!instance || instance.shouldSuppressClickSelection?.()) {
+                    return false;
+                }
+
+                const target = getEventTargetElement(event.target);
+                if (target?.closest?.('.attachment-inline-rename-input')) {
+                    return false;
+                }
+
+                const side = getEdgeHitSideFromClientX(event.clientX, container.getBoundingClientRect());
+                if (!side) {
+                    return false;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                suppressNextClickSelection = true;
+                window.setTimeout(() => {
+                    suppressNextClickSelection = false;
+                }, 0);
+                return placeCursorNearSelf(side);
             };
 
             const nodeViewApi = {
@@ -1183,6 +1890,12 @@ const KangarooAttachment = TiptapNode.create({
 
             const getInstance = () => this.editor?.storage?.kangarooWysiwygInstance || null;
 
+            container.addEventListener('mousedown', (event) => {
+                if (handleCardEdgePointerDown(event)) {
+                    return;
+                }
+            }, true);
+
             container.addEventListener('click', (event) => {
                 if (event.button !== 0) return;
                 const instance = getInstance();
@@ -1190,10 +1903,24 @@ const KangarooAttachment = TiptapNode.create({
                     return;
                 }
 
+                if (suppressNextClickSelection) {
+                    suppressNextClickSelection = false;
+                    return;
+                }
+
+                const target = getEventTargetElement(event.target);
+                if (target?.closest?.('.attachment-inline-rename-input')) {
+                    return;
+                }
+
+                if (handleCardEdgePointerDown(event)) {
+                    return;
+                }
+
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
-                instance.selectAttachmentNode(nodeViewApi);
+                instance.selectAttachmentNode(nodeViewApi, { preserveScroll: true });
                 instance.editor.commands.focus(undefined, {
                     scrollIntoView: false
                 });
@@ -1206,7 +1933,7 @@ const KangarooAttachment = TiptapNode.create({
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
-                instance.selectAttachmentNode(nodeViewApi);
+                instance.selectAttachmentNode(nodeViewApi, { preserveScroll: true });
                 const handler = instance.attachmentInteractionHandlers?.onOpen;
                 if (typeof handler === 'function') {
                     handler(nodeViewApi.getInfo());
@@ -1220,7 +1947,7 @@ const KangarooAttachment = TiptapNode.create({
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
-                instance.selectAttachmentNode(nodeViewApi);
+                instance.selectAttachmentNode(nodeViewApi, { preserveScroll: true });
                 const handler = instance.attachmentInteractionHandlers?.onContextMenu;
                 if (typeof handler === 'function') {
                     handler(event, nodeViewApi.getInfo());
@@ -1247,13 +1974,24 @@ const KangarooAttachment = TiptapNode.create({
                     event.dataTransfer.dropEffect = 'copy';
                 }
 
-                instance.selectAttachmentNode(nodeViewApi);
+                window.__kangarooPendingEditorNodeDrag = {
+                    documentPath: window.currentPath ? path.resolve(window.currentPath) : '',
+                    sourcePath: path.resolve(dragPath),
+                    pos: typeof info.pos === 'number' ? info.pos : null,
+                    kind: info.cardKind || 'attachment',
+                    nodeJSON: typeof info.node?.toJSON === 'function'
+                        ? info.node.toJSON()
+                        : null
+                };
+
+                instance.selectAttachmentNode(nodeViewApi, { preserveScroll: true });
                 startSystemAttachmentDrag(dragPath, {
                     copyBeforeDrag: Boolean(event.altKey)
                 });
             }, true);
 
             container.addEventListener('dragend', (event) => {
+                window.__kangarooPendingEditorNodeDrag = null;
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
             }, true);
@@ -1298,8 +2036,8 @@ const KangarooAttachment = TiptapNode.create({
 
 const KangarooVideo = TiptapNode.create({
     name: 'kangarooVideo',
-    inline: false,
-    group: 'block',
+    inline: true,
+    group: 'inline',
     atom: true,
     draggable: true,
     selectable: true,
@@ -1327,6 +2065,9 @@ const KangarooVideo = TiptapNode.create({
             identity: {
                 default: null
             },
+            id: {
+                default: null
+            },
             width: {
                 default: 560
             }
@@ -1348,7 +2089,14 @@ const KangarooVideo = TiptapNode.create({
                         return false;
                     }
 
-                    return { href, label, title, identity, width };
+                    return {
+                        href,
+                        label,
+                        title,
+                        identity,
+                        width,
+                        id: String(element.getAttribute('data-kangaroo-id') || '').trim() || null
+                    };
                 }
             }
         ];
@@ -1365,22 +2113,23 @@ const KangarooVideo = TiptapNode.create({
             : href;
         const markdownTitle = mergeAttachmentIdentityIntoTitle(HTMLAttributes?.title || null, HTMLAttributes?.identity || null);
 
-        return ['div', mergeAttributes(HTMLAttributes, {
+        return ['span', mergeAttributes(HTMLAttributes, {
             'data-kangaroo-video': '',
             'data-href': href,
             'data-label': label,
+            'data-kangaroo-id': HTMLAttributes?.id || '',
             'data-link-kind': displayMeta.kind || 'attachment-video',
             'data-kangaroo-path': displayMeta.absolutePath || '',
             title: stripAttachmentIdentityFromTitle(markdownTitle) || displayMeta.title || href || '',
             class: `kangaroo-video-card kangaroo-video-${displayMeta.kind || 'attachment-video'}`
         }),
-            ['div', { class: 'kangaroo-video-shell', 'data-kangaroo-video-shell': '' },
-                ['div', { class: 'kangaroo-video-header', 'data-kangaroo-video-header': '' },
+            ['span', { class: 'kangaroo-video-shell', 'data-kangaroo-video-shell': '' },
+                ['span', { class: 'kangaroo-video-header', 'data-kangaroo-video-header': '' },
                     ['span', { class: 'kangaroo-video-icon', 'aria-hidden': 'true' }, displayMeta.icon || '🎬'],
                     ['span', { class: 'kangaroo-video-label' }, label],
                     ['span', { class: 'kangaroo-video-badge', 'aria-hidden': 'true' }, displayMeta.badge || '视频']
                 ],
-                ['div', { class: 'kangaroo-video-player', 'data-kangaroo-video-player': '' },
+                ['span', { class: 'kangaroo-video-player', 'data-kangaroo-video-player': '' },
                     ['video', {
                         controls: 'true',
                         preload: 'metadata',
@@ -1417,6 +2166,7 @@ const KangarooVideo = TiptapNode.create({
                 const label = String(options.label || '').trim() || decodeLinkLabelFromHref(normalizedRelativePath);
                 const title = options.title || null;
                 const identity = options.identity || null;
+                const id = options.id || generateStableNodeId('video');
                 const { insertTrailingParagraph = true } = options;
 
                 const commandChain = chain().focus(undefined, {
@@ -1427,7 +2177,8 @@ const KangarooVideo = TiptapNode.create({
                         href: normalizedRelativePath,
                         label,
                         title,
-                        identity
+                        identity,
+                        id
                     }
                 });
 
@@ -1442,16 +2193,17 @@ const KangarooVideo = TiptapNode.create({
 
     addNodeView() {
         return ({ node, getPos }) => {
-            const container = document.createElement('div');
+            const container = document.createElement('span');
             container.dataset.kangarooVideo = '';
             container.contentEditable = 'false';
             container.draggable = true;
+            let suppressNextClickSelection = false;
 
-            const shell = document.createElement('div');
+            const shell = document.createElement('span');
             shell.className = 'kangaroo-video-shell';
             shell.dataset.kangarooVideoShell = '';
 
-            const header = document.createElement('div');
+            const header = document.createElement('span');
             header.className = 'kangaroo-video-header';
             header.dataset.kangarooVideoHeader = '';
             header.contentEditable = 'false';
@@ -1470,7 +2222,7 @@ const KangarooVideo = TiptapNode.create({
             badge.setAttribute('aria-hidden', 'true');
             badge.contentEditable = 'false';
 
-            const player = document.createElement('div');
+            const player = document.createElement('span');
             player.className = 'kangaroo-video-player';
             player.dataset.kangarooVideoPlayer = '';
             player.contentEditable = 'false';
@@ -1505,6 +2257,7 @@ const KangarooVideo = TiptapNode.create({
                 container.className = `kangaroo-video-card kangaroo-video-${displayMeta.kind || 'attachment-video'}`;
                 container.setAttribute('data-href', href);
                 container.setAttribute('data-label', displayLabel);
+                container.setAttribute('data-kangaroo-id', String(updatedNode.attrs?.id || ''));
                 container.setAttribute('data-link-kind', displayMeta.kind || 'attachment-video');
                 container.setAttribute('data-kangaroo-path', displayMeta.absolutePath || fallbackAbsolutePath || '');
                 container.setAttribute('title', stripAttachmentIdentityFromTitle(updatedNode.attrs?.title || null) || displayMeta.title || href || '');
@@ -1516,6 +2269,43 @@ const KangarooVideo = TiptapNode.create({
                     video.setAttribute('src', resolvedSrc || '');
                     video.src = resolvedSrc || '';
                 }
+            };
+
+            const placeCursorNearSelf = (side = 'before') => {
+                const pos = typeof getPos === 'function' ? getPos() : null;
+                if (typeof pos !== 'number' || !Number.isFinite(pos)) {
+                    return false;
+                }
+
+                this.editor?.storage?.kangarooWysiwygInstance?.clearCustomSelections?.();
+                return placeCursorNearBlockNode(this.editor, pos, node, side);
+            };
+
+            const handleCardEdgePointerDown = (event) => {
+                if (event.button !== 0) return false;
+                const instance = getInstance();
+                if (!instance || instance.shouldSuppressClickSelection?.()) {
+                    return false;
+                }
+
+                const target = getEventTargetElement(event.target);
+                if (target?.closest?.('[data-kangaroo-video-player]')) {
+                    return false;
+                }
+
+                const side = getEdgeHitSideFromClientX(event.clientX, container.getBoundingClientRect());
+                if (!side) {
+                    return false;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                suppressNextClickSelection = true;
+                window.setTimeout(() => {
+                    suppressNextClickSelection = false;
+                }, 0);
+                return placeCursorNearSelf(side);
             };
 
             const nodeViewApi = {
@@ -1566,10 +2356,21 @@ const KangarooVideo = TiptapNode.create({
 
             const getInstance = () => this.editor?.storage?.kangarooWysiwygInstance || null;
 
+            container.addEventListener('mousedown', (event) => {
+                if (handleCardEdgePointerDown(event)) {
+                    return;
+                }
+            }, true);
+
             container.addEventListener('click', (event) => {
                 if (event.button !== 0) return;
                 const instance = getInstance();
                 if (!instance || instance.shouldSuppressClickSelection?.()) {
+                    return;
+                }
+
+                if (suppressNextClickSelection) {
+                    suppressNextClickSelection = false;
                     return;
                 }
 
@@ -1578,10 +2379,14 @@ const KangarooVideo = TiptapNode.create({
                     return;
                 }
 
+                if (handleCardEdgePointerDown(event)) {
+                    return;
+                }
+
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
-                instance.selectVideoNode(nodeViewApi);
+                instance.selectVideoNode(nodeViewApi, { preserveScroll: true });
                 instance.editor.commands.focus(undefined, {
                     scrollIntoView: false
                 });
@@ -1594,7 +2399,7 @@ const KangarooVideo = TiptapNode.create({
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
-                instance.selectVideoNode(nodeViewApi);
+                instance.selectVideoNode(nodeViewApi, { preserveScroll: true });
                 const handler = instance.attachmentInteractionHandlers?.onOpen;
                 if (typeof handler === 'function') {
                     handler(nodeViewApi.getInfo());
@@ -1608,11 +2413,53 @@ const KangarooVideo = TiptapNode.create({
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
-                instance.selectVideoNode(nodeViewApi);
+                instance.selectVideoNode(nodeViewApi, { preserveScroll: true });
                 const handler = instance.attachmentInteractionHandlers?.onContextMenu;
                 if (typeof handler === 'function') {
                     handler(event, nodeViewApi.getInfo());
                 }
+            }, true);
+
+            container.addEventListener('dragstart', (event) => {
+                const instance = getInstance();
+                if (!instance) return;
+
+                const info = nodeViewApi.getInfo();
+                const dragPath = info?.absolutePath || '';
+                if (!dragPath) {
+                    return;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                event.dataTransfer?.clearData();
+                event.dataTransfer?.setData('text/plain', '');
+                if (event.dataTransfer) {
+                    event.dataTransfer.effectAllowed = 'copy';
+                    event.dataTransfer.dropEffect = 'copy';
+                }
+
+                window.__kangarooPendingEditorNodeDrag = {
+                    documentPath: window.currentPath ? path.resolve(window.currentPath) : '',
+                    sourcePath: path.resolve(dragPath),
+                    pos: typeof info.pos === 'number' ? info.pos : null,
+                    kind: info.cardKind || 'video',
+                    nodeJSON: typeof info.node?.toJSON === 'function'
+                        ? info.node.toJSON()
+                        : null
+                };
+
+                instance.selectVideoNode(nodeViewApi, { preserveScroll: true });
+                startSystemAttachmentDrag(dragPath, {
+                    copyBeforeDrag: Boolean(event.altKey)
+                });
+            }, true);
+
+            container.addEventListener('dragend', (event) => {
+                window.__kangarooPendingEditorNodeDrag = null;
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
             }, true);
 
             return {
@@ -1698,6 +2545,35 @@ const KangarooMarkdownPasteBehavior = Extension.create({
                         }
 
                         return false;
+                    }
+                }
+            })
+        ];
+    }
+});
+
+const KangarooMarkdownImageTypingBehavior = Extension.create({
+    name: 'kangarooMarkdownImageTypingBehavior',
+    addProseMirrorPlugins() {
+        return [
+            new Plugin({
+                props: {
+                    handleTextInput: (view, from, to, text) => {
+                        return tryResolveMarkdownImageInput(view, from, to, text);
+                    },
+                    handleDOMEvents: {
+                        compositionend: (view) => {
+                            const instance = this.editor?.storage?.kangarooWysiwygInstance || null;
+                            if (!instance) {
+                                return false;
+                            }
+
+                            window.requestAnimationFrame(() => {
+                                if (instance.isApplyingExternalUpdate) return;
+                                instance.scheduleMarkdownImageConversion?.();
+                            });
+                            return false;
+                        }
                     }
                 }
             })
@@ -1876,6 +2752,7 @@ const KangarooLinkNormalizationBehavior = Extension.create({
             rafId = window.requestAnimationFrame(() => {
                 rafId = null;
                 if (instance.isApplyingExternalUpdate) return;
+                instance.scheduleMarkdownImageConversion();
                 instance.scheduleRawLinkConversion();
                 instance.scheduleLinkHrefSync();
                 instance.normalizeLinkDisplayToHref();
@@ -1941,7 +2818,7 @@ const KangarooImageInteractionBehavior = Extension.create({
                                 return false;
                             }
 
-                            info.instance.selectImage(info.imageInfo);
+                            info.instance.selectImage(info.imageInfo, { preserveScroll: true });
                             const handler = info.instance.imageInteractionHandlers?.onSelect;
                             if (typeof handler === 'function') {
                                 handler(info.imageInfo);
@@ -1954,7 +2831,7 @@ const KangarooImageInteractionBehavior = Extension.create({
 
                             event.preventDefault();
                             event.stopPropagation();
-                            info.instance.selectImage(info.imageInfo);
+                            info.instance.selectImage(info.imageInfo, { preserveScroll: true });
                             const handler = info.instance.imageInteractionHandlers?.onOpen;
                             if (typeof handler === 'function') {
                                 handler(info.imageInfo);
@@ -1967,7 +2844,7 @@ const KangarooImageInteractionBehavior = Extension.create({
 
                             event.preventDefault();
                             event.stopPropagation();
-                            info.instance.selectImage(info.imageInfo);
+                            info.instance.selectImage(info.imageInfo, { preserveScroll: true });
                             const handler = info.instance.imageInteractionHandlers?.onContextMenu;
                             if (typeof handler === 'function') {
                                 handler(event, info.imageInfo);
@@ -2060,8 +2937,8 @@ const KangarooVideoDisplayBehavior = Extension.create({
 
 const KangarooPdf = TiptapNode.create({
     name: 'kangarooPdf',
-    inline: false,
-    group: 'block',
+    inline: true,
+    group: 'inline',
     atom: true,
     draggable: true,
     selectable: true,
@@ -2089,6 +2966,9 @@ const KangarooPdf = TiptapNode.create({
             identity: {
                 default: null
             },
+            id: {
+                default: null
+            },
             width: {
                 default: 560
             }
@@ -2110,7 +2990,14 @@ const KangarooPdf = TiptapNode.create({
                         return false;
                     }
 
-                    return { href, label, title, identity, width };
+                    return {
+                        href,
+                        label,
+                        title,
+                        identity,
+                        width,
+                        id: String(element.getAttribute('data-kangaroo-id') || '').trim() || null
+                    };
                 }
             }
         ];
@@ -2131,23 +3018,24 @@ const KangarooPdf = TiptapNode.create({
             width
         );
 
-        return ['div', mergeAttributes(HTMLAttributes, {
+        return ['span', mergeAttributes(HTMLAttributes, {
             'data-kangaroo-pdf': '',
             'data-href': href,
             'data-label': label,
+            'data-kangaroo-id': HTMLAttributes?.id || '',
             'data-link-kind': displayMeta.kind || 'attachment-pdf',
             'data-kangaroo-path': displayMeta.absolutePath || '',
             title: stripPdfWidthFromTitle(markdownTitle) || displayMeta.title || href || '',
             style: `--kangaroo-pdf-width:${width}px;`,
             class: `kangaroo-pdf-card kangaroo-pdf-${displayMeta.kind || 'attachment-pdf'}`
         }),
-            ['div', { class: 'kangaroo-pdf-shell', 'data-kangaroo-pdf-shell': '' },
-                ['div', { class: 'kangaroo-pdf-header', 'data-kangaroo-pdf-header': '' },
+            ['span', { class: 'kangaroo-pdf-shell', 'data-kangaroo-pdf-shell': '' },
+                ['span', { class: 'kangaroo-pdf-header', 'data-kangaroo-pdf-header': '' },
                     ['span', { class: 'kangaroo-pdf-icon', 'aria-hidden': 'true' }, displayMeta.icon || '📕'],
                     ['span', { class: 'kangaroo-pdf-label' }, label],
                     ['span', { class: 'kangaroo-pdf-badge', 'aria-hidden': 'true' }, displayMeta.badge || 'PDF']
                 ],
-                ['div', { class: 'kangaroo-pdf-viewer', 'data-kangaroo-pdf-viewer': '' },
+                ['span', { class: 'kangaroo-pdf-viewer', 'data-kangaroo-pdf-viewer': '' },
                     ['img', {
                         src: '',
                         alt: label,
@@ -2190,6 +3078,7 @@ const KangarooPdf = TiptapNode.create({
                 const title = options.title || null;
                 const identity = options.identity || null;
                 const width = clampPdfPreviewWidth(options.width);
+                const id = options.id || generateStableNodeId('pdf');
                 const { insertTrailingParagraph = true } = options;
 
                 const commandChain = chain().focus(undefined, {
@@ -2201,6 +3090,7 @@ const KangarooPdf = TiptapNode.create({
                         label,
                         title,
                         identity,
+                        id,
                         width
                     }
                 });
@@ -2216,16 +3106,17 @@ const KangarooPdf = TiptapNode.create({
 
     addNodeView() {
         return ({ node, getPos }) => {
-            const container = document.createElement('div');
+            const container = document.createElement('span');
             container.dataset.kangarooPdf = '';
             container.contentEditable = 'false';
             container.draggable = true;
+            let suppressNextClickSelection = false;
 
-            const shell = document.createElement('div');
+            const shell = document.createElement('span');
             shell.className = 'kangaroo-pdf-shell';
             shell.dataset.kangarooPdfShell = '';
 
-            const header = document.createElement('div');
+            const header = document.createElement('span');
             header.className = 'kangaroo-pdf-header';
             header.dataset.kangarooPdfHeader = '';
             header.contentEditable = 'false';
@@ -2244,7 +3135,7 @@ const KangarooPdf = TiptapNode.create({
             badge.setAttribute('aria-hidden', 'true');
             badge.contentEditable = 'false';
 
-            const viewer = document.createElement('div');
+            const viewer = document.createElement('span');
             viewer.className = 'kangaroo-pdf-viewer';
             viewer.dataset.kangarooPdfViewer = '';
             viewer.contentEditable = 'false';
@@ -2319,6 +3210,7 @@ const KangarooPdf = TiptapNode.create({
                 container.className = `kangaroo-pdf-card kangaroo-pdf-${displayMeta.kind || 'attachment-pdf'}`;
                 container.setAttribute('data-href', href);
                 container.setAttribute('data-label', displayLabel);
+                container.setAttribute('data-kangaroo-id', String(updatedNode.attrs?.id || ''));
                 container.setAttribute('data-link-kind', displayMeta.kind || 'attachment-pdf');
                 container.setAttribute('data-kangaroo-path', displayMeta.absolutePath || fallbackAbsolutePath || '');
                 container.setAttribute('title', stripAttachmentIdentityFromTitle(stripPdfWidthFromTitle(updatedNode.attrs?.title || null)) || displayMeta.title || href || '');
@@ -2329,6 +3221,43 @@ const KangarooPdf = TiptapNode.create({
                 label.textContent = displayLabel;
                 badge.textContent = displayMeta.badge || 'PDF';
                 syncPreviewImage(resolvedSrc, displayLabel);
+            };
+
+            const placeCursorNearSelf = (side = 'before') => {
+                const pos = typeof getPos === 'function' ? getPos() : null;
+                if (typeof pos !== 'number' || !Number.isFinite(pos)) {
+                    return false;
+                }
+
+                this.editor?.storage?.kangarooWysiwygInstance?.clearCustomSelections?.();
+                return placeCursorNearBlockNode(this.editor, pos, node, side);
+            };
+
+            const handleCardEdgePointerDown = (event) => {
+                if (event.button !== 0) return false;
+                const instance = getInstance();
+                if (!instance || instance.shouldSuppressClickSelection?.()) {
+                    return false;
+                }
+
+                const target = getEventTargetElement(event.target);
+                if (target?.closest?.('[data-kangaroo-pdf-resize-handle]')) {
+                    return false;
+                }
+
+                const side = getEdgeHitSideFromClientX(event.clientX, container.getBoundingClientRect());
+                if (!side) {
+                    return false;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                suppressNextClickSelection = true;
+                window.setTimeout(() => {
+                    suppressNextClickSelection = false;
+                }, 0);
+                return placeCursorNearSelf(side);
             };
 
             const nodeViewApi = {
@@ -2379,6 +3308,12 @@ const KangarooPdf = TiptapNode.create({
 
             const getInstance = () => this.editor?.storage?.kangarooWysiwygInstance || null;
             let resizeState = null;
+
+            container.addEventListener('mousedown', (event) => {
+                if (handleCardEdgePointerDown(event)) {
+                    return;
+                }
+            }, true);
 
             const applyPreviewWidth = (nextWidth) => {
                 const width = clampPdfPreviewWidth(nextWidth);
@@ -2433,14 +3368,23 @@ const KangarooPdf = TiptapNode.create({
                     return;
                 }
 
+                if (suppressNextClickSelection) {
+                    suppressNextClickSelection = false;
+                    return;
+                }
+
                 const target = getEventTargetElement(event.target);
                 if (target?.closest?.('[data-kangaroo-pdf-resize-handle]')) {
+                    return;
+                }
+
+                if (handleCardEdgePointerDown(event)) {
                     return;
                 }
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
-                instance.selectPdfNode(nodeViewApi);
+                instance.selectPdfNode(nodeViewApi, { preserveScroll: true });
                 instance.editor.commands.focus(undefined, {
                     scrollIntoView: false
                 });
@@ -2453,7 +3397,7 @@ const KangarooPdf = TiptapNode.create({
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
-                instance.selectPdfNode(nodeViewApi);
+                instance.selectPdfNode(nodeViewApi, { preserveScroll: true });
                 const handler = instance.attachmentInteractionHandlers?.onOpen;
                 if (typeof handler === 'function') {
                     handler(nodeViewApi.getInfo());
@@ -2467,7 +3411,7 @@ const KangarooPdf = TiptapNode.create({
                 event.preventDefault();
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
-                instance.selectPdfNode(nodeViewApi);
+                instance.selectPdfNode(nodeViewApi, { preserveScroll: true });
                 const handler = instance.attachmentInteractionHandlers?.onContextMenu;
                 if (typeof handler === 'function') {
                     handler(event, nodeViewApi.getInfo());
@@ -2494,13 +3438,24 @@ const KangarooPdf = TiptapNode.create({
                     event.dataTransfer.dropEffect = 'copy';
                 }
 
-                instance.selectPdfNode(nodeViewApi);
+                window.__kangarooPendingEditorNodeDrag = {
+                    documentPath: window.currentPath ? path.resolve(window.currentPath) : '',
+                    sourcePath: path.resolve(dragPath),
+                    pos: typeof info.pos === 'number' ? info.pos : null,
+                    kind: info.cardKind || 'pdf',
+                    nodeJSON: typeof info.node?.toJSON === 'function'
+                        ? info.node.toJSON()
+                        : null
+                };
+
+                instance.selectPdfNode(nodeViewApi, { preserveScroll: true });
                 startSystemAttachmentDrag(dragPath, {
                     copyBeforeDrag: Boolean(event.altKey)
                 });
             }, true);
 
             container.addEventListener('dragend', (event) => {
+                window.__kangarooPendingEditorNodeDrag = null;
                 event.stopPropagation();
                 event.stopImmediatePropagation?.();
             }, true);
@@ -2687,6 +3642,7 @@ class KangarooWysiwygEditor {
         this.rangeSelectionHighlightFrame = null;
         this.isApplyingExternalUpdate = false;
         this.currentMarkdown = normalizeMarkdown(initialMarkdown);
+        this.currentDocumentJson = null;
         this.bundlePath = null;
         this.pendingMarkdownLinkConversion = false;
         this.pendingRawLinkConversion = false;
@@ -2758,8 +3714,10 @@ class KangarooWysiwygEditor {
                 StarterKit.configure({
                     link: false
                 }),
+                GapCursor,
                 Underline,
                 KangarooMarkdownPasteBehavior,
+                KangarooMarkdownImageTypingBehavior,
                 KangarooAssetKeyboardBehavior,
                 KangarooHeadingKeyboardBehavior,
                 KangarooLinkDisplayBehavior,
@@ -2811,6 +3769,8 @@ class KangarooWysiwygEditor {
             },
             onCreate: () => {
                 this.normalizeTaskHeadingNodesFromText();
+                this.runSafeNodeNormalizers();
+                this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
                 this.syncMarkdown();
                 this.refreshLineMap();
                 this.refreshRangeSelectionHighlights();
@@ -2823,18 +3783,21 @@ class KangarooWysiwygEditor {
             onUpdate: () => {
                 if (this.isApplyingExternalUpdate) return;
                 if (this.normalizeTaskHeadingNodesFromText()) {
+                    this.runSafeNodeNormalizers();
+                    return;
+                }
+                const normalizerResult = this.runSafeNodeNormalizers();
+                if (Object.values(normalizerResult).some(Boolean)) {
                     return;
                 }
 
-                const nextMarkdown = stripTaskCompletionTimestampsFromMarkdown(applyTaskHeadingLevelsToMarkdown(
-                    normalizeMarkdown(this.editor.getMarkdown()),
-                    this.collectTaskHeadingLevels()
-                ));
-                if (nextMarkdown === this.currentMarkdown) {
+                const nextDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+                if (JSON.stringify(nextDocumentJson || null) === JSON.stringify(this.currentDocumentJson || null)) {
                     return;
                 }
 
-                this.currentMarkdown = nextMarkdown;
+                this.currentDocumentJson = nextDocumentJson;
+                this.syncMarkdown();
                 this.scheduleRefreshLineMap();
                 this.scheduleRefreshRangeSelectionHighlights();
                 this.emitChange();
@@ -2843,6 +3806,7 @@ class KangarooWysiwygEditor {
         this.editor.storage.kangarooWysiwygInstance = this;
         this.editor.kangarooTaskInteractionHandlers = this.taskInteractionHandlers;
 
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
         this.syncMarkdown();
         this.refreshLineMap();
         this.root.addEventListener('mousedown', (event) => {
@@ -2925,12 +3889,20 @@ class KangarooWysiwygEditor {
     }
 
     getValue() {
-        return this.currentMarkdown;
+        return this.syncMarkdown();
+    }
+
+    getDocumentJson() {
+        try {
+            return cloneSerializableValue(this.currentDocumentJson || this.editor?.getJSON?.());
+        } catch {
+            return null;
+        }
     }
 
     getLiveMarkdownSnapshot() {
         try {
-            return this.currentMarkdown;
+            return this.syncMarkdown();
         } catch {
             return this.currentMarkdown;
         }
@@ -3022,13 +3994,14 @@ class KangarooWysiwygEditor {
         });
         this.normalizeTaskHeadingNodesFromText();
         const {
+            didAssignStableIds,
             didRepair,
             didNormalizeAttachment,
             didNormalizePdf,
             didNormalizeVideo
         } = this.runSafeNodeNormalizers();
         this.isApplyingExternalUpdate = false;
-        if (didRepair || didNormalizeAttachment || didNormalizePdf || didNormalizeVideo) {
+        if (didAssignStableIds || didRepair || didNormalizeAttachment || didNormalizePdf || didNormalizeVideo) {
             this.syncMarkdown();
         }
         if (selectionSnapshot) {
@@ -3050,9 +4023,91 @@ class KangarooWysiwygEditor {
         }
     }
 
+    setDocumentJson(documentJson, options = {}) {
+        const {
+            emitChange = false,
+            preserveSelection = false,
+            preserveViewport = false,
+            forceRebuild = false
+        } = options;
+        const nextDocumentJson = cloneSerializableValue(documentJson);
+        if (!nextDocumentJson) {
+            return false;
+        }
+
+        const currentDocumentJson = this.getDocumentJson();
+        const selectionSnapshot = preserveSelection
+            ? {
+                from: this.editor?.state?.selection?.from ?? 1,
+                to: this.editor?.state?.selection?.to ?? 1
+            }
+            : null;
+        const viewportSnapshot = preserveViewport && this.host
+            ? {
+                top: this.host.scrollTop,
+                left: this.host.scrollLeft
+            }
+            : null;
+
+        if (!forceRebuild && JSON.stringify(currentDocumentJson || null) === JSON.stringify(nextDocumentJson || null)) {
+            if (selectionSnapshot) {
+                this.restoreSelectionSnapshot(selectionSnapshot, { scrollIntoView: false });
+            } else {
+                resetEditorSelectionToDocumentStart(this.editor);
+            }
+            if (viewportSnapshot) {
+                this.host.scrollTop = viewportSnapshot.top;
+                this.host.scrollLeft = viewportSnapshot.left;
+            }
+            if (emitChange) {
+                this.emitChange();
+            }
+            return true;
+        }
+
+        this.clearSelectedImageNode();
+        this.clearSelectedPdfNode();
+        this.clearSelectedVideoNode();
+        this.clearSelectedAttachmentNode();
+        this.clearSelectedLink();
+        clearBrowserSelection();
+        try {
+            this.isApplyingExternalUpdate = true;
+            this.editor.commands.setContent(nextDocumentJson, {
+                emitUpdate: false
+            });
+            this.normalizeTaskHeadingNodesFromText();
+            this.runSafeNodeNormalizers();
+        } catch {
+            this.isApplyingExternalUpdate = false;
+            return false;
+        }
+        this.isApplyingExternalUpdate = false;
+        this.syncMarkdown();
+
+        if (selectionSnapshot) {
+            this.restoreSelectionSnapshot(selectionSnapshot, { scrollIntoView: false });
+        } else {
+            resetEditorSelectionToDocumentStart(this.editor);
+        }
+        if (viewportSnapshot) {
+            this.host.scrollTop = viewportSnapshot.top;
+            this.host.scrollLeft = viewportSnapshot.left;
+        }
+        this.refreshLineMap();
+        this.refreshLinkDomState();
+        this.refreshAttachmentNodeLabels();
+        this.refreshRangeSelectionHighlights();
+
+        if (emitChange) {
+            this.emitChange();
+        }
+        return true;
+    }
+
     refreshDisplayState() {
-        const liveMarkdown = normalizeMarkdown(this.editor?.getMarkdown?.() || '');
-        if (liveMarkdown === this.currentMarkdown) {
+        const liveDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        if (JSON.stringify(liveDocumentJson || null) === JSON.stringify(this.currentDocumentJson || null)) {
             return false;
         }
 
@@ -3068,22 +4123,23 @@ class KangarooWysiwygEditor {
         this.clearSelectedLink();
 
         this.isApplyingExternalUpdate = true;
-        this.editor.commands.setContent(this.currentMarkdown, {
-            contentType: 'markdown',
+        this.editor.commands.setContent(this.currentDocumentJson || this.editor.getJSON(), {
             emitUpdate: false
         });
         this.normalizeTaskHeadingNodesFromText();
         const {
+            didAssignStableIds,
             didRepair,
             didNormalizeAttachment,
             didNormalizePdf,
             didNormalizeVideo
         } = this.runSafeNodeNormalizers();
-        const didChange = didRepair || didNormalizeAttachment || didNormalizePdf || didNormalizeVideo;
+        const didChange = didAssignStableIds || didRepair || didNormalizeAttachment || didNormalizePdf || didNormalizeVideo;
         this.isApplyingExternalUpdate = false;
         if (didChange) {
             this.syncMarkdown();
         }
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
 
         const maxPos = Math.max(this.editor.state.doc.content.size, 1);
         const from = clampNumber(selection.from, 1, maxPos);
@@ -3110,7 +4166,8 @@ class KangarooWysiwygEditor {
             didRepair: safeRun(this.repairAttachmentReferencesByIdentity, '附件引用修复'),
             didNormalizeAttachment: safeRun(this.normalizeAttachmentNodes, '附件节点'),
             didNormalizePdf: safeRun(this.normalizePdfNodes, 'PDF 节点'),
-            didNormalizeVideo: safeRun(this.normalizeVideoNodes, '视频节点')
+            didNormalizeVideo: safeRun(this.normalizeVideoNodes, '视频节点'),
+            didAssignStableIds: safeRun(this.ensureStableNodeIds, '稳定节点 id')
         };
     }
 
@@ -3644,7 +4701,10 @@ class KangarooWysiwygEditor {
         if (!taskContext?.node) {
             return false;
         }
-        return this.applyTaskItemHeadingLevel(level);
+        const requestedLevel = clampNumber(Number(level || 0), 0, 6);
+        const currentHeadingLevel = clampNumber(Number(taskContext.node.attrs?.headingLevel || 0), 0, 6);
+        const nextHeadingLevel = currentHeadingLevel === requestedLevel ? 0 : requestedLevel;
+        return this.applyTaskItemHeadingLevel(nextHeadingLevel);
     }
 
     applyTaskItemHeadingLevel(level) {
@@ -3694,21 +4754,12 @@ class KangarooWysiwygEditor {
     }
 
     toggleHeading(level) {
-        const lineNumber = this.getAnchorLineFromCursor();
-        const currentLine = this.getLineText(lineNumber);
-        if (isTodoMarkdownLine(currentLine)) {
-            const nextLine = updateTodoHeadingMarkdownLine(currentLine, level);
-            if (nextLine && nextLine !== currentLine) {
-                this.replaceLines(lineNumber, lineNumber, [nextLine], {
-                    preferredKind: 'task',
-                    preferredText: normalizeMarkdownLineForMatch(nextLine),
-                    textblockOrder: this.getCurrentTextblockOrder(),
-                    restoreByTextblockOrder: false,
-                    preserveViewport: true
-                });
-                return true;
-            }
-            return true;
+        const taskContext = this.getTaskItemContext();
+        if (taskContext?.node) {
+            const requestedLevel = clampNumber(Number(level || 0), 0, 6);
+            const currentHeadingLevel = clampNumber(Number(taskContext.node.attrs?.headingLevel || 0), 0, 6);
+            const nextHeadingLevel = currentHeadingLevel === requestedLevel ? 0 : requestedLevel;
+            return this.applyTaskItemHeadingLevel(nextHeadingLevel);
         }
 
         return this.editor.chain().focus(undefined, {
@@ -4053,7 +5104,7 @@ class KangarooWysiwygEditor {
                 return true;
             }
 
-            targetPos = firstTextblock.pos + 1;
+            targetPos = pos;
             return false;
         });
 
@@ -4061,29 +5112,13 @@ class KangarooWysiwygEditor {
             return false;
         }
 
-        this.editor.chain().focus().setTextSelection(targetPos).run();
+        setSelectionNearPosition(this.editor, targetPos, -1);
         this.scrollPositionIntoView(targetPos);
         return true;
     }
 
     focusTaskByKindIndex(kindIndex) {
-        if (!Number.isInteger(kindIndex) || kindIndex < 0) {
-            return false;
-        }
-
-        const block = this.findBlockByKindIndex('task', kindIndex, {});
-        if (!block) {
-            return false;
-        }
-
-        const position = this.getEditorPositionForBlock(block);
-        if (typeof position !== 'number') {
-            return false;
-        }
-
-        this.editor.chain().focus().setTextSelection(position).run();
-        this.scrollPositionIntoView(position);
-        return true;
+        return this.focusBlockByKindIndex('task', kindIndex);
     }
 
     focusTaskAtLine(lineNumber) {
@@ -4104,9 +5139,11 @@ class KangarooWysiwygEditor {
             return false;
         }
 
-        this.editor.chain().focus().setTextSelection(position).run();
-        this.scrollPositionIntoView(position);
-        return true;
+        return this.focusBlockByKindIndex('task', block.kindIndex, {
+            lineNumber,
+            preferredText: block.displayText || block.normalizedText || '',
+            preferredKind: 'task'
+        });
     }
 
     focusTextLine(lineNumber) {
@@ -4627,7 +5664,7 @@ class KangarooWysiwygEditor {
             return;
         }
 
-        this.editor.chain().focus().setTextSelection(position).run();
+        setSelectionNearPosition(this.editor, position, block.kind === 'task' ? 1 : 1);
         this.scrollPositionIntoView(position);
     }
 
@@ -4665,21 +5702,73 @@ class KangarooWysiwygEditor {
         return true;
     }
 
-    jumpToAnchor(kind, kindIndex, options = {}) {
+    focusBlockByKindIndex(kind, kindIndex, options = {}) {
         const block = this.findBlockByKindIndex(kind, kindIndex, options);
         if (!block) {
-            this.jumpToLine(options.lineNumber || 1, options);
-            return;
+            if (Number.isInteger(options.lineNumber) && options.lineNumber > 0) {
+                return this.jumpToLine(options.lineNumber, options);
+            }
+            return false;
         }
 
         const position = this.getEditorPositionForBlock(block);
         if (typeof position !== 'number') {
-            this.focus();
-            return;
+            return false;
         }
 
-        this.editor.chain().focus().setTextSelection(position).run();
-        this.scrollPositionIntoView(position);
+        if (kind === 'task') {
+            const taskContext = {
+                node: this.editor.state.doc.nodeAt(position),
+                pos: position
+            };
+            if (!focusTaskBodyFromContext(this.editor, taskContext, false)) {
+                setSelectionNearPosition(this.editor, position, 1);
+            }
+        } else if (kind === 'attachment') {
+            if (!this.selectBlockByKindIndex(kind, kindIndex, { ...options, preserveSelection: true })) {
+                setSelectionNearPosition(this.editor, position, 1);
+            }
+        } else {
+            this.editor.chain().focus().setTextSelection(position).run();
+        }
+        if (!options.preserveScroll) {
+            this.scrollPositionIntoView(position);
+        }
+        return true;
+    }
+
+    selectBlockByKindIndex(kind, kindIndex, options = {}) {
+        const block = this.findBlockByKindIndex(kind, kindIndex, options);
+        if (!block) {
+            return false;
+        }
+
+        const position = this.getEditorPositionForBlock(block);
+        if (typeof position !== 'number') {
+            return false;
+        }
+
+        if (kind === 'attachment') {
+            const didSelectNode = this.editor.chain().focus(undefined, {
+                scrollIntoView: false
+            }).setNodeSelection(position).run();
+            if (!didSelectNode) {
+                setSelectionNearPosition(this.editor, position, 1);
+            }
+            if (!options.preserveScroll) {
+                this.scrollPositionIntoView(position);
+            }
+            return true;
+        }
+
+        return this.focusBlockByKindIndex(kind, kindIndex, options);
+    }
+
+    jumpToAnchor(kind, kindIndex, options = {}) {
+        if (kind === 'attachment') {
+            return this.selectBlockByKindIndex(kind, kindIndex, options);
+        }
+        return this.focusBlockByKindIndex(kind, kindIndex, options);
     }
 
     highlightLine(lineNumber) {
@@ -4739,6 +5828,33 @@ class KangarooWysiwygEditor {
                 kind: entry.kind || '',
                 kindIndex: Number.isInteger(entry.kindIndex) ? entry.kindIndex : null
             }));
+    }
+
+    getOutlineEntries() {
+        return [
+            ...this.docKindAnchors.heading.map((entry) => ({
+                kind: 'heading',
+                kindIndex: Number.isInteger(entry.kindIndex) ? entry.kindIndex : null,
+                level: clampNumber(Number(entry.level || 0), 1, 6),
+                lineNumber: Number.isInteger(entry.lineNumber) ? entry.lineNumber : 1,
+                text: String(entry.displayText || '').trim(),
+                stableId: String(entry.stableId || '').trim() || null,
+                pos: Number.isInteger(entry.pos) ? entry.pos : Number.MAX_SAFE_INTEGER
+            })),
+            ...this.docKindAnchors.task
+                .filter((entry) => clampNumber(Number(entry.headingLevel || 0), 0, 6) > 0)
+                .map((entry) => ({
+                    kind: 'heading',
+                    kindIndex: Number.isInteger(entry.kindIndex) ? entry.kindIndex : null,
+                    level: clampNumber(Number(entry.headingLevel || 0), 1, 6),
+                    lineNumber: Number.isInteger(entry.lineNumber) ? entry.lineNumber : 1,
+                    text: String(entry.displayText || '').trim(),
+                    stableId: String(entry.stableId || '').trim() || null,
+                    pos: Number.isInteger(entry.pos) ? entry.pos : Number.MAX_SAFE_INTEGER
+                }))
+        ]
+            .sort((left, right) => (left.pos - right.pos) || (Number(left.kindIndex ?? 0) - Number(right.kindIndex ?? 0)))
+            .map(({ pos, ...entry }) => entry);
     }
 
     getSearchMatches(query, limit = 200) {
@@ -4869,50 +5985,124 @@ class KangarooWysiwygEditor {
     }
 
     getTodoItems() {
-        return this.docKindAnchors.task.map((entry) => ({
-            lineNumber: entry.lineNumber || 1,
-            checked: Boolean(entry.checked),
-            text: stripTaskCompletionTimestamp(entry.displayText || ''),
-            kindIndex: entry.kindIndex
-        }));
+        return collectTaskTodoItemsFromEditorState(this.editor, {
+            resolveLineFromPos: (pos) => this.resolveLineFromPos(pos)
+        });
     }
 
     setTaskCheckedByKindIndex(kindIndex, checked) {
         const index = Number(kindIndex);
-        if (!Number.isInteger(index)) return false;
-
-        const nextChecked = Boolean(checked);
-        const lines = this.currentMarkdown.split('\n');
-        let currentTaskIndex = 0;
-        let didUpdate = false;
-
-        for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-            const match = lines[lineIndex].match(/^(\s*)([-+*]|\d+\.)\s+\[([ xX])\]\s*(.*)$/);
-            if (!match) continue;
-
-            if (currentTaskIndex === index) {
-                if ((match[3] || '').toLowerCase() === (nextChecked ? 'x' : ' ')) {
-                    return true;
-                }
-
-                lines[lineIndex] = `${match[1]}${match[2]} [${nextChecked ? 'x' : ' '}] ${match[4] || ''}`;
-                didUpdate = true;
-                break;
-            }
-
-            currentTaskIndex += 1;
-        }
-
-        if (!didUpdate) {
+        if (!Number.isInteger(index) || index < 0) {
             return false;
         }
 
-        let nextMarkdown = lines.join('\n');
-        if (this.currentMarkdown.endsWith('\n') && !nextMarkdown.endsWith('\n')) {
-            nextMarkdown += '\n';
+        const found = getTaskItemNodeByKindIndex(this.editor, index);
+        if (!found?.node || typeof found.pos !== 'number') {
+            return false;
         }
 
-        this.setValue(nextMarkdown, { emitChange: true, preserveSelection: true });
+        const nextChecked = Boolean(checked);
+        if (Boolean(found.node.attrs?.checked) === nextChecked) {
+            return true;
+        }
+
+        const tr = this.editor.state.tr.setNodeMarkup(found.pos, undefined, {
+            ...found.node.attrs,
+            checked: nextChecked
+        });
+        this.editor.view.dispatch(tr.scrollIntoView());
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        this.syncMarkdown();
+        this.scheduleRefreshLineMap();
+        this.scheduleRefreshRangeSelectionHighlights();
+        this.emitChange();
+        return true;
+    }
+
+    setTaskCheckedByStableId(stableId, checked) {
+        const found = getTaskItemNodeByStableId(this.editor, stableId);
+        if (!found?.node || typeof found.pos !== 'number') {
+            return false;
+        }
+
+        const nextChecked = Boolean(checked);
+        if (Boolean(found.node.attrs?.checked) === nextChecked) {
+            return true;
+        }
+
+        const tr = this.editor.state.tr.setNodeMarkup(found.pos, undefined, {
+            ...found.node.attrs,
+            checked: nextChecked
+        });
+        this.editor.view.dispatch(tr.scrollIntoView());
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        this.syncMarkdown();
+        this.scheduleRefreshLineMap();
+        this.scheduleRefreshRangeSelectionHighlights();
+        this.emitChange();
+        return true;
+    }
+
+    deleteTaskByKindIndex(kindIndex) {
+        const index = Number(kindIndex);
+        if (!Number.isInteger(index) || index < 0) {
+            return false;
+        }
+
+        const found = getTaskItemNodeByKindIndex(this.editor, index);
+        if (!found?.node || typeof found.pos !== 'number' || !found.node.nodeSize) {
+            return false;
+        }
+
+        const tr = this.editor.state.tr;
+        try {
+            tr.setSelection(NodeSelection.create(tr.doc, found.pos));
+            tr.deleteSelection();
+        } catch {
+            tr.delete(found.pos, found.pos + found.node.nodeSize);
+        }
+        this.editor.view.dispatch(tr.scrollIntoView());
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        this.syncMarkdown();
+        this.scheduleRefreshLineMap();
+        this.scheduleRefreshRangeSelectionHighlights();
+        this.emitChange();
+        return true;
+    }
+
+    deleteTaskByStableId(stableId) {
+        const found = getTaskItemNodeByStableId(this.editor, stableId);
+        if (!found?.node || typeof found.pos !== 'number' || !found.node.nodeSize) {
+            return false;
+        }
+
+        const tr = this.editor.state.tr;
+        try {
+            tr.setSelection(NodeSelection.create(tr.doc, found.pos));
+            tr.deleteSelection();
+        } catch {
+            tr.delete(found.pos, found.pos + found.node.nodeSize);
+        }
+        this.editor.view.dispatch(tr.scrollIntoView());
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        this.syncMarkdown();
+        this.scheduleRefreshLineMap();
+        this.scheduleRefreshRangeSelectionHighlights();
+        this.emitChange();
+        return true;
+    }
+
+    moveTaskByStableIdRelativeToStableId(sourceStableId, targetStableId, placeAfter = false) {
+        const didMove = moveTodoItemWithinEditor(this.editor, sourceStableId, targetStableId, placeAfter);
+        if (!didMove) {
+            return false;
+        }
+
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        this.syncMarkdown();
+        this.scheduleRefreshLineMap();
+        this.scheduleRefreshRangeSelectionHighlights();
+        this.emitChange();
         return true;
     }
 
@@ -4922,15 +6112,7 @@ class KangarooWysiwygEditor {
             return false;
         }
 
-        const firstTextblock = findFirstTextblockInNode(taskContext.node, taskContext.pos);
-        if (!firstTextblock?.node) {
-            return false;
-        }
-
-        const targetPos = Math.min(firstTextblock.pos + 1, this.editor.state.doc.content.size);
-        return this.editor.chain().focus(undefined, {
-            scrollIntoView: false
-        }).setTextSelection(targetPos).run();
+        return focusTaskBoundaryFromContext(this.editor, taskContext, false);
     }
 
     placeCursorAtTaskTextEnd(taskItemName = 'taskItem') {
@@ -4939,18 +6121,7 @@ class KangarooWysiwygEditor {
             return false;
         }
 
-        const firstTextblock = findFirstTextblockInNode(taskContext.node, taskContext.pos);
-        if (!firstTextblock?.node) {
-            return false;
-        }
-
-        const targetPos = Math.min(
-            firstTextblock.pos + firstTextblock.node.content.size + 1,
-            this.editor.state.doc.content.size
-        );
-        return this.editor.chain().focus(undefined, {
-            scrollIntoView: false
-        }).setTextSelection(targetPos).run();
+        return focusTaskBoundaryFromContext(this.editor, taskContext, true);
     }
 
     getAttachmentReferences() {
@@ -4999,79 +6170,38 @@ class KangarooWysiwygEditor {
     }
 
     toggleTodoSelection() {
-        const currentBlock = this.getCurrentTextblockContext();
-        if (currentBlock && this.editor.state.selection.empty) {
-            const lineNumber = this.getAnchorLineFromCursor();
-            const currentLine = this.getLineText(lineNumber);
-            const nextLine = isTodoMarkdownLine(currentLine)
-                ? stripTodoLineToParagraph(currentLine, currentLine)
-                : normalizeTodoLine(currentLine, false);
-
-            if (nextLine === currentLine) {
-                return true;
+        const taskContext = this.getTaskItemContext();
+        if (taskContext?.node) {
+            const headingLevel = clampNumber(Number(taskContext.node.attrs?.headingLevel || 0), 0, 6);
+            if (headingLevel > 0) {
+                return convertTodoHeadingToHeadingSelection(this.editor, taskContext);
             }
-
-            this.replaceLines(lineNumber, lineNumber, [nextLine], {
-                preferredKind: isTodoMarkdownLine(currentLine) ? 'paragraph' : 'task',
-                preferredText: normalizeMarkdownLineForMatch(nextLine),
-                textblockOrder: this.getCurrentTextblockOrder(),
-                restoreByTextblockOrder: false,
-                preserveViewport: true,
-                restoreCursorAtLineEnd: true
-            });
-            return true;
+            return this.toggleTaskList();
         }
 
-        const { startLine, endLine } = this.getSelectionLineRange();
-        if (!startLine || !endLine) {
+        const headingContext = findHeadingSelectionContext(this.editor.state, 'heading');
+        if (headingContext?.node) {
+            return convertHeadingSelectionToTodo(this.editor, headingContext);
+        }
+
+        return this.toggleTaskList();
+    }
+
+    jumpToTaskByStableId(stableId, options = {}) {
+        const found = getTaskItemNodeByStableId(this.editor, stableId);
+        if (!found?.node || typeof found.pos !== 'number') {
             return false;
         }
-        const selectedEntries = this.getSelectedTextblockEntries();
-        if (selectedEntries.length) {
-            const selectedLineNumbers = selectedEntries.map((entry) => entry.lineNumber);
-            const allSelectedAreTasks = selectedLineNumbers.every((lineNumber) => isTodoMarkdownLine(this.getLineText(lineNumber)));
-            const replacementLines = [];
 
-            selectedEntries.forEach((entry, index) => {
-                const currentLine = this.getLineText(entry.lineNumber);
-                const nextLine = allSelectedAreTasks
-                    ? stripTodoLineToParagraph(currentLine, entry.text)
-                    : normalizeTodoLine(currentLine, false);
-
-                if (allSelectedAreTasks && index > 0) {
-                    replacementLines.push('');
-                }
-                replacementLines.push(nextLine);
-            });
-
-            this.replaceLines(
-                selectedLineNumbers[0],
-                selectedLineNumbers[selectedLineNumbers.length - 1],
-                replacementLines,
-                {
-                    preferredKind: allSelectedAreTasks ? 'paragraph' : 'task',
-                    preferredText: selectedEntries[0]?.text || '',
-                    textblockOrder: this.getCurrentTextblockOrder(),
-                    restoreByTextblockOrder: false,
-                    preserveViewport: true
-                }
-            );
-            return true;
+        const taskContext = {
+            node: found.node,
+            pos: found.pos
+        };
+        if (!focusTaskBodyFromContext(this.editor, taskContext, false)) {
+            const bias = Number.isInteger(options.bias) ? options.bias : 1;
+            setSelectionNearPosition(this.editor, found.pos, bias);
         }
-
-        const nextLines = [];
-        for (let lineNumber = startLine; lineNumber <= endLine; lineNumber++) {
-            nextLines.push(normalizeTodoLine(this.getLineText(lineNumber), false));
-        }
-
-        this.replaceLines(startLine, endLine, nextLines, {
-            preferredText: nextLines[0] || '',
-            preferredKind: 'task',
-            textblockOrder: this.getCurrentTextblockOrder(),
-            restoreByTextblockOrder: false,
-            preserveViewport: true,
-            restoreCursorAtLineEnd: true
-        });
+        this.scrollPositionIntoView(found.pos);
         return true;
     }
 
@@ -5193,10 +6323,12 @@ class KangarooWysiwygEditor {
     }
 
     syncMarkdown() {
+        const nextDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
         const syncedMarkdown = stripTaskCompletionTimestampsFromMarkdown(applyTaskHeadingLevelsToMarkdown(
             normalizeMarkdown(this.editor.getMarkdown()),
             this.collectTaskHeadingLevels()
         ));
+        this.currentDocumentJson = nextDocumentJson;
         if (syncedMarkdown !== this.currentMarkdown) {
             this.currentMarkdown = syncedMarkdown;
         }
@@ -5233,6 +6365,17 @@ class KangarooWysiwygEditor {
             this.pendingMarkdownLinkConversion = false;
             if (this.isApplyingExternalUpdate) return;
             this.convertMarkdownLinksInCurrentTextblock();
+        });
+    }
+
+    scheduleMarkdownImageConversion() {
+        if (this.pendingMarkdownImageConversion) return;
+        this.pendingMarkdownImageConversion = true;
+
+        window.requestAnimationFrame(() => {
+            this.pendingMarkdownImageConversion = false;
+            if (this.isApplyingExternalUpdate) return;
+            this.convertMarkdownImagesInCurrentTextblock();
         });
     }
 
@@ -5325,6 +6468,52 @@ class KangarooWysiwygEditor {
         return true;
     }
 
+    convertMarkdownImagesInCurrentTextblock() {
+        const context = this.getCurrentTextblockContext();
+        if (!context || context.node?.type?.name === 'codeBlock') {
+            return false;
+        }
+
+        const text = String(context.text || '').trim();
+        if (!text) {
+            return false;
+        }
+
+        const imageMatch = text.match(/^!\[([^\]]*)\]\(([^)\n]+)\)$/);
+        if (!imageMatch) {
+            return false;
+        }
+
+        const imageNode = this.editor.state.schema.nodes.image;
+        if (!imageNode) {
+            return false;
+        }
+
+        const src = normalizeMarkdownUrlLike(imageMatch[2] || '');
+        if (!src) {
+            return false;
+        }
+
+        const textStart = context.from + 1;
+        const textEnd = Math.max(textStart, context.to - 1);
+
+        try {
+            const tr = this.editor.state.tr.setMeta('addToHistory', false).replaceRangeWith(
+                textStart,
+                textEnd,
+                imageNode.create({
+                    src,
+                    alt: imageMatch[1] || 'image',
+                    title: null
+                })
+            );
+            this.editor.view.dispatch(tr);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     convertRawLinksInCurrentTextblock() {
         const context = this.getCurrentTextblockContext();
         if (!context || context.node?.type?.name === 'codeBlock') {
@@ -5403,6 +6592,7 @@ class KangarooWysiwygEditor {
             const normalizedRelativeHref = normalizeLinkHref(href).replace(/^\.?\//, '');
             if (
                 normalizedRelativeHref.startsWith('attachments/')
+                || normalizedRelativeHref.startsWith('images/')
                 || normalizedRelativeHref.startsWith('assets/')
             ) {
                 continue;
@@ -5444,6 +6634,7 @@ class KangarooWysiwygEditor {
 
             if (
                 !normalizedRelativeHref.startsWith('attachments/')
+                && !normalizedRelativeHref.startsWith('images/')
                 && !normalizedRelativeHref.startsWith('assets/')
             ) {
                 continue;
@@ -5682,6 +6873,62 @@ class KangarooWysiwygEditor {
         }
 
         if (!didChange) return false;
+
+        this.editor.view.dispatch(tr);
+        return true;
+    }
+
+    ensureStableNodeIds() {
+        if (!this.editor) {
+            return false;
+        }
+
+        const targetTypes = new Set(['taskItem', 'kangarooAttachment', 'kangarooVideo', 'kangarooPdf', 'image']);
+        let tr = this.editor.state.tr.setMeta('addToHistory', false);
+        let didChange = false;
+        const seenIds = new Set();
+
+        this.editor.state.doc.descendants((node, pos) => {
+            const typeName = node.type?.name;
+            if (!targetTypes.has(typeName)) {
+                return true;
+            }
+
+            const currentId = String(node.attrs?.id || '').trim();
+            const currentKey = currentId ? `${typeName}:${currentId}` : '';
+            if (currentKey && !seenIds.has(currentKey)) {
+                seenIds.add(currentKey);
+                return true;
+            }
+
+            const prefix = typeName === 'taskItem'
+                ? 'task'
+                : typeName === 'kangarooAttachment'
+                    ? 'att'
+                    : typeName === 'kangarooVideo'
+                        ? 'video'
+                        : typeName === 'kangarooPdf'
+                            ? 'pdf'
+                            : 'img';
+            let nextId = generateStableNodeId(prefix);
+            let nextKey = `${typeName}:${nextId}`;
+            while (seenIds.has(nextKey)) {
+                nextId = generateStableNodeId(prefix);
+                nextKey = `${typeName}:${nextId}`;
+            }
+            seenIds.add(nextKey);
+
+            tr = tr.setNodeMarkup(pos, undefined, {
+                ...node.attrs,
+                id: nextId
+            });
+            didChange = true;
+            return true;
+        });
+
+        if (!didChange) {
+            return false;
+        }
 
         this.editor.view.dispatch(tr);
         return true;
@@ -6182,7 +7429,8 @@ class KangarooWysiwygEditor {
             const {
                 baseClass,
                 defaultKind,
-                defaultBadge
+                defaultBadge,
+                defaultIcon
             } = options;
             const elements = Array.from(this.root.querySelectorAll(selector));
             for (const element of elements) {
@@ -6202,6 +7450,10 @@ class KangarooWysiwygEditor {
                 const labelElement = element.querySelector(labelSelector);
                 if (labelElement) {
                     labelElement.textContent = nextLabel;
+                }
+                const iconElement = element.querySelector('.kangaroo-attachment-icon, .kangaroo-video-icon, .kangaroo-pdf-icon');
+                if (iconElement) {
+                    iconElement.textContent = displayMeta.icon || defaultIcon || '';
                 }
                 const badgeElement = element.querySelector('.kangaroo-attachment-badge, .kangaroo-video-badge, .kangaroo-pdf-badge');
                 if (badgeElement) {
@@ -6262,17 +7514,20 @@ class KangarooWysiwygEditor {
         refreshNode('[data-kangaroo-attachment]', '.kangaroo-attachment-label', {
             baseClass: 'kangaroo-attachment-card',
             defaultKind: 'attachment-file',
-            defaultBadge: '文件'
+            defaultBadge: '文件',
+            defaultIcon: '📄'
         });
         refreshNode('[data-kangaroo-video]', '.kangaroo-video-label', {
             baseClass: 'kangaroo-video-card',
             defaultKind: 'attachment-video',
-            defaultBadge: '视频'
+            defaultBadge: '视频',
+            defaultIcon: '🎬'
         });
         refreshNode('[data-kangaroo-pdf]', '.kangaroo-pdf-label', {
             baseClass: 'kangaroo-pdf-card',
             defaultKind: 'attachment-pdf',
-            defaultBadge: 'PDF'
+            defaultBadge: 'PDF',
+            defaultIcon: '📕'
         });
         this.lastAttachmentNodeLabelsKey = renderKey;
     }
@@ -6333,8 +7588,12 @@ class KangarooWysiwygEditor {
             return;
         }
 
-        for (const element of Array.from(rootElement.querySelectorAll('.is-range-selected'))) {
-            element.classList.remove('is-range-selected');
+        for (const element of Array.from(rootElement.querySelectorAll('.is-range-selected, .is-image-selected'))) {
+            element.classList.remove('is-range-selected', 'is-image-selected');
+        }
+
+        if (selectionNodeType !== 'image' && this.selectedImageNodeView) {
+            this.clearSelectedImageNode();
         }
 
         if (!selection || selection.empty) {
@@ -6416,7 +7675,7 @@ class KangarooWysiwygEditor {
                 })
                 : false;
             if (intersectsEditorSelection || intersectsSelection || intersectsBrowserRange) {
-                container.classList.add('is-range-selected');
+                setImageSelectionClasses(container, { rangeSelected: true });
             }
         }
 
@@ -6779,7 +8038,7 @@ class KangarooWysiwygEditor {
         this.clearSelectedLink();
     }
 
-    selectAttachment(info) {
+    selectAttachment(info, options = {}) {
         if (!info?.href) {
             return false;
         }
@@ -6789,6 +8048,22 @@ class KangarooWysiwygEditor {
         this.clearSelectedVideoNode();
         this.clearSelectedAttachmentNode();
         this.clearSelectedLink();
+
+        const attachmentRefs = this.getAttachmentReferences();
+        const targetAbsolutePath = String(info.absolutePath || '').trim();
+        const targetHref = String(info.href || '').trim();
+        const matchedReference = attachmentRefs.find((entry) => (
+            (targetAbsolutePath && path.resolve(entry.absolutePath || '') === targetAbsolutePath)
+            || (targetHref && normalizeLinkHref(entry.relativePath || '') === normalizeLinkHref(targetHref))
+        ));
+
+        if (matchedReference && Number.isInteger(matchedReference.kindIndex)) {
+            return this.selectBlockByKindIndex('attachment', matchedReference.kindIndex, {
+                preferredText: info.text || '',
+                lineNumber: matchedReference.lineNumber || info.lineNumber || 1,
+                preserveScroll: Boolean(options.preserveScroll)
+            });
+        }
 
         const nodeView = info?.nodeView
             || info?.element?.__kangarooAttachmentNodeView
@@ -6801,7 +8076,7 @@ class KangarooWysiwygEditor {
             return false;
         }
 
-        this.selectAttachmentNode(nodeView);
+        this.selectAttachmentNode(nodeView, options);
         this.editor.commands.focus(undefined, {
             scrollIntoView: false
         });
@@ -6809,7 +8084,7 @@ class KangarooWysiwygEditor {
         return true;
     }
 
-    selectAttachmentNode(nodeView) {
+    selectAttachmentNode(nodeView, options = {}) {
         if (this.selectedAttachmentNodeView === nodeView) {
             return;
         }
@@ -6834,6 +8109,10 @@ class KangarooWysiwygEditor {
 
         this.selectedAttachmentNodeView = nodeView;
         this.selectedAttachmentNodeView?.select?.();
+
+        if (!options.preserveScroll && typeof pos === 'number') {
+            this.scrollPositionIntoView(pos);
+        }
     }
 
     clearSelectedAttachmentNode() {
@@ -6990,7 +8269,46 @@ class KangarooWysiwygEditor {
         }
     }
 
-    selectImageNode(nodeView) {
+    moveNodeAtPosToPosition(sourcePos, targetPos, options = {}) {
+        const fromPos = Number(sourcePos);
+        const toPos = Number(targetPos);
+        if (!Number.isInteger(fromPos) || !Number.isInteger(toPos) || fromPos < 0 || toPos < 0) {
+            return false;
+        }
+
+        const sourceNode = this.editor?.state?.doc?.nodeAt(fromPos);
+        if (!sourceNode || !['image', 'kangarooAttachment', 'kangarooVideo', 'kangarooPdf'].includes(sourceNode.type?.name)) {
+            return false;
+        }
+
+        const sourceTo = fromPos + sourceNode.nodeSize;
+        if (toPos >= fromPos && toPos <= sourceTo) {
+            return false;
+        }
+
+        const nodeJSON = options.nodeJSON || (typeof sourceNode.toJSON === 'function' ? sourceNode.toJSON() : null);
+        if (!nodeJSON) {
+            return false;
+        }
+
+        try {
+            const node = this.editor.schema.nodeFromJSON(nodeJSON);
+            const adjustedTargetPos = toPos > fromPos ? toPos - sourceNode.nodeSize : toPos;
+            const insertPos = Math.max(0, Math.min(adjustedTargetPos, this.editor.state.doc.content.size));
+            const tr = this.editor.state.tr
+                .delete(fromPos, sourceTo)
+                .insert(insertPos, node)
+                .scrollIntoView();
+
+            this.editor.view.dispatch(tr);
+            this.focus();
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    selectImageNode(nodeView, options = {}) {
         if (this.selectedImageNodeView === nodeView) {
             return;
         }
@@ -7023,7 +8341,7 @@ class KangarooWysiwygEditor {
         this.selectedImageNodeView = null;
     }
 
-    selectPdfNode(nodeView) {
+    selectPdfNode(nodeView, options = {}) {
         if (this.selectedPdfNodeView === nodeView) {
             return;
         }
@@ -7058,7 +8376,7 @@ class KangarooWysiwygEditor {
         this.selectedPdfNodeView = null;
     }
 
-    selectVideoNode(nodeView) {
+    selectVideoNode(nodeView, options = {}) {
         if (this.selectedVideoNodeView === nodeView) {
             return;
         }
@@ -7155,7 +8473,33 @@ class KangarooWysiwygEditor {
             return null;
         }
 
-        return path.join(this.bundlePath, decodedSrc);
+        const normalizedSrc = decodedSrc.replace(/^\.?\//, '');
+        const candidates = [path.join(this.bundlePath, normalizedSrc)];
+        if (normalizedSrc.startsWith('attachments/images/')) {
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\/images\//, 'images/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\/images\//, 'assets/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\/images\//, 'attachments/')));
+        } else if (normalizedSrc.startsWith('images/')) {
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^images\//, 'assets/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^images\//, 'attachments/images/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^images\//, 'attachments/')));
+        } else if (normalizedSrc.startsWith('assets/')) {
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^assets\//, 'images/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^assets\//, 'attachments/images/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^assets\//, 'attachments/')));
+        } else if (normalizedSrc.startsWith('attachments/')) {
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\//, 'attachments/images/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\//, 'images/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\//, 'assets/')));
+        }
+
+        for (const candidate of candidates) {
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+        }
+
+        return candidates[0];
     }
 
     resolveAttachmentAbsolutePath(href) {
@@ -7269,7 +8613,7 @@ class KangarooWysiwygEditor {
         return this.getImageInfoFromNodeView(nodeView);
     }
 
-    selectImage(imageInfo) {
+    selectImage(imageInfo, options = {}) {
         const nodeView = imageInfo?.nodeView || imageInfo;
         if (!nodeView) {
             this.clearSelectedImageNode();
@@ -7277,7 +8621,7 @@ class KangarooWysiwygEditor {
         }
 
         this.clearSelectedLink();
-        this.selectImageNode(nodeView);
+        this.selectImageNode(nodeView, options);
         this.editor.commands.focus(undefined, {
             scrollIntoView: false
         });
@@ -7429,6 +8773,10 @@ class KangarooWysiwygEditor {
             return null;
         }
 
+        if (block.kind === 'task' || block.taskItemPos === block.pos) {
+            return block.pos;
+        }
+
         if (block.isTextblock) {
             return Math.min(block.pos + 1, this.editor.state.doc.content.size);
         }
@@ -7533,6 +8881,7 @@ class SimpleTiptapKangarooEditor {
         this.container = container;
         this.listeners = new Set();
         this.currentMarkdown = normalizeMarkdown(initialMarkdown);
+        this.currentDocumentJson = null;
         this.bundlePath = null;
         this.attachmentInteractionHandlers = { onOpen: null, onContextMenu: null };
         this.imageInteractionHandlers = { onSelect: null, onOpen: null, onContextMenu: null };
@@ -7557,6 +8906,7 @@ class SimpleTiptapKangarooEditor {
                 StarterKit.configure({
                     link: false
                 }),
+                GapCursor,
                 Underline,
                 Link.configure({
                     openOnClick: false,
@@ -7571,9 +8921,10 @@ class SimpleTiptapKangarooEditor {
                     }
                 }),
                 TaskList,
-                TaskItem.configure({
+                KangarooTaskItem.configure({
                     nested: true
                 }),
+                KangarooMarkdownImageTypingBehavior,
                 Markdown.configure({
                     markedOptions: {
                         gfm: true,
@@ -7591,19 +8942,21 @@ class SimpleTiptapKangarooEditor {
                 })
             },
             onCreate: () => {
+                this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
                 this.syncMarkdown();
             },
             onSelectionUpdate: () => {
                 this.emitSelectionChange();
             },
             onUpdate: () => {
-                const previousMarkdown = this.currentMarkdown;
-                const nextMarkdown = stripTaskCompletionTimestampsFromMarkdown(normalizeMarkdown(this.editor.getMarkdown()));
-                if (nextMarkdown === previousMarkdown) {
+                const previousDocumentJson = this.currentDocumentJson;
+                const nextDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+                if (JSON.stringify(nextDocumentJson || null) === JSON.stringify(previousDocumentJson || null)) {
                     return;
                 }
 
-                this.currentMarkdown = nextMarkdown;
+                this.currentDocumentJson = nextDocumentJson;
+                this.syncMarkdown();
                 this.emitChange();
             }
         });
@@ -7614,6 +8967,7 @@ class SimpleTiptapKangarooEditor {
     }
 
     syncMarkdown() {
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
         const syncedMarkdown = applyTaskHeadingLevelsToMarkdown(
             normalizeMarkdown(this.editor.getMarkdown()),
             this.collectTaskHeadingLevels()
@@ -7654,12 +9008,20 @@ class SimpleTiptapKangarooEditor {
     }
 
     getValue() {
-        return this.currentMarkdown;
+        return this.syncMarkdown();
+    }
+
+    getDocumentJson() {
+        try {
+            return cloneSerializableValue(this.currentDocumentJson || this.editor?.getJSON?.());
+        } catch {
+            return null;
+        }
     }
 
     getLiveMarkdownSnapshot() {
         try {
-            return this.currentMarkdown;
+            return this.syncMarkdown();
         } catch {
             return this.currentMarkdown;
         }
@@ -7720,6 +9082,7 @@ class SimpleTiptapKangarooEditor {
             contentType: 'markdown',
             emitUpdate: false
         });
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
         if (selectionSnapshot) {
             this.restoreSelectionSnapshot(selectionSnapshot, { scrollIntoView: false });
         } else {
@@ -7729,6 +9092,56 @@ class SimpleTiptapKangarooEditor {
         if (options.emitChange) {
             this.emitChange();
         }
+    }
+
+    setDocumentJson(documentJson, options = {}) {
+        const { emitChange = false, preserveSelection = false } = options;
+        const nextDocumentJson = cloneSerializableValue(documentJson);
+        if (!nextDocumentJson) {
+            return false;
+        }
+
+        const liveDocumentJson = this.getDocumentJson();
+        const selectionSnapshot = preserveSelection
+            ? {
+                from: this.editor?.state?.selection?.from ?? 1,
+                to: this.editor?.state?.selection?.to ?? 1
+            }
+            : null;
+
+        if (JSON.stringify(liveDocumentJson || null) === JSON.stringify(nextDocumentJson || null)) {
+            clearBrowserSelection();
+            if (selectionSnapshot) {
+                this.restoreSelectionSnapshot(selectionSnapshot, { scrollIntoView: false });
+            } else {
+                resetEditorSelectionToDocumentStart(this.editor);
+            }
+            if (emitChange) {
+                this.emitChange();
+            }
+            return true;
+        }
+
+        clearBrowserSelection();
+        try {
+            this.editor.commands.setContent(nextDocumentJson, {
+                emitUpdate: false
+            });
+        } catch {
+            return false;
+        }
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        this.isApplyingExternalUpdate = false;
+        if (selectionSnapshot) {
+            this.restoreSelectionSnapshot(selectionSnapshot, { scrollIntoView: false });
+        } else {
+            resetEditorSelectionToDocumentStart(this.editor);
+        }
+        this.syncMarkdown();
+        if (options.emitChange) {
+            this.emitChange();
+        }
+        return true;
     }
 
     refreshDisplayState() {
@@ -7854,15 +9267,12 @@ class SimpleTiptapKangarooEditor {
     }
 
     toggleHeading(level) {
-        const lineNumber = this.getAnchorLineFromCursor();
-        const currentLine = this.getLineText(lineNumber);
-        if (isTodoMarkdownLine(currentLine)) {
-            const nextLine = updateTodoHeadingMarkdownLine(currentLine, level);
-            if (nextLine && nextLine !== currentLine) {
-                this.replaceLines(lineNumber, lineNumber, [nextLine]);
-                return true;
-            }
-            return true;
+        const taskContext = this.getTaskItemContext();
+        if (taskContext?.node) {
+            const requestedLevel = clampNumber(Number(level || 0), 0, 6);
+            const currentHeadingLevel = clampNumber(Number(taskContext.node.attrs?.headingLevel || 0), 0, 6);
+            const nextHeadingLevel = currentHeadingLevel === requestedLevel ? 0 : requestedLevel;
+            return this.applyTaskItemHeadingLevel(nextHeadingLevel);
         }
 
         return this.editor.chain().focus(undefined, { scrollIntoView: false }).toggleHeading({ level: clampNumber(Number(level), 1, 6) }).run();
@@ -7918,19 +9328,21 @@ class SimpleTiptapKangarooEditor {
     }
 
     toggleTodoSelection() {
-        const lineNumber = this.getAnchorLineFromCursor();
-        const currentLine = this.getLineText(lineNumber);
-        const nextLine = isTodoMarkdownLine(currentLine)
-            ? stripTodoLineToParagraph(currentLine, currentLine)
-            : normalizeTodoLine(currentLine, false);
-        if (nextLine === currentLine) {
-            return true;
+        const taskContext = this.getTaskItemContext();
+        if (taskContext?.node) {
+            const headingLevel = clampNumber(Number(taskContext.node.attrs?.headingLevel || 0), 0, 6);
+            if (headingLevel > 0) {
+                return convertTodoHeadingToHeadingSelection(this.editor, taskContext);
+            }
+            return this.toggleTaskList();
         }
-        this.replaceLines(lineNumber, lineNumber, [nextLine], {
-            preserveViewport: true,
-            restoreCursorAtLineEnd: true
-        });
-        return true;
+
+        const headingContext = findHeadingSelectionContext(this.editor.state, 'heading');
+        if (headingContext?.node) {
+            return convertHeadingSelectionToTodo(this.editor, headingContext);
+        }
+
+        return this.toggleTaskList();
     }
 
     getAnchorLineFromCursor() {
@@ -7997,8 +9409,16 @@ class SimpleTiptapKangarooEditor {
         return this.jumpToTextblockOrder(Math.max(0, Number(lineNumber || 1) - 1));
     }
 
-    jumpToAnchor(kind, kindIndex) {
-        return this.jumpToLine(Number(kindIndex || 0) + 1);
+    focusBlockByKindIndex(kind, kindIndex, options = {}) {
+        return this.jumpToLine(Number(options.lineNumber || Number(kindIndex || 0) + 1));
+    }
+
+    selectBlockByKindIndex(kind, kindIndex, options = {}) {
+        return this.focusBlockByKindIndex(kind, kindIndex, options);
+    }
+
+    jumpToAnchor(kind, kindIndex, options = {}) {
+        return this.focusBlockByKindIndex(kind, kindIndex, options);
     }
 
     highlightLine() {}
@@ -8055,49 +9475,109 @@ class SimpleTiptapKangarooEditor {
     }
 
     getTodoItems() {
-        const todos = [];
-        const lines = this.currentMarkdown.split('\n');
-        let kindIndex = 0;
-        for (let index = 0; index < lines.length; index++) {
-            const match = lines[index].match(/^(\s*)([-+*]|\d+\.)\s+\[([ xX])\]\s*(.*)$/);
-            if (!match) continue;
-            todos.push({
-                lineNumber: index + 1,
-                checked: String(match[3] || '').toLowerCase() === 'x',
-                text: stripTaskCompletionTimestamp(String(match[4] || '').trim()),
-                kindIndex: kindIndex++
-            });
-        }
-        return todos;
+        return collectTaskTodoItemsFromEditorState(this.editor);
     }
 
     setTaskCheckedByKindIndex(kindIndex, checked) {
-        const targetIndex = Number(kindIndex);
-        if (!Number.isInteger(targetIndex)) return false;
-
-        const lines = this.currentMarkdown.split('\n');
-        let currentIndex = 0;
-        let changed = false;
-
-        for (let index = 0; index < lines.length; index++) {
-            const match = lines[index].match(/^(\s*)([-+*]|\d+\.)\s+\[([ xX])\]\s*(.*)$/);
-            if (!match) continue;
-
-            if (currentIndex === targetIndex) {
-                lines[index] = `${match[1]}${match[2]} [${checked ? 'x' : ' '}] ${match[4] || ''}`;
-                changed = true;
-                break;
-            }
-
-            currentIndex += 1;
+        const found = getTaskItemNodeByKindIndex(this.editor, kindIndex);
+        if (!found?.node || typeof found.pos !== 'number') {
+            return false;
         }
 
-        if (!changed) return false;
-        this.setValue(lines.join('\n'), {
-            emitChange: true,
-            preserveSelection: true,
-            preserveViewport: true
+        const nextChecked = Boolean(checked);
+        if (Boolean(found.node.attrs?.checked) === nextChecked) {
+            return true;
+        }
+
+        const tr = this.editor.state.tr.setNodeMarkup(found.pos, undefined, {
+            ...found.node.attrs,
+            checked: nextChecked
         });
+        this.editor.view.dispatch(tr.scrollIntoView());
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        this.syncMarkdown();
+        this.emitChange();
+        return true;
+    }
+
+    setTaskCheckedByStableId(stableId, checked) {
+        const found = getTaskItemNodeByStableId(this.editor, stableId);
+        if (!found?.node || typeof found.pos !== 'number') {
+            return false;
+        }
+
+        const nextChecked = Boolean(checked);
+        if (Boolean(found.node.attrs?.checked) === nextChecked) {
+            return true;
+        }
+
+        const tr = this.editor.state.tr.setNodeMarkup(found.pos, undefined, {
+            ...found.node.attrs,
+            checked: nextChecked
+        });
+        this.editor.view.dispatch(tr.scrollIntoView());
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        this.syncMarkdown();
+        this.emitChange();
+        return true;
+    }
+
+    deleteTaskByKindIndex(kindIndex) {
+        const index = Number(kindIndex);
+        if (!Number.isInteger(index) || index < 0) {
+            return false;
+        }
+
+        const found = getTaskItemNodeByKindIndex(this.editor, index);
+        if (!found?.node || typeof found.pos !== 'number' || !found.node.nodeSize) {
+            return false;
+        }
+
+        const tr = this.editor.state.tr;
+        try {
+            tr.setSelection(NodeSelection.create(tr.doc, found.pos));
+            tr.deleteSelection();
+        } catch {
+            tr.delete(found.pos, found.pos + found.node.nodeSize);
+        }
+        this.editor.view.dispatch(tr.scrollIntoView());
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        this.syncMarkdown();
+        this.emitChange();
+        return true;
+    }
+
+    deleteTaskByStableId(stableId) {
+        const found = getTaskItemNodeByStableId(this.editor, stableId);
+        if (!found?.node || typeof found.pos !== 'number' || !found.node.nodeSize) {
+            return false;
+        }
+
+        const tr = this.editor.state.tr;
+        try {
+            tr.setSelection(NodeSelection.create(tr.doc, found.pos));
+            tr.deleteSelection();
+        } catch {
+            tr.delete(found.pos, found.pos + found.node.nodeSize);
+        }
+        this.editor.view.dispatch(tr.scrollIntoView());
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        this.syncMarkdown();
+        this.emitChange();
+        return true;
+    }
+
+    moveTaskByStableIdRelativeToStableId(sourceStableId, targetStableId, placeAfter = false) {
+        const didMove = moveTodoItemWithinEditor(this.editor, sourceStableId, targetStableId, placeAfter);
+        if (!didMove) {
+            return false;
+        }
+
+        this.currentDocumentJson = cloneSerializableValue(this.editor?.getJSON?.());
+        this.syncMarkdown();
+        this.scheduleRefreshLineMap?.();
+        this.scheduleRefreshRangeSelectionHighlights?.();
+        this.emitChange();
         return true;
     }
 
@@ -8128,6 +9608,32 @@ class SimpleTiptapKangarooEditor {
             });
         }
         return references;
+    }
+
+    getOutlineEntries() {
+        const entries = [];
+        this.editor.state.doc.descendants((node, pos) => {
+            const type = node?.type?.name;
+            const headingLevel = clampNumber(Number(node.attrs?.headingLevel || 0), 0, 6);
+            if (type !== 'heading' && !(type === 'taskItem' && headingLevel > 0)) {
+                return true;
+            }
+
+            entries.push({
+                kind: 'heading',
+                kindIndex: entries.length,
+                level: type === 'heading'
+                    ? clampNumber(Number(node.attrs?.level || 1), 1, 6)
+                    : headingLevel,
+                lineNumber: this.resolveLineFromPos(pos + 1) || 1,
+                text: type === 'heading'
+                    ? String(node.textContent || '').trim()
+                    : String(getTaskItemPrimaryTextblock(node)?.textContent || node.textContent || '').trim(),
+                stableId: String(node.attrs?.id || '').trim() || null
+            });
+            return true;
+        });
+        return entries;
     }
 
     setAttachmentInteractionHandlers(handlers = {}) {
@@ -8186,7 +9692,32 @@ class SimpleTiptapKangarooEditor {
         if (!this.bundlePath) {
             return null;
         }
-        return path.join(this.bundlePath, decodedSrc);
+        const normalizedSrc = decodedSrc.replace(/^\.?\//, '');
+        const candidates = [path.join(this.bundlePath, normalizedSrc)];
+        if (normalizedSrc.startsWith('attachments/images/')) {
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\/images\//, 'images/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\/images\//, 'assets/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\/images\//, 'attachments/')));
+        } else if (normalizedSrc.startsWith('images/')) {
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^images\//, 'attachments/images/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^images\//, 'assets/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^images\//, 'attachments/')));
+        } else if (normalizedSrc.startsWith('assets/')) {
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^assets\//, 'attachments/images/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^assets\//, 'images/')));
+        } else if (normalizedSrc.startsWith('attachments/')) {
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\//, 'attachments/images/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\//, 'images/')));
+            candidates.push(path.join(this.bundlePath, normalizedSrc.replace(/^attachments\//, 'assets/')));
+        }
+
+        for (const candidate of candidates) {
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+        }
+
+        return candidates[0];
     }
 
     resolveAttachmentAbsolutePath(href) {
@@ -8258,17 +9789,81 @@ function stripMarkdownAngleBrackets(value) {
     return normalized;
 }
 
+function normalizeMarkdownUrlLike(value) {
+    const normalized = stripMarkdownAngleBrackets(String(value || '').trim());
+    if (!normalized) return normalized;
+
+    const webUrlMatch = normalized.match(/^(https?:)\/(?!\/)(.*)$/i);
+    if (webUrlMatch) {
+        return `${webUrlMatch[1]}//${webUrlMatch[2]}`;
+    }
+
+    return normalized;
+}
+
+function tryResolveMarkdownImageInput(view, from, to, text) {
+    const state = view?.state;
+    const selection = state?.selection;
+    const $from = selection?.$from;
+    const $to = selection?.$to;
+    if (!state || !$from || !$to || !$from.sameParent($to)) {
+        return false;
+    }
+
+    const parent = $from.parent;
+    if (!parent?.isTextblock || parent.type.spec.code || !!($from.nodeBefore || $from.nodeAfter)?.marks.find((mark) => mark.type.spec.code)) {
+        return false;
+    }
+
+    const nextText = `${String(parent.textContent || '').slice(0, $from.parentOffset)}${String(text || '')}${String(parent.textContent || '').slice($to.parentOffset)}`.trim();
+    const match = nextText.match(/^!\[([^\]]*)\]\(([^)\n]+)\)$/);
+    if (!match) {
+        return false;
+    }
+
+    const imageNode = state.schema.nodes.image;
+    if (!imageNode) {
+        return false;
+    }
+
+    const src = normalizeMarkdownUrlLike(match[2] || '');
+    if (!src) {
+        return false;
+    }
+
+    try {
+        const tr = state.tr.setMeta('addToHistory', false).replaceWith(
+            $from.start(),
+            $from.end(),
+            imageNode.create({
+                src,
+                alt: match[1] || 'image',
+                title: null
+            })
+        );
+        view.dispatch(tr);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function setImageSelectionClasses(container, { selected = false, rangeSelected = false } = {}) {
+    if (!container?.classList) return;
+
+    container.classList.toggle('ProseMirror-selectednode', selected);
+    container.classList.toggle('is-selected', selected);
+    container.classList.toggle('is-range-selected', rangeSelected);
+    container.classList.toggle('is-image-selected', selected || rangeSelected);
+}
+
 function canonicalizeMarkdownDestination(rawDestination) {
     const original = String(rawDestination || '').trim();
     const parsed = parseMarkdownLinkDestination(original);
     if (!parsed?.href) return original;
 
-    const href = stripMarkdownAngleBrackets(parsed.href);
+    const href = normalizeMarkdownUrlLike(parsed.href);
     if (!href) return original;
-
-    if (/^[a-zA-Z][a-zA-Z\d+.-]*:/i.test(href) || href.startsWith('#')) {
-        return original;
-    }
 
     const normalizedHref = /\s/.test(href) ? `<${href}>` : href;
     return parsed.title
@@ -8389,7 +9984,7 @@ function splitMarkdownAroundImageSyntax(markdown) {
         parts.push({
             type: 'image',
             alt: match[1] || '',
-            src: match[2] || ''
+            src: normalizeMarkdownUrlLike(match[2] || '')
         });
         lastIndex = imagePattern.lastIndex;
     }
@@ -8494,7 +10089,7 @@ function insertMarkdownWithImageFallback(editorInstance, markdown, { scrollIntoV
     const hasImageSyntax = /!\[[^\]]*]\([^)]+\)/.test(normalizedMarkdown);
     if (hasImageSyntax) {
         const parts = splitMarkdownAroundImageSyntax(normalizedMarkdown);
-        if (parts.length > 1) {
+        if (parts.length) {
             let insertedAnyPart = false;
 
             for (const part of parts) {
@@ -8720,8 +10315,13 @@ function resolveLocalHref(href, bundlePath = null) {
 }
 
 function normalizeLinkHref(href) {
-    const value = stripMarkdownAngleBrackets(String(href || '').trim());
+    let value = stripMarkdownAngleBrackets(String(href || '').trim());
     if (!value) return '';
+
+    const webUrlMatch = value.match(/^(https?:)\/(?!\/)(.*)$/i);
+    if (webUrlMatch) {
+        value = `${webUrlMatch[1]}//${webUrlMatch[2]}`;
+    }
 
     if (/^[a-zA-Z][a-zA-Z\d+.-]*:/i.test(value)) {
         try {
@@ -8994,6 +10594,7 @@ function collectDocumentAnchors(editor) {
             pos,
             nodeSize: node.nodeSize,
             isTextblock: Boolean(node.isTextblock),
+            stableId: String(node.attrs?.id || '').trim() || null,
             displayText: type === 'image'
                 ? (node.attrs?.alt || getPathTail(node.attrs?.src || '')).trim()
                 : type === 'kangarooAttachment'
@@ -9035,6 +10636,7 @@ function buildDocKindAnchors(editor, semanticAnchors) {
                 pos,
                 nodeSize: node.nodeSize,
                 isTextblock: true,
+                stableId: String(node.attrs?.id || '').trim() || null,
                 displayText: String(node.textContent || '').trim(),
                 normalizedText: normalizeComparableText(node.textContent || ''),
                 level: Number(node.attrs?.level || 1),
@@ -9062,6 +10664,7 @@ function buildDocKindAnchors(editor, semanticAnchors) {
                 pos,
                 nodeSize: node.nodeSize,
                 isTextblock: false,
+                stableId: String(node.attrs?.id || '').trim() || null,
                 displayText: String(node.attrs?.label || path.basename(href)).trim(),
                 normalizedText: normalizeComparableText(node.attrs?.label || path.basename(href)),
                 lineNumber: semanticAnchors.attachments[attachmentIndex]?.lineNumber || 1,
@@ -9086,6 +10689,7 @@ function buildDocKindAnchors(editor, semanticAnchors) {
                     pos,
                     nodeSize: node.nodeSize,
                     isTextblock: false,
+                    stableId: String(node.attrs?.id || '').trim() || null,
                     displayText: String(node.text || path.basename(href)).trim(),
                     normalizedText: normalizeComparableText(node.text || path.basename(href)),
                     lineNumber: semanticAnchors.attachments[attachmentIndex]?.lineNumber || 1,
@@ -9111,10 +10715,12 @@ function findTaskItemAnchor(taskNode, taskPos, kindIndex, semanticAnchor) {
     return {
         kind: 'task',
         kindIndex,
+        stableId: String(taskNode.attrs?.id || '').trim() || null,
         taskItemPos: taskPos,
-        pos: firstTextblock.pos,
-        nodeSize: firstTextblock.node.nodeSize,
+        pos: taskPos,
+        nodeSize: taskNode.nodeSize,
         isTextblock: true,
+        headingLevel: clampNumber(Number(taskNode.attrs?.headingLevel || 0), 0, 6),
         displayText: String(firstTextblock.node.textContent || '').trim(),
         normalizedText: normalizeComparableText(firstTextblock.node.textContent || ''),
         lineNumber: semanticAnchor?.lineNumber || 1
@@ -9434,6 +11040,145 @@ function findTaskItemSelectionContext(state, taskItemName = 'taskItem') {
     }
 
     return null;
+}
+
+function findHeadingSelectionContext(state, headingName = 'heading') {
+    const { selection } = state || {};
+    const { $from } = selection || {};
+    if (!$from) {
+        return null;
+    }
+
+    for (let depth = $from.depth; depth >= 0; depth--) {
+        const node = $from.node(depth);
+        if (node?.type?.name !== headingName) {
+            continue;
+        }
+
+        return {
+            depth,
+            node,
+            pos: $from.before(depth)
+        };
+    }
+
+    return null;
+}
+
+function convertHeadingSelectionToTodo(editor, headingContext) {
+    if (!editor?.state?.schema || !headingContext?.node || typeof headingContext.pos !== 'number') {
+        return false;
+    }
+
+    const { state } = editor;
+    const headingType = state.schema.nodes.heading;
+    const taskListType = state.schema.nodes.taskList;
+    const taskItemType = state.schema.nodes.taskItem;
+    const paragraphType = state.schema.nodes.paragraph;
+    if (!headingType || !taskListType || !taskItemType || !paragraphType) {
+        return false;
+    }
+
+    const headingLevel = clampNumber(Number(headingContext.node.attrs?.level || 0), 1, 6);
+    const taskItemNode = taskItemType.create({
+        checked: false,
+        headingLevel
+    }, [paragraphType.create({}, headingContext.node.content)]);
+    const replacementNode = taskListType.create({}, [taskItemNode]);
+    const replaceFrom = headingContext.pos;
+    const replaceTo = headingContext.pos + headingContext.node.nodeSize;
+
+    try {
+        const tr = state.tr.replaceWith(replaceFrom, replaceTo, replacementNode);
+        const selectionPos = Math.min(replaceFrom + 3, tr.doc.content.size);
+        tr.setSelection(Selection.near(tr.doc.resolve(selectionPos), 1));
+        editor.view.dispatch(tr.scrollIntoView());
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function convertTodoHeadingToHeadingSelection(editor, taskContext) {
+    if (!editor?.state?.schema || !taskContext?.node || typeof taskContext.pos !== 'number') {
+        return false;
+    }
+
+    const { state } = editor;
+    const headingType = state.schema.nodes.heading;
+    if (!headingType) {
+        return false;
+    }
+
+    const headingLevel = clampNumber(Number(taskContext.node.attrs?.headingLevel || 0), 0, 6);
+    if (headingLevel <= 0) {
+        return false;
+    }
+
+    const firstTextblock = findFirstTextblockInNode(taskContext.node, taskContext.pos);
+    if (!firstTextblock?.node) {
+        return false;
+    }
+
+    let taskListDepth = null;
+    const { $from } = state.selection;
+    for (let depth = taskContext.depth - 1; depth >= 0; depth--) {
+        if ($from.node(depth)?.type?.name === 'taskList') {
+            taskListDepth = depth;
+            break;
+        }
+    }
+
+    if (!Number.isInteger(taskListDepth) || taskListDepth < 0) {
+        return false;
+    }
+
+    const taskListNode = $from.node(taskListDepth);
+    const taskListPos = $from.before(taskListDepth);
+    const taskItemIndex = $from.index(taskListDepth);
+    const taskListType = taskListNode.type;
+    const replacementNodes = [];
+    const headingNode = headingType.create({
+        level: headingLevel
+    }, firstTextblock.node.content);
+
+    let headingPos = taskListPos;
+    const beforeItems = [];
+    const afterItems = [];
+    taskListNode.forEach((child, _offset, index) => {
+        if (index < taskItemIndex) {
+            beforeItems.push(child);
+        } else if (index > taskItemIndex) {
+            afterItems.push(child);
+        }
+    });
+
+    if (beforeItems.length) {
+        const beforeList = taskListType.create(taskListNode.attrs, Fragment.fromArray(beforeItems));
+        replacementNodes.push(beforeList);
+        headingPos += beforeList.nodeSize;
+    }
+
+    replacementNodes.push(headingNode);
+
+    if (afterItems.length) {
+        const afterList = taskListType.create(taskListNode.attrs, Fragment.fromArray(afterItems));
+        replacementNodes.push(afterList);
+    }
+
+    try {
+        const tr = state.tr.replaceWith(
+            taskListPos,
+            taskListPos + taskListNode.nodeSize,
+            Fragment.fromArray(replacementNodes)
+        );
+        const selectionPos = Math.min(headingPos + 1, tr.doc.content.size);
+        tr.setSelection(Selection.near(tr.doc.resolve(selectionPos), 1));
+        editor.view.dispatch(tr.scrollIntoView());
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function isTaskItemEffectivelyEmpty(node) {
@@ -9922,6 +11667,7 @@ function shouldSyncVisibleLinkTextToHref(href, text) {
     const normalizedRelativeHref = normalizeLinkHref(normalizedHref).replace(/^\.?\//, '');
     if (
         normalizedRelativeHref.startsWith('attachments/')
+        || normalizedRelativeHref.startsWith('images/')
         || normalizedRelativeHref.startsWith('assets/')
     ) {
         return false;

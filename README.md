@@ -3,7 +3,7 @@
 Kangaroo is a local-first Markdown editor for writing, note-taking, attachments, and workspace-based organization.  
 Kangaroo 是一款本地优先的 Markdown 编辑器，适合写作、笔记、附件管理和基于工作空间的文档组织。
 
-![软件界面](./README.assets/软件界面2.png)
+![image-20260515134502242](./README.assets/image-20260515134502242.png)
 
 Why to choose Kangaroo?
 为什么选择Kangaroo?

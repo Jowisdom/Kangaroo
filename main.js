@@ -120,6 +120,10 @@ function isValidBundle(bundlePath) {
     return (
         fs.existsSync(path.join(bundlePath, 'text.markdown'))
         || fs.existsSync(path.join(bundlePath, 'text.md'))
+        || (
+            fs.existsSync(path.join(bundlePath, 'manifest.json'))
+            && fs.existsSync(path.join(bundlePath, 'document.json'))
+        )
     );
 }
 
@@ -519,11 +523,18 @@ function createWindow() {
     const win = new BrowserWindow({
         width: 1200,
         height: 800,
+        show: false,
         titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
-        webPreferences: { 
-            nodeIntegration: true, 
-            contextIsolation: false 
+        webPreferences: {
+            nodeIntegration: true,
+            contextIsolation: false
         }
+    });
+
+    win.once('ready-to-show', () => {
+        if (win.isDestroyed()) return;
+        win.show();
+        win.focus();
     });
 
     win.loadFile('index.html');
@@ -645,7 +656,7 @@ ipcMain.handle('dialog:openBundle', async (_, options = {}) => {
     if (isValidBundle(selectedPath)) {
         return selectedPath;
     } else {
-        throw new Error('所选文件夹缺少 text.md 或 text.markdown，不是有效的 Kangaroo bundle。');
+        throw new Error('所选文件夹缺少 text.md、text.markdown 或 private format 文件，不是有效的 Kangaroo bundle。');
     }
 });
 

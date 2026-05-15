@@ -35,6 +35,18 @@ const DEFAULT_BUNDLE_EXTENSION = '.kangaroo';
 const LEGACY_BUNDLE_EXTENSIONS = ['.textbundle'];
 const DEFAULT_BUNDLE_MARKDOWN_FILE = 'text.md';
 const LEGACY_BUNDLE_MARKDOWN_FILE = 'text.markdown';
+const PRIVATE_BUNDLE_MANIFEST_FILE = 'manifest.json';
+const PRIVATE_BUNDLE_DOCUMENT_FILE = 'document.json';
+const IMAGE_RESOURCE_DIR_NAME = 'images';
+const LEGACY_IMAGE_RESOURCE_DIR_NAME = 'assets';
+const RICH_TEXT_EDITOR_ONLY = true;
+const APP_VERSION = (() => {
+    try {
+        return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf-8'))?.version || '';
+    } catch {
+        return '';
+    }
+})();
 
 const previewLineTokenTypes = new Set([
     'paragraph_open',
@@ -62,6 +74,226 @@ function stripKnownBundleExtension(value) {
         }
     }
     return name;
+}
+
+function sanitizeFileNameSegment(value, fallback = '未命名文档') {
+    const sanitized = String(value || '')
+        .trim()
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+        .replace(/\s+/g, ' ')
+        .replace(/[. ]+$/g, '')
+        .trim();
+    return sanitized || fallback;
+}
+
+function cloneSerializableValue(value) {
+    if (value == null) return null;
+
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch {
+        return null;
+    }
+}
+
+function clampNumber(value, min, max) {
+    const num = Number(value);
+    if (Number.isNaN(num)) {
+        return min;
+    }
+    return Math.min(Math.max(num, min), max);
+}
+
+function getBundleManifestPath(folderPath) {
+    return folderPath ? path.join(folderPath, PRIVATE_BUNDLE_MANIFEST_FILE) : '';
+}
+
+function getBundleDocumentJsonPath(folderPath) {
+    return folderPath ? path.join(folderPath, PRIVATE_BUNDLE_DOCUMENT_FILE) : '';
+}
+
+function readJsonFileIfExists(filePath) {
+    if (!filePath || !fs.existsSync(filePath)) {
+        return null;
+    }
+
+    try {
+        return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    } catch {
+        return null;
+    }
+}
+
+function getImageResourceDirPath(folderPath) {
+    return folderPath ? path.join(folderPath, 'attachments', IMAGE_RESOURCE_DIR_NAME) : '';
+}
+
+function getOldImageResourceDirPath(folderPath) {
+    return folderPath ? path.join(folderPath, IMAGE_RESOURCE_DIR_NAME) : '';
+}
+
+function getLegacyImageResourceDirPath(folderPath) {
+    return folderPath ? path.join(folderPath, LEGACY_IMAGE_RESOURCE_DIR_NAME) : '';
+}
+
+function getImageResourceDirCandidates(folderPath) {
+    const candidates = [];
+    const modernDir = getImageResourceDirPath(folderPath);
+    const oldRootDir = getOldImageResourceDirPath(folderPath);
+    const legacyDir = getLegacyImageResourceDirPath(folderPath);
+
+    if (modernDir) candidates.push(modernDir);
+    if (oldRootDir) candidates.push(oldRootDir);
+    if (legacyDir) candidates.push(legacyDir);
+
+    return candidates;
+}
+
+function resolveExistingImageResourceDir(folderPath) {
+    for (const candidate of getImageResourceDirCandidates(folderPath)) {
+        if (candidate && fs.existsSync(candidate)) {
+            try {
+                const entries = fs.readdirSync(candidate);
+                if (entries.length > 0) {
+                    return candidate;
+                }
+            } catch {
+                return candidate;
+            }
+        }
+    }
+
+    for (const candidate of getImageResourceDirCandidates(folderPath)) {
+        if (candidate && fs.existsSync(candidate)) {
+            return candidate;
+        }
+    }
+    return getImageResourceDirPath(folderPath);
+}
+
+function getBundleDisplayTitleFromManifest(folderPath) {
+    const manifest = readJsonFileIfExists(getBundleManifestPath(folderPath));
+    if (manifest && typeof manifest.title === 'string' && manifest.title.trim()) {
+        return manifest.title.trim();
+    }
+
+    return getCanonicalBundleDisplayName(folderPath);
+}
+
+function buildBundleManifest(folderPath, options = {}) {
+    const now = new Date().toISOString();
+    const existingManifest = options.existingManifest && typeof options.existingManifest === 'object'
+        ? options.existingManifest
+        : null;
+    const title = String(options.title || existingManifest?.title || getCanonicalBundleDisplayName(folderPath) || '未命名').trim() || '未命名';
+
+    return {
+        format: 'kangaroo',
+        formatVersion: 1,
+        appVersion: APP_VERSION || processRef?.versions?.electron || '',
+        documentId: String(existingManifest?.documentId || options.documentId || crypto.randomUUID()),
+        title,
+        createdAt: existingManifest?.createdAt || now,
+        updatedAt: now,
+        defaultLanguage: 'markdown',
+        rootBlockId: 'root',
+        documentFormat: 'tiptap-json'
+    };
+}
+
+function writeJsonFile(filePath, data) {
+    if (!filePath) return false;
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+    return true;
+}
+
+function createDocumentJsonFromMarkdown(markdown) {
+    if (!markdown && markdown !== '') {
+        return null;
+    }
+
+    const scratchHost = document.createElement('div');
+    scratchHost.style.position = 'fixed';
+    scratchHost.style.left = '-99999px';
+    scratchHost.style.top = '-99999px';
+    scratchHost.style.width = '1px';
+    scratchHost.style.height = '1px';
+    scratchHost.style.overflow = 'hidden';
+    scratchHost.style.pointerEvents = 'none';
+    document.body.appendChild(scratchHost);
+
+    try {
+        const scratchEditor = createWysiwygEditor(scratchHost, String(markdown || ''));
+        const documentJson = cloneSerializableValue(scratchEditor.getDocumentJson?.());
+        scratchEditor.destroy();
+        return documentJson;
+    } catch {
+        try {
+            scratchHost.remove();
+        } catch {
+            // ignore cleanup failure
+        }
+        return null;
+    } finally {
+        try {
+            scratchHost.remove();
+        } catch {
+            // ignore cleanup failure
+        }
+    }
+}
+
+function serializeDocumentJsonToMarkdown(documentJson) {
+    const normalizedDocumentJson = cloneSerializableValue(documentJson);
+    if (!normalizedDocumentJson) {
+        return '';
+    }
+
+    const scratchHost = document.createElement('div');
+    scratchHost.style.position = 'fixed';
+    scratchHost.style.left = '-99999px';
+    scratchHost.style.top = '-99999px';
+    scratchHost.style.width = '1px';
+    scratchHost.style.height = '1px';
+    scratchHost.style.overflow = 'hidden';
+    scratchHost.style.pointerEvents = 'none';
+    document.body.appendChild(scratchHost);
+
+    try {
+        const scratchEditor = createWysiwygEditor(scratchHost, '');
+        if (!scratchEditor?.setDocumentJson || !scratchEditor?.getValue) {
+            scratchEditor?.destroy?.();
+            return '';
+        }
+
+        const didApply = scratchEditor.setDocumentJson(normalizedDocumentJson, {
+            emitChange: false,
+            forceRebuild: true
+        });
+        const markdown = didApply ? String(scratchEditor.getValue() || '') : '';
+        scratchEditor.destroy();
+        return markdown;
+    } catch {
+        return '';
+    } finally {
+        try {
+            scratchHost.remove();
+        } catch {
+            // ignore cleanup failure
+        }
+    }
+}
+
+function isPrivateBundlePath(folderPath) {
+    if (!folderPath) return false;
+
+    try {
+        const manifestPath = getBundleManifestPath(folderPath);
+        const documentJsonPath = getBundleDocumentJsonPath(folderPath);
+        return fs.existsSync(manifestPath) && fs.existsSync(documentJsonPath);
+    } catch {
+        return false;
+    }
 }
 
 function isSupportedBundleName(name) {
@@ -328,9 +560,11 @@ let fallbackUndoStack = [];
 let fallbackRedoStack = [];
 let fallbackPendingSnapshot = null;
 let fallbackApplyingHistory = false;
+window.__kangarooPendingEditorNodeDrag = null;
 let editorRenderFrame = null;
 let autoSaveTimer = null;
 let persistActiveTabTimer = null;
+let persistActiveTabTimerContext = null;
 let toolbarStateRefreshFrame = null;
 let editorTabs = [];
 let activeTabId = null;
@@ -342,11 +576,18 @@ let previewImageContextTarget = null;
 let tabContextTargetId = null;
 let editorLinkContextTarget = null;
 let timelineDayContextTarget = null;
+let timelineDiaryContextTarget = null;
+let timelineTodoContextTarget = null;
+let timelineTodoDragState = null;
+let timelineTodoDropState = null;
+let timelineTodoEditState = null;
+let pendingTimelineTodoInlineEditTarget = null;
 let suppressContextMenuHideUntil = 0;
 let selectedPreviewImageKey = null;
 let activePreviewImageResize = null;
 let pendingPreviewVisibleLine = null;
 let currentSettingsTab = 'theme';
+let textInputModalState = null;
 let currentSearchQuery = '';
 let currentSearchMatches = [];
 let activeSearchMatchIndex = -1;
@@ -378,12 +619,19 @@ let bundleAttachmentPollTimer = null;
 let suppressBundleAttachmentWatcherUntil = 0;
 let bundleAttachmentSnapshot = new Map();
 let bundleAttachmentSnapshotRoot = null;
+let activeHistoryTransaction = null;
+let suppressHistoryRecording = false;
+let nextHistoryEntryId = 1;
 let attachmentInlineRenameState = null;
 let pendingAttachmentDeleteSnapshot = null;
 let pendingAttachmentRenameSnapshot = null;
 let pendingEditorClipboardSlicePayload = null;
 let pendingEditorClipboardSliceTimestamp = 0;
 let editorChangeToken = 0;
+const DEBUG_TEST_SHORTCUTS_ENABLED = typeof process !== 'undefined'
+    && process
+    && process.env
+    && process.env.KANGAROO_DEBUG_SHORTCUTS === '1';
 let workspaceTreeSortSettings = null;
 let workspaceManualDropPlacement = 'before';
 let workspaceFolderDropIntentPath = null;
@@ -400,6 +648,8 @@ let timelineEntryFilterMode = 'all';
 let pomodoroState = null;
 let pomodoroTickTimer = null;
 let pomodoroTaskPickerOpen = false;
+let pomodoroCustomSettingsOpen = false;
+let pomodoroSelectedMode = 'focus';
 let workspaceTimelineEntriesCache = null;
 let workspaceTimelineEntriesCacheRoot = null;
 let workspaceTimelineEntriesCacheDirty = true;
@@ -407,37 +657,9 @@ let workspaceChildrenCache = new Map();
 let workspaceBundlePathsCache = null;
 let workspaceBundlePathsCacheRoot = null;
 let workspaceBundlePathsCacheDirty = true;
-let workspaceAlbumEntriesCache = null;
-let workspaceAlbumEntriesCacheRoot = null;
-let workspaceAlbumEntriesCacheDirty = true;
-let workspaceVideoEntriesCache = null;
-let workspaceVideoEntriesCacheRoot = null;
-let workspaceVideoEntriesCacheDirty = true;
-let selectedWorkspaceMusicBundlePath = null;
-let rememberedWorkspaceMusicBundleSelections = new Map();
-let rememberedWorkspaceMusicPlaybackStates = new Map();
-let activeWorkspaceAlbumPath = null;
-let activeWorkspaceTrackPath = null;
-let workspaceAudioPlaybackState = null;
-let workspaceMusicPanelDirty = true;
-let workspaceMusicSearchQuery = '';
-let workspaceMusicUiRefs = null;
-let workspaceMusicLibraryScrollTop = 0;
-let workspaceAudioControllerElement = null;
-let workspaceLyricsCache = new Map();
-let workspaceEmbeddedArtworkCache = new Map();
-let selectedWorkspaceVideoBundlePath = null;
-let rememberedWorkspaceVideoBundleSelections = new Map();
-let activeWorkspaceVideoPath = null;
-let workspaceVideoPlaybackState = null;
-let workspaceVideoIgnorePauseUntil = 0;
-let workspaceVideoPanelDirty = true;
-let workspaceVideoThumbnailCache = new Map();
-let workspaceVideoControllerElement = null;
 let pendingWorkspaceRevealPath = null;
 let skipEnsureActiveWorkspacePathExpandedOnce = false;
 let featureVisibilitySettings = null;
-let workspaceMusicFullscreen = false;
 let persistWorkspaceMusicPlaybackTimer = null;
 let lastAutomaticHistorySnapshotAt = 0;
 let selectedHistorySnapshotId = '';
@@ -448,6 +670,8 @@ let historyPanelDetailRenderTimer = null;
 
 const AUTO_SAVE_DELAY = 350;
 const RECOVERY_DIR_NAME = '.kangaroo-recovery';
+const LEGACY_RECOVERY_DIR_NAMES = ['recovery', '.kangaroo-recoery'];
+const SESSION_HISTORY_DIR_NAME = '.kangaroo-session-history';
 const HISTORY_DIR_NAME = '.kangaroo-history';
 const HISTORY_MANIFEST_FILE = 'manifest.json';
 const HISTORY_SNAPSHOT_DIR = 'snapshots';
@@ -461,33 +685,33 @@ const TOOLBAR_VISIBILITY_SETTINGS_KEY = 'codex.toolbar.visibility.v1';
 const VIEW_MODE_SETTINGS_KEY = 'codex.view.mode.v1';
 const THEME_SETTINGS_KEY = 'codex.theme.settings.v1';
 const TYPOGRAPHY_SETTINGS_KEY = 'codex.typography.settings.v1';
+const INLINE_MEDIA_POSITION_SETTINGS_KEY = 'codex.inline.media.position.v1';
 const FEATURE_VISIBILITY_SETTINGS_KEY = 'codex.feature.visibility.v1';
 const SIDEBAR_RAIL_ORDER_SETTINGS_KEY = 'codex.sidebar.rail.order.v1';
 const WORKSPACE_TREE_SORT_SETTINGS_KEY = 'codex.workspace.tree.sort.v1';
 const TIMELINE_PANEL_VISIBILITY_SETTINGS_KEY = 'codex.timeline.visibility.v1';
 const POMODORO_STATE_SETTINGS_KEY = 'codex.pomodoro.state.v1';
+const pendingTodoCheckedUpdates = new Map();
 const WORKSPACE_TIMELINE_EVENTS_FILE = '.kangaroo-timeline.json';
 const WORKSPACE_CHILDREN_CACHE_TTL = 1200;
 const WORKSPACE_BUNDLE_PATHS_CACHE_TTL = 1200;
 const WORKSPACE_ALBUM_PATHS_CACHE_TTL = 1200;
 const WORKSPACE_VIDEO_PATHS_CACHE_TTL = 1200;
-const WORKSPACE_AUDIO_FILE_REGEX = /\.(flac|m4a|aac|mp3|wav|ogg|opus)$/i;
-const WORKSPACE_ALBUM_ART_FILE_REGEX = /\.(png|jpe?g|webp|avif)$/i;
-const WORKSPACE_LYRIC_FILE_REGEX = /\.(lrc|txt)$/i;
-const WORKSPACE_VIDEO_FILE_REGEX = /\.(mp4|mov|m4v|webm|ogv|avi|mkv)$/i;
 const DEFAULT_THEME_ID = 'dark-ocean';
 const DEFAULT_UNTITLED_CONTENT = '';
-const DEFAULT_VIEW_MODE = 'split';
+const DEFAULT_VIEW_MODE = 'editor';
 const WORKSPACE_SETTINGS_KEY = 'codex.workspace.root.v1';
-const WORKSPACE_MUSIC_SELECTIONS_KEY = 'codex.workspace.music.selections.v1';
-const WORKSPACE_MUSIC_PLAYBACK_SETTINGS_KEY = 'codex.workspace.music.playback.v1';
-const WORKSPACE_VIDEO_SELECTIONS_KEY = 'codex.workspace.video.selections.v1';
 const TODO_PANEL_SETTINGS_KEY = 'codex.todo.panel.v1';
+const TIMELINE_TODO_GROUP_SETTINGS_KEY = 'codex.timeline.todo.groups.v1';
 const PINNED_EDITOR_TABS_KEY = 'codex.editor.tabs.pinned.v1';
 const DEFAULT_LAYOUT_SETTINGS = {
     sidebarWidth: 30,
     editorWidth: 76,
     previewWidth: 46
+};
+const DEFAULT_INLINE_MEDIA_POSITION_SETTINGS = {
+    position: 'offset',
+    leftOffset: 5
 };
 const DEFAULT_TODO_PANEL_SETTINGS = {
     scope: 'document',
@@ -524,17 +748,86 @@ const VALID_WORKSPACE_SORT_MODES = new Set([
     'manual'
 ]);
 const FONT_FAMILY_MAP = {
-    'ui-system': '"SF Pro Display", "Segoe UI", "PingFang SC", "Helvetica Neue", sans-serif',
-    'ui-pingfang': '"PingFang SC", "Hiragino Sans GB", "Helvetica Neue", sans-serif',
-    'ui-rounded': '"SF Pro Rounded", "PingFang SC", "Helvetica Neue", sans-serif',
-    'editor-sfmono': '"SF Mono", "Menlo", "Monaco", monospace',
-    'editor-maple': '"Maple Mono", "Maple Mono NF", "Maple Mono CN", "SF Mono", "Menlo", monospace',
-    'editor-jetbrains': '"JetBrains Mono", "SF Mono", "Menlo", monospace',
-    'editor-fira': '"Fira Code", "SF Mono", "Menlo", monospace',
-    'preview-charter': '"Charter", "Palatino Linotype", "Songti SC", serif',
-    'preview-songti': '"Songti SC", "STSong", "Palatino Linotype", serif',
-    'preview-pingfang': '"PingFang SC", "Hiragino Sans GB", "Helvetica Neue", sans-serif'
+    'ui-system': '"IBM Plex Sans", "Noto Sans SC", "Segoe UI", "Helvetica Neue", sans-serif',
+    'ui-noto-sans': '"Noto Sans SC", "IBM Plex Sans", "Segoe UI", "Helvetica Neue", sans-serif',
+    'ui-pingfang': '"LXGW WenKai", "Noto Sans SC", "IBM Plex Sans", sans-serif',
+    'ui-rounded': '"M PLUS Rounded 1c", "ZCOOL QingKe HuangYou", "Noto Sans SC", sans-serif',
+    'editor-sfmono': '"IBM Plex Mono", "LXGW WenKai", "Menlo", "Monaco", monospace',
+    'editor-maple': '"Maple Mono Normal NL CN", "Long Cang", "Menlo", monospace',
+    'editor-jetbrains': '"JetBrains Mono", "Noto Sans SC", "Menlo", monospace',
+    'editor-fira': '"Fira Code", "ZCOOL XiaoWei", "Menlo", monospace',
+    'preview-charter': '"Libre Baskerville", "Noto Serif SC", "Palatino Linotype", serif',
+    'preview-songti': '"Noto Serif SC", "ZCOOL XiaoWei", "Libre Baskerville", serif',
+    'preview-pingfang': '"LXGW WenKai", "Noto Sans SC", "IBM Plex Sans", sans-serif'
 };
+
+const FONT_STYLESHEET_MAP = {
+    'ui-system': [
+        'node_modules/@fontsource/ibm-plex-sans/400.css',
+        'node_modules/@fontsource/ibm-plex-sans/700.css'
+    ],
+    'ui-noto-sans': [],
+    'ui-pingfang': [],
+    'ui-rounded': [],
+    'editor-sfmono': [
+        'node_modules/@fontsource/ibm-plex-mono/400.css',
+        'node_modules/@fontsource/ibm-plex-mono/700.css'
+    ],
+    'editor-maple': [
+        'assets/fonts/maple-mono-normalnl/maple-mono-normalnl.css'
+    ],
+    'editor-jetbrains': [
+        'node_modules/@fontsource/jetbrains-mono/400.css',
+        'node_modules/@fontsource/jetbrains-mono/700.css'
+    ],
+    'editor-fira': [
+        'node_modules/@fontsource/fira-code/400.css',
+        'node_modules/@fontsource/fira-code/700.css'
+    ],
+    'preview-charter': [
+        'node_modules/@fontsource/libre-baskerville/400.css',
+        'node_modules/@fontsource/libre-baskerville/700.css'
+    ],
+    'preview-songti': [],
+    'preview-pingfang': []
+};
+
+const LOADED_FONT_STYLESHEETS = new Set();
+
+function loadStylesheetOnce(href) {
+    if (!href || LOADED_FONT_STYLESHEETS.has(href)) {
+        return;
+    }
+
+    if (document.querySelector(`link[data-typography-font-href="${href}"]`)) {
+        LOADED_FONT_STYLESHEETS.add(href);
+        return;
+    }
+
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = href;
+    link.setAttribute('data-typography-font-href', href);
+    document.head.appendChild(link);
+    LOADED_FONT_STYLESHEETS.add(href);
+}
+
+function ensureTypographyFontStylesheets(fontIds = []) {
+    const hrefs = new Set();
+
+    for (const fontId of fontIds) {
+        for (const href of FONT_STYLESHEET_MAP[fontId] || []) {
+            hrefs.add(href);
+        }
+    }
+
+    for (const href of hrefs) {
+        loadStylesheetOnce(href);
+    }
+}
+
+const DEFAULT_TYPOGRAPHY_FONT_IDS = ['ui-system', 'editor-sfmono', 'preview-charter'];
+
 const DEFAULT_TYPOGRAPHY_SETTINGS = {
     uiFont: 'ui-system',
     editorFont: 'editor-sfmono',
@@ -546,8 +839,6 @@ const DEFAULT_TYPOGRAPHY_SETTINGS = {
 const FIXED_TOOLBAR_POSITION = 'right';
 const DEFAULT_FEATURE_VISIBILITY_SETTINGS = {
     timeline: true,
-    music: true,
-    player: true,
     pomodoro: true
 };
 const DEFAULT_SIDEBAR_RAIL_ORDER = [
@@ -557,13 +848,8 @@ const DEFAULT_SIDEBAR_RAIL_ORDER = [
     'todo',
     'attachment',
     'history',
-    'music',
-    'player',
     'pomodoro'
 ];
-rememberedWorkspaceVideoBundleSelections = loadWorkspaceVideoSelectionPreferences();
-rememberedWorkspaceMusicBundleSelections = loadWorkspaceMusicSelectionPreferences();
-rememberedWorkspaceMusicPlaybackStates = loadWorkspaceMusicPlaybackPreferences();
 
 const MONACO_THEME_MAP = {
     'dark-ocean': { name: 'codex-dark-ocean', base: 'vs-dark', background: '#141a26', foreground: '#d9e0ea', lineHighlight: '#1b2331', selection: '#26455f' },
@@ -587,6 +873,7 @@ const editorReadyPromise = new Promise((resolve, reject) => {
 applyTheme(loadThemePreference());
 applyTypographySettings(loadTypographySettings());
 applyLayoutSettings(loadLayoutSettings());
+applyInlineMediaPositionSettings(loadInlineMediaPositionSettings());
 applySidebarVisibility(loadSidebarVisibilityPreference());
 applyToolbarVisibility(loadToolbarVisibilityPreference());
 featureVisibilitySettings = applyFeatureVisibility(loadFeatureVisibilitySettings());
@@ -640,17 +927,23 @@ async function waitForEditorReady() {
     await editorReadyPromise;
 }
 
-function createEditorTabState({ path: folderPath = null, content = DEFAULT_UNTITLED_CONTENT, isDirty: dirty = false, searchQuery = '', preservedEntries = [], pinned = false } = {}) {
+function createEditorTabState({ path: folderPath = null, content = DEFAULT_UNTITLED_CONTENT, isDirty: dirty = false, searchQuery = '', preservedEntries = [], pinned = false, documentJson = null, manifest = null } = {}) {
     return {
         id: `tab-${nextEditorTabId++}`,
         path: folderPath,
         content,
         previousContent: content,
+        documentJson: cloneSerializableValue(documentJson),
+        manifest: cloneSerializableValue(manifest),
         isDirty: dirty,
         previousIsDirty: dirty,
         searchQuery,
         preservedEntries: [...preservedEntries],
         pinned: Boolean(pinned),
+        attachmentSnapshot: null,
+        attachmentSnapshotRoot: null,
+        pendingSelectionSnapshot: null,
+        selectionSnapshot: null,
         undoStack: [],
         redoStack: []
     };
@@ -670,40 +963,163 @@ function createTabStateSnapshot(tab) {
     if (!tab) {
         return {
             content: '',
+            documentJson: null,
+            manifest: null,
             isDirty: false,
             searchQuery: '',
-            preservedEntries: []
+            preservedEntries: [],
+            selection: null
         };
     }
 
     return {
         content: typeof tab.content === 'string' ? tab.content : '',
+        documentJson: cloneSerializableValue(tab.documentJson),
+        manifest: cloneSerializableValue(tab.manifest),
         isDirty: Boolean(tab.isDirty),
         searchQuery: tab.searchQuery || '',
-        preservedEntries: Array.from(tab.preservedEntries || [])
+        preservedEntries: Array.from(tab.preservedEntries || []),
+        attachmentSnapshot: cloneSerializableValue(tab.attachmentSnapshot),
+        attachmentSnapshotRoot: tab.attachmentSnapshotRoot || null,
+        selection: cloneSerializableValue(tab.pendingSelectionSnapshot)
+            || cloneSerializableValue(tab.selectionSnapshot)
+            || (typeof window.editor?.getSelectionSnapshot === 'function'
+            ? cloneSerializableValue(window.editor.getSelectionSnapshot())
+            : null)
     };
 }
 
-function pushTabUndoSnapshot(tab, snapshot = null) {
-    if (!tab) return;
+function historySnapshotKey(snapshot) {
+    if (!snapshot) {
+        return '';
+    }
+
+    return JSON.stringify({
+        content: typeof snapshot.content === 'string' ? snapshot.content : '',
+        documentJson: snapshot.documentJson || null,
+        manifest: snapshot.manifest || null,
+        isDirty: Boolean(snapshot.isDirty),
+        searchQuery: snapshot.searchQuery || '',
+        preservedEntries: Array.from(snapshot.preservedEntries || []),
+        attachmentSnapshot: snapshot.attachmentSnapshot || null,
+        attachmentSnapshotRoot: snapshot.attachmentSnapshotRoot || null
+    });
+}
+
+function historySnapshotsEqual(leftSnapshot, rightSnapshot) {
+    return historySnapshotKey(leftSnapshot) === historySnapshotKey(rightSnapshot);
+}
+
+function capturePendingSelectionSnapshot() {
+    const tab = getActiveTab();
+    if (!tab || !window.editor || typeof window.editor.getSelectionSnapshot !== 'function') {
+        return false;
+    }
+
+    const selectionSnapshot = cloneSerializableValue(window.editor.getSelectionSnapshot());
+    if (!selectionSnapshot) {
+        return false;
+    }
+
+    tab.pendingSelectionSnapshot = selectionSnapshot;
+    return true;
+}
+
+function createSnapshotHistoryEntry(tab, previousSnapshot, nextSnapshot, label = '文档修改') {
+    return {
+        id: createHistoryEntryId(),
+        kind: 'snapshot',
+        label,
+        beforeSnapshot: cloneSerializableValue(previousSnapshot),
+        afterSnapshot: cloneSerializableValue(nextSnapshot),
+        undo() {
+            return applyTabStateSnapshot(tab, previousSnapshot, {
+                preserveSelection: false,
+                selectionSnapshot: previousSnapshot?.selection || null,
+                addCurrentToOppositeStack: false
+            });
+        },
+        redo() {
+            return applyTabStateSnapshot(tab, nextSnapshot, {
+                preserveSelection: false,
+                selectionSnapshot: nextSnapshot?.selection || null,
+                addCurrentToOppositeStack: false
+            });
+        }
+    };
+}
+
+function createCompositeHistoryEntry(tab, previousSnapshot, nextSnapshot, steps = [], label = '文档修改') {
+    const attachmentSteps = Array.isArray(steps) ? steps.filter(Boolean) : [];
+    return {
+        id: createHistoryEntryId(),
+        kind: 'transaction',
+        label,
+        beforeSnapshot: cloneSerializableValue(previousSnapshot),
+        afterSnapshot: cloneSerializableValue(nextSnapshot),
+        steps: attachmentSteps,
+        async undo() {
+            for (let index = attachmentSteps.length - 1; index >= 0; index--) {
+                const step = attachmentSteps[index];
+                if (typeof step?.undo === 'function') {
+                    const didUndoStep = await step.undo();
+                    if (didUndoStep === false) {
+                        return false;
+                    }
+                }
+            }
+            return applyTabStateSnapshot(tab, previousSnapshot, {
+                preserveSelection: false,
+                selectionSnapshot: previousSnapshot?.selection || null,
+                addCurrentToOppositeStack: false
+            });
+        },
+        async redo() {
+            for (const step of attachmentSteps) {
+                if (typeof step?.redo === 'function') {
+                    const didRedoStep = await step.redo();
+                    if (didRedoStep === false) {
+                        return false;
+                    }
+                }
+            }
+            return applyTabStateSnapshot(tab, nextSnapshot, {
+                preserveSelection: false,
+                selectionSnapshot: nextSnapshot?.selection || null,
+                addCurrentToOppositeStack: false
+            });
+        }
+    };
+}
+
+function pushTabHistoryEntry(tab, entry) {
+    if (!tab || !entry) return;
     ensureTabHistoryStacks(tab);
 
-    const nextSnapshot = snapshot || createTabStateSnapshot(tab);
-    const lastSnapshot = tab.undoStack[tab.undoStack.length - 1];
-    if (
-        lastSnapshot
-        && lastSnapshot.content === nextSnapshot.content
-        && Boolean(lastSnapshot.isDirty) === Boolean(nextSnapshot.isDirty)
-        && (lastSnapshot.searchQuery || '') === (nextSnapshot.searchQuery || '')
-        && JSON.stringify(lastSnapshot.preservedEntries || []) === JSON.stringify(nextSnapshot.preservedEntries || [])
-    ) {
+    const lastEntry = tab.undoStack[tab.undoStack.length - 1];
+    const lastSnapshot = lastEntry?.afterSnapshot || lastEntry?.snapshot || null;
+    const nextSnapshot = entry.afterSnapshot || entry.snapshot || null;
+    if (historySnapshotsEqual(lastSnapshot, nextSnapshot) && !entry.steps?.length) {
         return;
     }
 
-    tab.undoStack.push(nextSnapshot);
+    tab.undoStack.push(entry);
     if (tab.undoStack.length > 200) {
         tab.undoStack.splice(0, tab.undoStack.length - 200);
     }
+    tab.redoStack.length = 0;
+}
+
+function pushTabUndoSnapshot(tab, previousSnapshot = null, nextSnapshot = null, label = '文档修改') {
+    if (!tab) return;
+    const beforeSnapshot = cloneSerializableValue(previousSnapshot) || createTabStateSnapshot(tab);
+    const afterSnapshot = cloneSerializableValue(nextSnapshot) || createTabStateSnapshot(tab);
+
+    if (historySnapshotsEqual(beforeSnapshot, afterSnapshot)) {
+        return;
+    }
+
+    pushTabHistoryEntry(tab, createSnapshotHistoryEntry(tab, beforeSnapshot, afterSnapshot, label));
 }
 
 function clearTabRedoStack(tab) {
@@ -748,10 +1164,41 @@ function getActiveTabRedoAvailability() {
     return activeTab.redoStack.length > 0;
 }
 
+function refreshActiveEditorAttachmentDom() {
+    if (!window.editor) return;
+
+    const refresh = () => {
+        if (!window.editor) return;
+        if (typeof window.editor.normalizeAttachmentNodes === 'function') {
+            window.editor.normalizeAttachmentNodes();
+        }
+        if (typeof window.editor.refreshLinkDomState === 'function') {
+            window.editor.refreshLinkDomState(true);
+        }
+        if (typeof window.editor.refreshAttachmentNodeLabels === 'function') {
+            window.editor.refreshAttachmentNodeLabels(true);
+        }
+        if (typeof window.editor.refreshRangeSelectionHighlights === 'function') {
+            window.editor.refreshRangeSelectionHighlights();
+        }
+    };
+
+    window.requestAnimationFrame(() => {
+        refresh();
+        window.requestAnimationFrame(refresh);
+    });
+}
+
 function applyTabStateSnapshot(tab, snapshot, options = {}) {
     if (!tab || !window.editor || !snapshot) return false;
+    if (tab.id !== activeTabId) return false;
 
-    const { preserveSelection = true, addCurrentToOppositeStack = false, oppositeStack = 'redo' } = options;
+    const {
+        preserveSelection = true,
+        selectionSnapshot = null,
+        addCurrentToOppositeStack = false,
+        oppositeStack = 'redo'
+    } = options;
     const currentSnapshot = createTabStateSnapshot(tab);
     ensureTabHistoryStacks(tab);
 
@@ -764,7 +1211,14 @@ function applyTabStateSnapshot(tab, snapshot, options = {}) {
     }
 
     suppressDocumentStateSync = true;
-    if (typeof window.editor.setValue === 'function') {
+    const nextSelectionSnapshot = selectionSnapshot || (preserveSelection ? snapshot.selection || null : null);
+    const didApplyDocumentJson = snapshot.documentJson && typeof window.editor.setDocumentJson === 'function'
+        ? window.editor.setDocumentJson(cloneSerializableValue(snapshot.documentJson), {
+            emitChange: false,
+            preserveSelection
+        })
+        : false;
+    if (!didApplyDocumentJson && typeof window.editor.setValue === 'function') {
         window.editor.setValue(snapshot.content || '', {
             emitChange: false,
             preserveSelection
@@ -772,12 +1226,21 @@ function applyTabStateSnapshot(tab, snapshot, options = {}) {
     }
     suppressDocumentStateSync = false;
 
+    const refreshedContent = typeof window.editor.getValue === 'function'
+        ? window.editor.getValue()
+        : (typeof snapshot.content === 'string' ? snapshot.content : '');
     tab.previousContent = tab.content;
     tab.previousIsDirty = tab.isDirty;
-    tab.content = typeof snapshot.content === 'string' ? snapshot.content : '';
+    tab.content = refreshedContent;
+    tab.documentJson = cloneSerializableValue(snapshot.documentJson);
+    tab.manifest = cloneSerializableValue(snapshot.manifest);
     tab.isDirty = Boolean(snapshot.isDirty);
     tab.searchQuery = snapshot.searchQuery || '';
     tab.preservedEntries = [...(snapshot.preservedEntries || [])];
+    tab.attachmentSnapshot = cloneSerializableValue(snapshot.attachmentSnapshot);
+    tab.attachmentSnapshotRoot = snapshot.attachmentSnapshotRoot || null;
+    tab.selectionSnapshot = cloneSerializableValue(nextSelectionSnapshot);
+    tab.pendingSelectionSnapshot = null;
     preservedUnusedAttachmentEntries = new Set(tab.preservedEntries);
     currentSearchQuery = tab.searchQuery;
 
@@ -787,26 +1250,16 @@ function applyTabStateSnapshot(tab, snapshot, options = {}) {
     }
 
     updateBundleStatus(tab.path || null);
-    const restoredEntries = restoreRecoveredEntries(tab.content || '');
-    if (restoredEntries) {
-        const refreshAttachmentDom = () => {
-            if (!window.editor) return;
-            if (typeof window.editor.normalizeAttachmentNodes === 'function') {
-                window.editor.normalizeAttachmentNodes();
-            }
-            if (typeof window.editor.refreshLinkDomState === 'function') {
-                window.editor.refreshLinkDomState(true);
-            }
-            if (typeof window.editor.refreshAttachmentNodeLabels === 'function') {
-                window.editor.refreshAttachmentNodeLabels(true);
-            }
-        };
-        window.requestAnimationFrame(refreshAttachmentDom);
+    const restoredEntries = restoreRecoveredEntries(tab.content || '', tab.documentJson || null);
+    refreshActiveEditorAttachmentDom();
+    if (nextSelectionSnapshot && typeof window.editor.restoreSelectionSnapshot === 'function') {
+        window.editor.restoreSelectionSnapshot(nextSelectionSnapshot, { scrollIntoView: false });
     }
     renderToolbarSearchResults(currentSearchQuery);
     updatePreview({ preserveViewport: true, preserveMode: 'anchor' });
     updateOutline();
     setDirty(Boolean(snapshot.isDirty) || restoredEntries);
+    refreshAttachmentPanelIfVisible();
     refreshEditorToolbarState();
     lastKnownEditorLineCount = getEditorTotalLines();
     pendingPreviewVisibleLine = getEditorAnchorLineFromCursor();
@@ -818,52 +1271,209 @@ function applyTabStateSnapshot(tab, snapshot, options = {}) {
     return true;
 }
 
-function undoActiveTabState() {
+async function undoActiveTabState() {
     const activeTab = getActiveTab();
     if (!activeTab || !window.editor) return false;
+
+    flushScheduledPersistActiveTabState();
 
     if (restorePendingAttachmentDeleteSnapshotForCancel()) {
         return true;
     }
 
     const didUndoAttachmentRename = applyPendingAttachmentRenameUndo();
-
-    ensureTabHistoryStacks(activeTab);
-    const snapshot = activeTab.undoStack.pop();
-    if (!snapshot) {
-        return didUndoAttachmentRename;
+    if (didUndoAttachmentRename) {
+        return true;
     }
 
-    activeTab.redoStack.push(createTabStateSnapshot(activeTab));
-    if (activeTab.redoStack.length > 200) {
-        activeTab.redoStack.splice(0, activeTab.redoStack.length - 200);
-    }
-
-    return applyTabStateSnapshot(activeTab, snapshot, {
-        preserveSelection: true,
-        addCurrentToOppositeStack: false
-    });
-}
-
-function redoActiveTabState() {
-    const activeTab = getActiveTab();
-    if (!activeTab || !window.editor) return false;
-
     ensureTabHistoryStacks(activeTab);
-    const snapshot = activeTab.redoStack.pop();
-    if (!snapshot) {
+    const entry = activeTab.undoStack[activeTab.undoStack.length - 1];
+    if (!entry) {
         return false;
     }
 
-    activeTab.undoStack.push(createTabStateSnapshot(activeTab));
-    if (activeTab.undoStack.length > 200) {
-        activeTab.undoStack.splice(0, activeTab.undoStack.length - 200);
+    suppressHistoryRecording = true;
+    try {
+        const didUndo = typeof entry.undo === 'function' ? Boolean(await entry.undo()) : false;
+        if (!didUndo) {
+            return false;
+        }
+
+        activeTab.undoStack.pop();
+        activeTab.redoStack.push(entry);
+        if (activeTab.redoStack.length > 200) {
+            activeTab.redoStack.splice(0, activeTab.redoStack.length - 200);
+        }
+        return true;
+    } catch (error) {
+        console.error('Undo failed:', error);
+        alert(`撤销失败: ${error?.message || error}`);
+        return false;
+    } finally {
+        suppressHistoryRecording = false;
+    }
+}
+
+async function redoActiveTabState() {
+    const activeTab = getActiveTab();
+    if (!activeTab || !window.editor) return false;
+
+    flushScheduledPersistActiveTabState();
+
+    ensureTabHistoryStacks(activeTab);
+    const entry = activeTab.redoStack[activeTab.redoStack.length - 1];
+    if (!entry) {
+        return false;
     }
 
-    return applyTabStateSnapshot(activeTab, snapshot, {
-        preserveSelection: true,
-        addCurrentToOppositeStack: false
-    });
+    suppressHistoryRecording = true;
+    try {
+        const didRedo = typeof entry.redo === 'function' ? Boolean(await entry.redo()) : false;
+        if (!didRedo) {
+            return false;
+        }
+
+        activeTab.redoStack.pop();
+        activeTab.undoStack.push(entry);
+        if (activeTab.undoStack.length > 200) {
+            activeTab.undoStack.splice(0, activeTab.undoStack.length - 200);
+        }
+        return true;
+    } catch (error) {
+        console.error('Redo failed:', error);
+        alert(`重做失败: ${error?.message || error}`);
+        return false;
+    } finally {
+        suppressHistoryRecording = false;
+    }
+}
+
+function beginHistoryTransaction(label, tab = getActiveTab()) {
+    if (!tab || activeHistoryTransaction) {
+        return false;
+    }
+
+    flushScheduledPersistActiveTabState();
+    if (tab.path) {
+        tab.attachmentSnapshot = captureBundleAttachmentSnapshot(tab.path);
+        tab.attachmentSnapshotRoot = path.resolve(tab.path);
+    }
+    activeHistoryTransaction = {
+        id: createHistoryEntryId(),
+        label: String(label || '文档修改'),
+        tabId: tab.id,
+        beforeSnapshot: createTabStateSnapshot(tab),
+        steps: []
+    };
+    suppressHistoryRecording = true;
+    return true;
+}
+
+function recordHistoryAttachmentStep(step) {
+    if (!activeHistoryTransaction || !step) {
+        return false;
+    }
+    if (activeHistoryTransaction.tabId !== activeTabId) {
+        return false;
+    }
+
+    activeHistoryTransaction.steps.push(step);
+    return true;
+}
+
+function commitHistoryTransaction() {
+    const transaction = activeHistoryTransaction;
+    if (!transaction) {
+        suppressHistoryRecording = false;
+        return false;
+    }
+
+    const tab = getTabById(transaction.tabId);
+    activeHistoryTransaction = null;
+    suppressHistoryRecording = false;
+
+    if (!tab) {
+        return false;
+    }
+
+    if (tab.path) {
+        tab.attachmentSnapshot = captureBundleAttachmentSnapshot(tab.path);
+        tab.attachmentSnapshotRoot = path.resolve(tab.path);
+    }
+    const afterSnapshot = createTabStateSnapshot(tab);
+    if (historySnapshotsEqual(transaction.beforeSnapshot, afterSnapshot) && !transaction.steps.length) {
+        return false;
+    }
+
+    pushTabHistoryEntry(
+        tab,
+        createCompositeHistoryEntry(
+            tab,
+            transaction.beforeSnapshot,
+            afterSnapshot,
+            transaction.steps,
+            transaction.label
+        )
+    );
+    return true;
+}
+
+async function cancelHistoryTransaction(options = {}) {
+    const { rollback = false } = options;
+    const transaction = activeHistoryTransaction;
+    activeHistoryTransaction = null;
+    suppressHistoryRecording = false;
+
+    if (!rollback || !transaction) {
+        return;
+    }
+
+    const tab = getTabById(transaction.tabId);
+    if (!tab) {
+        return;
+    }
+
+    for (let index = transaction.steps.length - 1; index >= 0; index--) {
+        const step = transaction.steps[index];
+        if (typeof step?.undo === 'function') {
+            try {
+                await step.undo();
+            } catch {
+                // ignore rollback failures
+            }
+        }
+    }
+
+    if (transaction.beforeSnapshot) {
+        try {
+            applyTabStateSnapshot(tab, transaction.beforeSnapshot, {
+                preserveSelection: true,
+                addCurrentToOppositeStack: false
+            });
+        } catch {
+            // ignore rollback failures
+        }
+    }
+}
+
+async function runHistoryTransaction(label, callback, tab = getActiveTab()) {
+    const started = beginHistoryTransaction(label, tab);
+    try {
+        const result = await callback();
+        if (started && result === false) {
+            await cancelHistoryTransaction({ rollback: true });
+            return result;
+        }
+        if (started) {
+            commitHistoryTransaction();
+        }
+        return result;
+    } catch (error) {
+        if (started) {
+            await cancelHistoryTransaction({ rollback: true });
+        }
+        throw error;
+    }
 }
 
 function getTabById(tabId = activeTabId) {
@@ -892,13 +1502,15 @@ function isDisposableWelcomeTab(tab) {
     return normalized === DEFAULT_UNTITLED_CONTENT.trim();
 }
 
-function persistActiveTabState(markdownOverride = null) {
-    if (suppressDocumentStateSync || !window.editor) return;
+function getActiveEditorSnapshot(markdownOverride = null) {
+    if (!window.editor) {
+        return {
+            markdown: typeof markdownOverride === 'string' ? markdownOverride : '',
+            documentJson: null
+        };
+    }
 
-    const tab = getActiveTab();
-    if (!tab) return;
-
-    const liveMarkdown = typeof markdownOverride === 'string'
+    const markdown = typeof markdownOverride === 'string'
         ? markdownOverride
         : (typeof window.editor.getValue === 'function'
             ? window.editor.getValue()
@@ -906,33 +1518,66 @@ function persistActiveTabState(markdownOverride = null) {
                 ? window.editor.getLiveMarkdownSnapshot()
                 : ''));
 
+    const documentJson = typeof window.editor.getDocumentJson === 'function'
+        ? cloneSerializableValue(window.editor.getDocumentJson())
+        : null;
+
+    return { markdown, documentJson };
+}
+
+function persistActiveTabState(markdownOverride = null) {
+    if (suppressDocumentStateSync || !window.editor) return;
+
+    const tab = getActiveTab();
+    if (!tab) return;
+    const previousSnapshot = createTabStateSnapshot(tab);
+    const { markdown: liveMarkdown, documentJson: liveDocumentJson } = getActiveEditorSnapshot(markdownOverride);
+    const tabDocumentJson = cloneSerializableValue(tab.documentJson);
+    const liveDocumentJsonString = JSON.stringify(liveDocumentJson || null);
+    const tabDocumentJsonString = JSON.stringify(tabDocumentJson || null);
+    const hasDocumentJsonState = Boolean(liveDocumentJson || tabDocumentJson);
+    const didStructuralChange = hasDocumentJsonState
+        ? liveDocumentJsonString !== tabDocumentJsonString
+        : liveMarkdown !== tab.content;
+
     ensureTabHistoryStacks(tab);
-    if (liveMarkdown !== tab.content) {
-        pushTabUndoSnapshot(tab, {
-            content: tab.content || '',
-            isDirty: Boolean(tab.isDirty),
-            searchQuery: tab.searchQuery || '',
-            preservedEntries: Array.from(tab.preservedEntries || [])
-        });
-        clearTabRedoStack(tab);
-    }
 
     tab.previousContent = tab.content;
     tab.previousIsDirty = tab.isDirty;
     tab.path = window.currentPath || null;
     tab.content = liveMarkdown;
+    tab.documentJson = liveDocumentJson;
     tab.isDirty = isDirty;
     tab.searchQuery = currentSearchQuery;
     tab.preservedEntries = Array.from(preservedUnusedAttachmentEntries);
+    tab.selectionSnapshot = typeof window.editor.getSelectionSnapshot === 'function'
+        ? cloneSerializableValue(window.editor.getSelectionSnapshot())
+        : tab.selectionSnapshot || null;
+    tab.pendingSelectionSnapshot = null;
+    if (tab.path) {
+        tab.attachmentSnapshot = captureBundleAttachmentSnapshot(tab.path);
+        tab.attachmentSnapshotRoot = path.resolve(tab.path);
+    }
+
+    const nextSnapshot = createTabStateSnapshot(tab);
+    if (didStructuralChange && !suppressHistoryRecording) {
+        pushTabUndoSnapshot(tab, previousSnapshot, nextSnapshot);
+    }
 }
 
-function schedulePersistActiveTabState(markdownOverride = null, delay = 120) {
+function schedulePersistActiveTabState(markdownOverride = null, delay = 120, tabId = activeTabId) {
     if (persistActiveTabTimer) {
         window.clearTimeout(persistActiveTabTimer);
     }
 
+    persistActiveTabTimerContext = { tabId };
     persistActiveTabTimer = window.setTimeout(() => {
+        const context = persistActiveTabTimerContext;
         persistActiveTabTimer = null;
+        persistActiveTabTimerContext = null;
+        if (context?.tabId && context.tabId !== activeTabId) {
+            return;
+        }
         persistActiveTabState(markdownOverride);
     }, delay);
 }
@@ -940,7 +1585,12 @@ function schedulePersistActiveTabState(markdownOverride = null, delay = 120) {
 function flushScheduledPersistActiveTabState() {
     if (!persistActiveTabTimer) return;
     window.clearTimeout(persistActiveTabTimer);
+    const context = persistActiveTabTimerContext;
     persistActiveTabTimer = null;
+    persistActiveTabTimerContext = null;
+    if (context?.tabId && context.tabId !== activeTabId) {
+        return;
+    }
     persistActiveTabState();
 }
 
@@ -1005,7 +1655,7 @@ function shouldApplyPendingAttachmentDeleteSnapshot() {
 
 function capturePendingAttachmentRenameSnapshot(oldAbsolutePath, newAbsolutePath) {
     const activeTab = getActiveTab();
-    if (!activeTab || !window.currentPath) {
+    if (!activeTab || !window.currentPath || activeHistoryTransaction || suppressHistoryRecording) {
         pendingAttachmentRenameSnapshot = null;
         return;
     }
@@ -1093,7 +1743,12 @@ function applyPendingAttachmentDeleteSnapshot() {
     activeTab.searchQuery = deleteSnapshot.searchQuery || '';
     activeTab.preservedEntries = [...(deleteSnapshot.preservedEntries || [])];
     ensureTabHistoryStacks(activeTab);
-    if (activeTab.undoStack.length && activeTab.undoStack[activeTab.undoStack.length - 1]?.content === deleteSnapshot.content) {
+    const lastHistoryEntry = activeTab.undoStack[activeTab.undoStack.length - 1];
+    const lastHistoryContent = lastHistoryEntry?.afterSnapshot?.content
+        || lastHistoryEntry?.snapshot?.content
+        || lastHistoryEntry?.content
+        || '';
+    if (activeTab.undoStack.length && lastHistoryContent === deleteSnapshot.content) {
         activeTab.undoStack.pop();
     }
     clearTabRedoStack(activeTab);
@@ -1152,6 +1807,7 @@ function clearPendingAutoSave() {
 }
 
 function isPreviewActive() {
+    if (RICH_TEXT_EDITOR_ONLY) return false;
     const preview = document.getElementById('preview-container');
     if (!preview) return false;
     const style = window.getComputedStyle(preview);
@@ -1229,6 +1885,9 @@ function renderEditorTabs() {
 }
 
 async function createEmptyTab() {
+    if (activeHistoryTransaction) {
+        return null;
+    }
     await waitForEditorReady();
     clearPendingAutoSave();
     persistActiveTabState();
@@ -1242,13 +1901,15 @@ async function createEmptyTab() {
 
 function syncGlobalsFromTab(tab) {
     window.currentPath = tab.path || null;
+    if (window.currentPath) {
+        migrateLegacyRecoveryRoot(window.currentPath);
+    }
     preservedUnusedAttachmentEntries = new Set(tab.preservedEntries || []);
     currentSearchQuery = tab.searchQuery || '';
 }
 
 function applyTabToEditor(tab) {
     if (!tab || !window.editor) return;
-    const targetTabId = tab.id;
 
     suppressDocumentStateSync = true;
     syncGlobalsFromTab(tab);
@@ -1258,13 +1919,45 @@ function applyTabToEditor(tab) {
     if (typeof window.editor.setBundlePath === 'function') {
         window.editor.setBundlePath(tab.path || null);
     }
-    window.editor.setValue(tab.content || '');
+
+    const canSetDocumentJson = typeof window.editor.setDocumentJson === 'function' && tab.documentJson;
+    const documentJsonApplied = canSetDocumentJson
+        ? window.editor.setDocumentJson(cloneSerializableValue(tab.documentJson), {
+            emitChange: false,
+            preserveSelection: false
+        })
+        : false;
+    if (!documentJsonApplied) {
+        window.editor.setValue(tab.content || '');
+    }
+
+    let didRepairAttachments = false;
+    if (typeof window.editor.repairAttachmentReferencesByIdentity === 'function') {
+        try {
+            didRepairAttachments = Boolean(window.editor.repairAttachmentReferencesByIdentity());
+        } catch {
+            didRepairAttachments = false;
+        }
+    }
+
     if (typeof window.editor.getValue === 'function') {
         const refreshedContent = window.editor.getValue();
         tab.content = refreshedContent;
         tab.previousContent = refreshedContent;
     }
+    if (typeof window.editor.getDocumentJson === 'function') {
+        tab.documentJson = cloneSerializableValue(window.editor.getDocumentJson());
+    }
     suppressDocumentStateSync = false;
+
+    if (didRepairAttachments && typeof window.editor.getValue === 'function') {
+        const repairedContent = window.editor.getValue();
+        tab.content = repairedContent;
+        tab.previousContent = repairedContent;
+    }
+    if (didRepairAttachments && typeof window.editor.getDocumentJson === 'function') {
+        tab.documentJson = cloneSerializableValue(window.editor.getDocumentJson());
+    }
 
     const searchInput = document.getElementById('toolbar-search-input');
     if (searchInput) {
@@ -1286,6 +1979,9 @@ function applyTabToEditor(tab) {
 function activateTab(tabId) {
     const nextTab = getTabById(tabId);
     if (!nextTab) return;
+    if (activeHistoryTransaction && activeHistoryTransaction.tabId !== tabId) {
+        return;
+    }
 
     if (activeTabId === tabId) {
         renderEditorTabs();
@@ -1295,6 +1991,7 @@ function activateTab(tabId) {
     clearPendingAutoSave();
     persistActiveTabState();
     activeTabId = tabId;
+    repairTabAttachmentStateFromFilesystem(nextTab);
     applyTabToEditor(nextTab);
     syncWorkspaceSelectionToPath(nextTab.path);
     renderEditorTabs();
@@ -1306,16 +2003,29 @@ function findTabByPath(folderPath) {
     return editorTabs.find((tab) => tab.path && path.resolve(tab.path) === normalizedTarget) || null;
 }
 
-function openTabWithContent(folderPath, content) {
+function openTabWithContent(folderPath, content, options = {}) {
+    if (activeHistoryTransaction) {
+        return null;
+    }
     const normalizedPath = folderPath ? path.resolve(folderPath) : null;
     const existingTab = normalizedPath ? findTabByPath(normalizedPath) : null;
+    const nextDocumentJson = options.documentJson ? cloneSerializableValue(options.documentJson) : null;
+    const nextManifest = options.manifest ? cloneSerializableValue(options.manifest) : null;
 
     if (existingTab) {
         existingTab.path = normalizedPath;
+        if (nextDocumentJson) {
+            existingTab.documentJson = nextDocumentJson;
+        }
+        if (nextManifest) {
+            existingTab.manifest = nextManifest;
+        }
         if (!existingTab.isDirty) {
             existingTab.content = content;
             resetTabHistory(existingTab, content);
         }
+        existingTab.attachmentSnapshot = existingTab.path ? captureBundleAttachmentSnapshot(existingTab.path) : null;
+        existingTab.attachmentSnapshotRoot = existingTab.path ? path.resolve(existingTab.path) : null;
         activateTab(existingTab.id);
         return existingTab;
     }
@@ -1329,11 +2039,15 @@ function openTabWithContent(folderPath, content) {
     ) {
         activeTab.path = normalizedPath;
         activeTab.content = content;
+        activeTab.documentJson = nextDocumentJson;
+        activeTab.manifest = nextManifest;
         activeTab.previousContent = content;
         activeTab.isDirty = false;
         activeTab.previousIsDirty = false;
         activeTab.searchQuery = '';
         activeTab.preservedEntries = [];
+        activeTab.attachmentSnapshot = activeTab.path ? captureBundleAttachmentSnapshot(activeTab.path) : null;
+        activeTab.attachmentSnapshotRoot = activeTab.path ? path.resolve(activeTab.path) : null;
         resetTabHistory(activeTab, content);
         applyTabToEditor(activeTab);
         renderEditorTabs();
@@ -1345,10 +2059,14 @@ function openTabWithContent(folderPath, content) {
     const tab = createEditorTabState({
         path: normalizedPath,
         content,
-        isDirty: false
+        isDirty: false,
+        documentJson: nextDocumentJson,
+        manifest: nextManifest
     });
     editorTabs.push(tab);
     activeTabId = tab.id;
+    tab.attachmentSnapshot = tab.path ? captureBundleAttachmentSnapshot(tab.path) : null;
+    tab.attachmentSnapshotRoot = tab.path ? path.resolve(tab.path) : null;
     applyTabToEditor(tab);
     syncWorkspaceSelectionToPath(tab.path);
     renderEditorTabs();
@@ -1358,6 +2076,7 @@ function openTabWithContent(folderPath, content) {
 async function closeEditorTab(tabId) {
     const targetTab = getTabById(tabId);
     if (!targetTab) return;
+    if (activeHistoryTransaction) return;
 
     clearPendingAutoSave();
 
@@ -1381,6 +2100,10 @@ async function closeEditorTab(tabId) {
             loadPinnedEditorTabPaths().filter((entry) => path.resolve(entry) !== normalizedClosedPath)
         );
     }
+
+    if (closedPath && !targetTab.isDirty) {
+        await cleanupUnusedResourcesForTab(targetTab);
+    }
     editorTabs = editorTabs.filter((tab) => tab.id !== tabId);
 
     if (!editorTabs.length) {
@@ -1392,7 +2115,7 @@ async function closeEditorTab(tabId) {
     }
 
     if (closedPath) {
-        cleanupRecoveryDir(closedPath);
+        cleanupRecoveryDir(closedPath, { preservePrimary: true });
     }
 
     if (editorTabs.length) {
@@ -1401,6 +2124,9 @@ async function closeEditorTab(tabId) {
 }
 
 async function confirmAllTabsBeforeClose() {
+    if (activeHistoryTransaction) {
+        return false;
+    }
     persistActiveTabState();
     const tabIds = editorTabs.map((tab) => tab.id);
     const originalActiveTabId = activeTabId;
@@ -1417,6 +2143,12 @@ async function confirmAllTabsBeforeClose() {
             }
             return false;
         }
+    }
+
+    for (const tab of editorTabs) {
+        if (!tab || !tab.path || tab.isDirty) continue;
+        await cleanupUnusedResourcesForTab(tab);
+        cleanupRecoveryDir(tab.path);
     }
 
     return true;
@@ -1480,11 +2212,52 @@ function appendWorkspaceTimelineEvent(event, rootPath = workspaceRootPath) {
 
 function getTodoTimelineEventIdentity(todo = {}) {
     const normalizedBundlePath = todo?.bundlePath ? path.resolve(todo.bundlePath) : '';
-    const lineNumber = Number.isInteger(todo?.lineNumber) ? todo.lineNumber : Number.isInteger(todo?.sourceLine) ? todo.sourceLine : null;
-    if (!normalizedBundlePath || !Number.isInteger(lineNumber)) {
+    if (!normalizedBundlePath) {
         return null;
     }
-    return `${normalizedBundlePath}::${lineNumber}`;
+
+    const stableId = String(todo?.stableId || '').trim();
+    if (stableId) {
+        return `${normalizedBundlePath}::id::${stableId}`;
+    }
+
+    const kindIndex = Number.isInteger(todo?.kindIndex) ? todo.kindIndex : null;
+    if (Number.isInteger(kindIndex)) {
+        return `${normalizedBundlePath}::kind::${kindIndex}`;
+    }
+
+    const lineNumber = Number.isInteger(todo?.lineNumber) ? todo.lineNumber : Number.isInteger(todo?.sourceLine) ? todo.sourceLine : null;
+    if (!Number.isInteger(lineNumber)) {
+        return null;
+    }
+
+    return `${normalizedBundlePath}::line::${lineNumber}`;
+}
+
+function getTodoCheckedUpdateKey(todo = {}) {
+    const normalizedBundlePath = todo?.bundlePath
+        ? path.resolve(todo.bundlePath)
+        : (window.currentPath ? path.resolve(window.currentPath) : '');
+    if (!normalizedBundlePath) {
+        return null;
+    }
+
+    const stableId = String(todo?.stableId || '').trim();
+    if (stableId) {
+        return `${normalizedBundlePath}::id::${stableId}`;
+    }
+
+    const kindIndex = Number.isInteger(todo?.kindIndex) ? todo.kindIndex : null;
+    if (Number.isInteger(kindIndex)) {
+        return `${normalizedBundlePath}::kind::${kindIndex}`;
+    }
+
+    const lineNumber = Number.isInteger(todo?.lineNumber) ? todo.lineNumber : null;
+    if (Number.isInteger(lineNumber)) {
+        return `${normalizedBundlePath}::line::${lineNumber}`;
+    }
+
+    return null;
 }
 
 function getNormalizedTodoTimelineText(todo = {}) {
@@ -1503,9 +2276,29 @@ function todoCompletedEventMatchesTodo(entry, todo, eventIdentity = null) {
         return false;
     }
 
+    const entryStableId = String(entry?.stableId || '').trim();
+    const todoStableId = String(todo?.stableId || '').trim();
+    if (entryStableId && todoStableId && entryStableId === todoStableId) {
+        return true;
+    }
+
+    const entryKindIndex = Number.isInteger(entry?.kindIndex) ? entry.kindIndex : null;
+    const todoKindIndex = Number.isInteger(todo?.kindIndex) ? todo.kindIndex : Number.isInteger(todo?.sourceKindIndex) ? todo.sourceKindIndex : null;
+    if (entryKindIndex != null && todoKindIndex != null && entryKindIndex === todoKindIndex) {
+        return true;
+    }
+
     const entryLineNumber = Number.isInteger(entry?.lineNumber) ? entry.lineNumber : null;
     const todoLineNumber = Number.isInteger(todo?.lineNumber) ? todo.lineNumber : Number.isInteger(todo?.sourceLine) ? todo.sourceLine : null;
-    if (eventIdentity && entryLineNumber != null && `${entryBundlePath}::${entryLineNumber}` === eventIdentity) {
+    if (eventIdentity && entryLineNumber != null && `${entryBundlePath}::line::${entryLineNumber}` === eventIdentity) {
+        return true;
+    }
+
+    if (eventIdentity && entryKindIndex != null && `${entryBundlePath}::kind::${entryKindIndex}` === eventIdentity) {
+        return true;
+    }
+
+    if (eventIdentity && entryStableId && `${entryBundlePath}::id::${entryStableId}` === eventIdentity) {
         return true;
     }
 
@@ -1578,7 +2371,9 @@ function upsertTodoCompletedTimelineEvent(todo, options = {}) {
         relativeBundlePath: path.relative(path.resolve(workspaceRootPath), nextTodo.bundlePath) || path.basename(nextTodo.bundlePath),
         noteTitle: getDocumentTitleFromBundlePath(nextTodo.bundlePath),
         todoText: stripTodoCompletionTimestamp(String(nextTodo.text || '').trim()),
+        kindIndex: Number.isInteger(nextTodo.kindIndex) ? nextTodo.kindIndex : null,
         lineNumber: Number.isInteger(nextTodo.lineNumber) ? nextTodo.lineNumber : null,
+        stableId: String(nextTodo.stableId || '').trim() || null,
         action: (() => {
             const cleanedTodoText = stripTodoCompletionTimestamp(String(nextTodo.text || '').trim());
             const trimmedTodoText = cleanedTodoText.length > 80 ? `${cleanedTodoText.slice(0, 80)}...` : cleanedTodoText;
@@ -1675,32 +2470,7 @@ function invalidateWorkspaceStructureCaches() {
     workspaceBundlePathsCache = null;
     workspaceBundlePathsCacheRoot = null;
     workspaceBundlePathsCacheDirty = true;
-    workspaceAlbumEntriesCache = null;
-    workspaceAlbumEntriesCacheRoot = null;
-    workspaceAlbumEntriesCacheDirty = true;
-    workspaceMusicPanelDirty = true;
-    workspaceEmbeddedArtworkCache = new Map();
-    workspaceVideoEntriesCache = null;
-    workspaceVideoEntriesCacheRoot = null;
-    workspaceVideoEntriesCacheDirty = true;
-    workspaceVideoPanelDirty = true;
     workspaceTreeRenderVersion += 1;
-}
-
-function isWorkspaceAudioFilePath(filePath) {
-    return WORKSPACE_AUDIO_FILE_REGEX.test(String(filePath || ''));
-}
-
-function isWorkspaceAlbumArtFilePath(filePath) {
-    return WORKSPACE_ALBUM_ART_FILE_REGEX.test(String(filePath || ''));
-}
-
-function isWorkspaceLyricFilePath(filePath) {
-    return WORKSPACE_LYRIC_FILE_REGEX.test(String(filePath || ''));
-}
-
-function isWorkspaceVideoFilePath(filePath) {
-    return WORKSPACE_VIDEO_FILE_REGEX.test(String(filePath || ''));
 }
 
 function formatFileSize(size) {
@@ -1759,195 +2529,11 @@ function getWorkspaceVideoBundleCandidates(rootPath = workspaceRootPath) {
     }));
 }
 
-function rememberWorkspaceMusicBundleSelection(rootPath = workspaceRootPath, bundlePath = selectedWorkspaceMusicBundlePath) {
-    if (!rootPath) {
-        return;
-    }
-
-    const normalizedRootPath = path.resolve(rootPath);
-    const normalizedBundlePath = bundlePath ? path.resolve(bundlePath) : null;
-    if (!normalizedBundlePath) {
-        rememberedWorkspaceMusicBundleSelections.delete(normalizedRootPath);
-        saveWorkspaceMusicSelectionPreferences();
-        return;
-    }
-
-    rememberedWorkspaceMusicBundleSelections.set(normalizedRootPath, normalizedBundlePath);
-    saveWorkspaceMusicSelectionPreferences();
-}
-
-function getRememberedWorkspaceMusicBundleSelection(rootPath = workspaceRootPath) {
-    if (!rootPath) {
-        return null;
-    }
-
-    return rememberedWorkspaceMusicBundleSelections.get(path.resolve(rootPath)) || null;
-}
-
-function resolveWorkspaceMusicBundlePath(preferredPath = selectedWorkspaceMusicBundlePath) {
-    if (!workspaceRootPath) {
-        return null;
-    }
-
-    const normalizedRootPath = path.resolve(workspaceRootPath);
-    const isValidSourcePath = (candidatePath) => {
-        if (!candidatePath) {
-            return false;
-        }
-        const normalizedCandidatePath = path.resolve(candidatePath);
-        return (
-            fs.existsSync(normalizedCandidatePath)
-            && fs.statSync(normalizedCandidatePath).isDirectory()
-            && (normalizedCandidatePath === normalizedRootPath || normalizedCandidatePath.startsWith(`${normalizedRootPath}${path.sep}`))
-        );
-    };
-
-    const normalizedPreferredPath = preferredPath ? path.resolve(preferredPath) : '';
-    if (normalizedPreferredPath && isValidSourcePath(normalizedPreferredPath)) {
-        return normalizedPreferredPath;
-    }
-
-    const rememberedPath = getRememberedWorkspaceMusicBundleSelection(workspaceRootPath);
-    const normalizedRememberedPath = rememberedPath ? path.resolve(rememberedPath) : '';
-    if (normalizedRememberedPath && isValidSourcePath(normalizedRememberedPath)) {
-        return normalizedRememberedPath;
-    }
-
-    if (rememberedPath) {
-        rememberWorkspaceMusicBundleSelection(workspaceRootPath, null);
-    }
-
-    return null;
-}
-
-function getRememberedWorkspaceMusicPlaybackState(rootPath = workspaceRootPath) {
-    if (!rootPath) {
-        return null;
-    }
-    return rememberedWorkspaceMusicPlaybackStates.get(path.resolve(rootPath)) || null;
-}
-
-function rememberWorkspaceMusicPlaybackState(rootPath = workspaceRootPath, playbackState = null) {
-    if (!rootPath) {
-        return;
-    }
-
-    const normalizedRootPath = path.resolve(rootPath);
-    if (!playbackState?.sourcePath || !playbackState?.trackPath) {
-        rememberedWorkspaceMusicPlaybackStates.delete(normalizedRootPath);
-        saveWorkspaceMusicPlaybackPreferences(rememberedWorkspaceMusicPlaybackStates);
-        return;
-    }
-
-    rememberedWorkspaceMusicPlaybackStates.set(normalizedRootPath, {
-        sourcePath: path.resolve(playbackState.sourcePath),
-        albumPath: playbackState.albumPath ? path.resolve(playbackState.albumPath) : '',
-        trackPath: path.resolve(playbackState.trackPath),
-        currentTime: Number(playbackState.currentTime || 0),
-        wasPlaying: Boolean(playbackState.wasPlaying),
-        volume: Number(playbackState.volume ?? 1),
-        muted: Boolean(playbackState.muted),
-        playbackRate: Number(playbackState.playbackRate || 1)
-    });
-    saveWorkspaceMusicPlaybackPreferences(rememberedWorkspaceMusicPlaybackStates);
-}
-
-function schedulePersistWorkspaceMusicPlaybackState(delay = 240) {
-    if (persistWorkspaceMusicPlaybackTimer) {
-        window.clearTimeout(persistWorkspaceMusicPlaybackTimer);
-    }
-    persistWorkspaceMusicPlaybackTimer = window.setTimeout(() => {
-        persistWorkspaceMusicPlaybackTimer = null;
-        if (!workspaceRootPath || !workspaceAudioPlaybackState?.path || !selectedWorkspaceMusicBundlePath) {
-            return;
-        }
-        rememberWorkspaceMusicPlaybackState(workspaceRootPath, {
-            sourcePath: selectedWorkspaceMusicBundlePath,
-            albumPath: activeWorkspaceAlbumPath || workspaceAudioPlaybackState.albumPath || '',
-            trackPath: workspaceAudioPlaybackState.path,
-            currentTime: workspaceAudioPlaybackState.currentTime || 0,
-            wasPlaying: workspaceAudioPlaybackState.wasPlaying,
-            volume: workspaceAudioPlaybackState.volume,
-            muted: workspaceAudioPlaybackState.muted,
-            playbackRate: workspaceAudioPlaybackState.playbackRate
-        });
-    }, delay);
-}
-
-function getWorkspaceMusicSourceMeta(sourcePath = selectedWorkspaceMusicBundlePath) {
-    const resolvedSourcePath = resolveWorkspaceMusicBundlePath(sourcePath);
-    if (!resolvedSourcePath || !workspaceRootPath) {
-        return null;
-    }
-
-    const normalizedRootPath = path.resolve(workspaceRootPath);
-    return {
-        path: resolvedSourcePath,
-        title: path.basename(resolvedSourcePath) || '未命名文件夹',
-        relativePath: path.relative(normalizedRootPath, resolvedSourcePath) || path.basename(resolvedSourcePath)
-    };
-}
-
-function rememberWorkspaceVideoBundleSelection(rootPath = workspaceRootPath, bundlePath = selectedWorkspaceVideoBundlePath) {
-    if (!rootPath) {
-        return;
-    }
-
-    const normalizedRootPath = path.resolve(rootPath);
-    const normalizedBundlePath = bundlePath ? path.resolve(bundlePath) : null;
-    if (!normalizedBundlePath) {
-        rememberedWorkspaceVideoBundleSelections.delete(normalizedRootPath);
-        saveWorkspaceVideoSelectionPreferences();
-        return;
-    }
-
-    rememberedWorkspaceVideoBundleSelections.set(normalizedRootPath, normalizedBundlePath);
-    saveWorkspaceVideoSelectionPreferences();
-}
-
-function getRememberedWorkspaceVideoBundleSelection(rootPath = workspaceRootPath) {
-    if (!rootPath) {
-        return null;
-    }
-
-    return rememberedWorkspaceVideoBundleSelections.get(path.resolve(rootPath)) || null;
-}
-
-function resolveWorkspaceVideoBundlePath(preferredPath = selectedWorkspaceVideoBundlePath) {
-    const candidates = getWorkspaceVideoBundleCandidates(workspaceRootPath);
-    if (!candidates.length) {
-        return null;
-    }
-
-    const normalizedPreferredPath = preferredPath ? path.resolve(preferredPath) : '';
-    const preferredCandidate = normalizedPreferredPath
-        ? candidates.find((entry) => path.resolve(entry.path) === normalizedPreferredPath)
-        : null;
-    if (preferredCandidate) {
-        return preferredCandidate.path;
-    }
-
-    const rememberedPath = getRememberedWorkspaceVideoBundleSelection(workspaceRootPath);
-    const normalizedRememberedPath = rememberedPath ? path.resolve(rememberedPath) : '';
-    const rememberedCandidate = normalizedRememberedPath
-        ? candidates.find((entry) => path.resolve(entry.path) === normalizedRememberedPath)
-        : null;
-    if (rememberedCandidate) {
-        return rememberedCandidate.path;
-    }
-
-    if (rememberedPath) {
-        rememberWorkspaceVideoBundleSelection(workspaceRootPath, null);
-    }
-
-    return null;
-}
-
 function isValidTextBundlePath(folderPath) {
     if (!folderPath) return false;
 
     try {
-        return Boolean(resolveBundleMarkdownFilePath(folderPath));
+        return Boolean(resolveBundleMarkdownFilePath(folderPath) || isPrivateBundlePath(folderPath));
     } catch {
         return false;
     }
@@ -1998,224 +2584,6 @@ function loadWorkspaceRootPreference() {
     }
 }
 
-function loadWorkspaceVideoSelectionPreferences() {
-    try {
-        const raw = window.localStorage.getItem(WORKSPACE_VIDEO_SELECTIONS_KEY);
-        if (!raw) {
-            return new Map();
-        }
-
-        const parsed = JSON.parse(raw);
-        if (!parsed || typeof parsed !== 'object') {
-            return new Map();
-        }
-
-        const selections = new Map();
-        for (const [rootPath, bundlePath] of Object.entries(parsed)) {
-            if (!rootPath || !bundlePath) {
-                continue;
-            }
-
-            const normalizedRootPath = path.resolve(rootPath);
-            const normalizedBundlePath = path.resolve(bundlePath);
-            if (
-                !fs.existsSync(normalizedRootPath)
-                || !fs.statSync(normalizedRootPath).isDirectory()
-                || !fs.existsSync(normalizedBundlePath)
-                || !isValidTextBundlePath(normalizedBundlePath)
-            ) {
-                continue;
-            }
-
-            if (
-                normalizedBundlePath !== normalizedRootPath
-                && !normalizedBundlePath.startsWith(`${normalizedRootPath}${path.sep}`)
-            ) {
-                continue;
-            }
-
-            selections.set(normalizedRootPath, normalizedBundlePath);
-        }
-
-        return selections;
-    } catch {
-        return new Map();
-    }
-}
-
-function loadWorkspaceMusicSelectionPreferences() {
-    try {
-        const raw = window.localStorage.getItem(WORKSPACE_MUSIC_SELECTIONS_KEY);
-        if (!raw) {
-            return new Map();
-        }
-
-        const parsed = JSON.parse(raw);
-        if (!parsed || typeof parsed !== 'object') {
-            return new Map();
-        }
-
-        const selections = new Map();
-        for (const [rootPath, sourcePath] of Object.entries(parsed)) {
-            if (!rootPath || !sourcePath) {
-                continue;
-            }
-
-            const normalizedRootPath = path.resolve(rootPath);
-            const normalizedSourcePath = path.resolve(sourcePath);
-            if (
-                !fs.existsSync(normalizedRootPath)
-                || !fs.statSync(normalizedRootPath).isDirectory()
-                || !fs.existsSync(normalizedSourcePath)
-                || !fs.statSync(normalizedSourcePath).isDirectory()
-            ) {
-                continue;
-            }
-
-            if (
-                normalizedSourcePath !== normalizedRootPath
-                && !normalizedSourcePath.startsWith(`${normalizedRootPath}${path.sep}`)
-            ) {
-                continue;
-            }
-
-            selections.set(normalizedRootPath, normalizedSourcePath);
-        }
-
-        return selections;
-    } catch {
-        return new Map();
-    }
-}
-
-function saveWorkspaceMusicSelectionPreferences() {
-    try {
-        if (!(rememberedWorkspaceMusicBundleSelections instanceof Map) || !rememberedWorkspaceMusicBundleSelections.size) {
-            window.localStorage.removeItem(WORKSPACE_MUSIC_SELECTIONS_KEY);
-            return;
-        }
-
-        const serialized = {};
-        for (const [rootPath, sourcePath] of rememberedWorkspaceMusicBundleSelections.entries()) {
-            if (!rootPath || !sourcePath) {
-                continue;
-            }
-            serialized[path.resolve(rootPath)] = path.resolve(sourcePath);
-        }
-        window.localStorage.setItem(WORKSPACE_MUSIC_SELECTIONS_KEY, JSON.stringify(serialized));
-    } catch {
-        // Ignore preference failures.
-    }
-}
-
-function loadWorkspaceMusicPlaybackPreferences() {
-    try {
-        const raw = window.localStorage.getItem(WORKSPACE_MUSIC_PLAYBACK_SETTINGS_KEY);
-        if (!raw) {
-            return new Map();
-        }
-
-        const parsed = JSON.parse(raw);
-        if (!parsed || typeof parsed !== 'object') {
-            return new Map();
-        }
-
-        const preferences = new Map();
-        for (const [rootPath, payload] of Object.entries(parsed)) {
-            const normalizedRootPath = path.resolve(rootPath);
-            if (!normalizedRootPath || !payload || typeof payload !== 'object') {
-                continue;
-            }
-            if (!fs.existsSync(normalizedRootPath) || !fs.statSync(normalizedRootPath).isDirectory()) {
-                continue;
-            }
-
-            const sourcePath = payload.sourcePath ? path.resolve(String(payload.sourcePath)) : '';
-            const albumPath = payload.albumPath ? path.resolve(String(payload.albumPath)) : '';
-            const trackPath = payload.trackPath ? path.resolve(String(payload.trackPath)) : '';
-            if (
-                !sourcePath
-                || !fs.existsSync(sourcePath)
-                || !fs.statSync(sourcePath).isDirectory()
-                || (sourcePath !== normalizedRootPath && !sourcePath.startsWith(`${normalizedRootPath}${path.sep}`))
-            ) {
-                continue;
-            }
-            if (albumPath && !fs.existsSync(albumPath)) {
-                continue;
-            }
-            if (trackPath && !fs.existsSync(trackPath)) {
-                continue;
-            }
-
-            preferences.set(normalizedRootPath, {
-                sourcePath,
-                albumPath,
-                trackPath,
-                currentTime: Number(payload.currentTime || 0),
-                wasPlaying: Boolean(payload.wasPlaying),
-                volume: Number(payload.volume ?? 1),
-                muted: Boolean(payload.muted),
-                playbackRate: Number(payload.playbackRate || 1)
-            });
-        }
-
-        return preferences;
-    } catch {
-        return new Map();
-    }
-}
-
-function saveWorkspaceMusicPlaybackPreferences(preferences) {
-    try {
-        if (!(preferences instanceof Map) || !preferences.size) {
-            window.localStorage.removeItem(WORKSPACE_MUSIC_PLAYBACK_SETTINGS_KEY);
-            return;
-        }
-
-        const serialized = {};
-        for (const [rootPath, payload] of preferences.entries()) {
-            if (!rootPath || !payload?.sourcePath) {
-                continue;
-            }
-            serialized[path.resolve(rootPath)] = {
-                sourcePath: path.resolve(payload.sourcePath),
-                albumPath: payload.albumPath ? path.resolve(payload.albumPath) : '',
-                trackPath: payload.trackPath ? path.resolve(payload.trackPath) : '',
-                currentTime: Number(payload.currentTime || 0),
-                wasPlaying: Boolean(payload.wasPlaying),
-                volume: Number(payload.volume ?? 1),
-                muted: Boolean(payload.muted),
-                playbackRate: Number(payload.playbackRate || 1)
-            };
-        }
-
-        window.localStorage.setItem(WORKSPACE_MUSIC_PLAYBACK_SETTINGS_KEY, JSON.stringify(serialized));
-    } catch {
-        // Ignore preference failures.
-    }
-}
-
-function saveWorkspaceVideoSelectionPreferences() {
-    try {
-        if (!(rememberedWorkspaceVideoBundleSelections instanceof Map) || !rememberedWorkspaceVideoBundleSelections.size) {
-            window.localStorage.removeItem(WORKSPACE_VIDEO_SELECTIONS_KEY);
-            return;
-        }
-
-        const serialized = {};
-        for (const [rootPath, bundlePath] of rememberedWorkspaceVideoBundleSelections.entries()) {
-            if (!rootPath || !bundlePath) {
-                continue;
-            }
-            serialized[path.resolve(rootPath)] = path.resolve(bundlePath);
-        }
-        window.localStorage.setItem(WORKSPACE_VIDEO_SELECTIONS_KEY, JSON.stringify(serialized));
-    } catch {
-        // Ignore preference failures.
-    }
-}
-
 function saveWorkspaceRootPreference(folderPath) {
     try {
         if (!folderPath) {
@@ -2251,10 +2619,6 @@ function scheduleWorkspaceDataWarmup(rootPath = workspaceRootPath) {
         }
 
         getWorkspaceBundlePaths(normalizedRootPath);
-        const rememberedVideoBundlePath = getRememberedWorkspaceVideoBundleSelection(normalizedRootPath);
-        if (rememberedVideoBundlePath) {
-            getWorkspaceVideoEntries(rememberedVideoBundlePath);
-        }
     }, 0);
 }
 
@@ -2459,6 +2823,73 @@ function refreshCurrentBundleAttachmentSnapshot(folderPath = window.currentPath)
     bundleAttachmentSnapshot = nextSnapshot;
     bundleAttachmentSnapshotRoot = normalizedRoot;
     return renamePairs;
+}
+
+function repairTabAttachmentStateFromFilesystem(tab) {
+    if (!tab?.path) {
+        return false;
+    }
+
+    const normalizedRoot = path.resolve(tab.path);
+    const previousSnapshot = tab.attachmentSnapshotRoot && path.resolve(String(tab.attachmentSnapshotRoot || '')) === normalizedRoot
+        ? tab.attachmentSnapshot
+        : null;
+    const nextSnapshot = captureBundleAttachmentSnapshot(normalizedRoot);
+    const renamePairs = previousSnapshot ? diffBundleAttachmentSnapshots(previousSnapshot, nextSnapshot) : [];
+    if (!renamePairs.length) {
+        tab.attachmentSnapshot = nextSnapshot;
+        tab.attachmentSnapshotRoot = normalizedRoot;
+        return false;
+    }
+
+    let nextContent = typeof tab.content === 'string' ? tab.content : '';
+    let nextDocumentJson = cloneSerializableValue(tab.documentJson);
+    let didChange = false;
+
+    for (const pair of renamePairs) {
+        if (!pair?.oldAbsolutePath || !pair?.newAbsolutePath) {
+            continue;
+        }
+
+        const rewrittenContent = rewriteAttachmentReferencesAfterRenameInMarkdown(
+            nextContent,
+            pair.oldAbsolutePath,
+            pair.newAbsolutePath,
+            normalizedRoot
+        );
+        if (rewrittenContent !== nextContent) {
+            nextContent = rewrittenContent;
+            didChange = true;
+        }
+
+        if (nextDocumentJson) {
+            const rewrittenDocumentJson = rewriteAttachmentReferencesAfterRenameInDocumentJson(
+                nextDocumentJson,
+                pair.oldAbsolutePath,
+                pair.newAbsolutePath,
+                normalizedRoot
+            );
+            if (JSON.stringify(rewrittenDocumentJson || null) !== JSON.stringify(nextDocumentJson || null)) {
+                nextDocumentJson = rewrittenDocumentJson;
+                didChange = true;
+            }
+        }
+    }
+
+    tab.attachmentSnapshot = nextSnapshot;
+    tab.attachmentSnapshotRoot = normalizedRoot;
+
+    if (!didChange) {
+        return false;
+    }
+
+    tab.content = nextContent;
+    tab.documentJson = nextDocumentJson;
+    tab.previousContent = nextContent;
+    if (!tab.isDirty) {
+        resetTabHistory(tab, nextContent);
+    }
+    return true;
 }
 
 function scheduleCurrentBundleAttachmentRefresh() {
@@ -2736,7 +3167,7 @@ function refreshWorkspaceTreeFromFilesystem(options = {}) {
     renderWorkspaceTree(true);
     registerWorkspaceWatchers();
     if (timelinePanelOpen && currentRightSidebarTab === 'todo') {
-        renderTodoList(getTabMarkdownContent());
+        renderTodoList(getActiveEditorSnapshot());
     }
 
     if (refreshCurrentDocument && window.currentPath && window.editor && typeof window.editor.refreshDisplayState === 'function') {
@@ -2823,6 +3254,77 @@ function saveTodoPanelSettings(settings = {}) {
         // Ignore preference failures.
     }
     return normalized;
+}
+
+function normalizeTimelineTodoGroupSettings(settings = {}) {
+    const source = settings && typeof settings === 'object' ? settings : {};
+    const rawHidden = source.hiddenCompletedByGroup && typeof source.hiddenCompletedByGroup === 'object'
+        ? source.hiddenCompletedByGroup
+        : (source.hideCompletedByGroup && typeof source.hideCompletedByGroup === 'object'
+            ? source.hideCompletedByGroup
+            : {});
+    const hiddenCompletedByGroup = {};
+
+    for (const [key, value] of Object.entries(rawHidden)) {
+        const normalizedKey = String(key || '').trim();
+        if (!normalizedKey) {
+            continue;
+        }
+        hiddenCompletedByGroup[normalizedKey] = Boolean(value);
+    }
+
+    return {
+        hiddenCompletedByGroup
+    };
+}
+
+function loadTimelineTodoGroupSettings() {
+    try {
+        const raw = window.localStorage.getItem(TIMELINE_TODO_GROUP_SETTINGS_KEY);
+        return normalizeTimelineTodoGroupSettings(raw ? JSON.parse(raw) : {});
+    } catch {
+        return normalizeTimelineTodoGroupSettings();
+    }
+}
+
+function saveTimelineTodoGroupSettings(settings = {}) {
+    const normalized = normalizeTimelineTodoGroupSettings(settings);
+    try {
+        window.localStorage.setItem(TIMELINE_TODO_GROUP_SETTINGS_KEY, JSON.stringify(normalized));
+    } catch {
+        // ignore persistence failures
+    }
+    return normalized;
+}
+
+function getTimelineTodoGroupKey(bundlePath) {
+    const normalizedPath = String(bundlePath || '').trim();
+    if (!normalizedPath || normalizedPath === 'Someday') {
+        return 'Someday';
+    }
+    return path.resolve(normalizedPath);
+}
+
+function isTimelineTodoGroupHidden(bundlePath) {
+    const settings = loadTimelineTodoGroupSettings();
+    return Boolean(settings.hiddenCompletedByGroup[getTimelineTodoGroupKey(bundlePath)]);
+}
+
+function setTimelineTodoGroupHidden(bundlePath, hidden) {
+    const settings = loadTimelineTodoGroupSettings();
+    settings.hiddenCompletedByGroup[getTimelineTodoGroupKey(bundlePath)] = Boolean(hidden);
+    saveTimelineTodoGroupSettings(settings);
+    scheduleTimelinePanelRender();
+}
+
+function toggleTimelineTodoGroupHidden(bundlePath) {
+    const settings = loadTimelineTodoGroupSettings();
+    const key = getTimelineTodoGroupKey(bundlePath);
+    const nextHidden = !Boolean(settings.hiddenCompletedByGroup[key]);
+    settings.hiddenCompletedByGroup[key] = nextHidden;
+    saveTimelineTodoGroupSettings(settings);
+    scheduleTimelinePanelRender();
+    return nextHidden;
 }
 
 function normalizePinnedEditorTabPaths(paths = []) {
@@ -3100,6 +3602,63 @@ function incrementPomodoroTodayCycleCount() {
         pomodoroState.todayCycleCount = 0;
     }
     pomodoroState.todayCycleCount += 1;
+}
+
+function getPomodoroDisplayedCycleCount() {
+    ensurePomodoroState();
+    const todayCycleCount = getPomodoroTodayCycleCount();
+    const count = todayCycleCount + ((pomodoroState.phase === 'idle' || pomodoroState.phase === 'break') ? 1 : 0);
+    return Math.max(1, count);
+}
+
+function getPomodoroModePreview(mode) {
+    ensurePomodoroState();
+    switch (mode) {
+        case 'short-break':
+            return {
+                label: '休息时间',
+                minutes: pomodoroState.breakMinutes,
+                kind: 'break'
+            };
+        case 'long-break':
+            return {
+                label: '休息时间',
+                minutes: Math.max(pomodoroState.breakMinutes, 15),
+                kind: 'break'
+            };
+        case 'custom':
+            return {
+                label: '专注时间',
+                minutes: pomodoroState.workMinutes,
+                kind: 'focus'
+            };
+        case 'focus':
+        default:
+            return {
+                label: '专注时间',
+                minutes: pomodoroState.workMinutes,
+                kind: 'focus'
+            };
+    }
+}
+
+function startPomodoroSelectedMode() {
+    ensurePomodoroState();
+    const preview = getPomodoroModePreview(pomodoroSelectedMode);
+    if (preview.kind === 'break') {
+        return startPomodoroBreak(preview.minutes);
+    }
+    return startPomodoroWork(pomodoroState.activeTodo || pomodoroState.selectedTodo);
+}
+
+function selectPomodoroMode(mode) {
+    ensurePomodoroState();
+    pomodoroSelectedMode = mode;
+    pomodoroCustomSettingsOpen = false;
+    if (pomodoroState.phase !== 'idle') {
+        stopPomodoroSession();
+    }
+    renderPomodoroPanel();
 }
 
 function selectPomodoroTodo(todo) {
@@ -3490,44 +4049,8 @@ function setWorkspaceRoot(folderPath) {
     expandedWorkspaceEntries = workspaceRootPath ? new Set([workspaceRootPath]) : new Set();
     workspaceSelectedEntryPath = null;
     invalidateWorkspaceStructureCaches();
-    const rememberedMusicPlaybackState = getRememberedWorkspaceMusicPlaybackState(workspaceRootPath);
-    selectedWorkspaceMusicBundlePath = rememberedMusicPlaybackState?.sourcePath || getRememberedWorkspaceMusicBundleSelection(workspaceRootPath);
-    activeWorkspaceAlbumPath = rememberedMusicPlaybackState?.albumPath || null;
-    activeWorkspaceTrackPath = rememberedMusicPlaybackState?.trackPath || null;
-    workspaceAudioPlaybackState = rememberedMusicPlaybackState
-        ? {
-            path: rememberedMusicPlaybackState.trackPath,
-            albumPath: rememberedMusicPlaybackState.albumPath || '',
-            currentTime: Number(rememberedMusicPlaybackState.currentTime || 0),
-            wasPlaying: Boolean(rememberedMusicPlaybackState.wasPlaying),
-            volume: Number(rememberedMusicPlaybackState.volume ?? 1),
-            muted: Boolean(rememberedMusicPlaybackState.muted),
-            playbackRate: Number(rememberedMusicPlaybackState.playbackRate || 1)
-        }
-        : null;
-    workspaceMusicUiRefs = null;
-    workspaceMusicSearchQuery = '';
-    workspaceLyricsCache = new Map();
-    workspaceEmbeddedArtworkCache = new Map();
-    workspaceMusicFullscreen = false;
-    document.body.classList.remove('music-focus-mode');
-    selectedWorkspaceVideoBundlePath = getRememberedWorkspaceVideoBundleSelection(workspaceRootPath);
-    activeWorkspaceVideoPath = null;
-    workspaceVideoPlaybackState = null;
-    workspaceVideoThumbnailCache = new Map();
-    if (workspaceAudioPlaybackState?.path) {
-        hydrateWorkspaceAudioControllerFromSavedState();
-    } else {
-        clearWorkspaceAudioControllerRuntimeState();
-    }
     saveWorkspaceRootPreference(workspaceRootPath);
     renderWorkspaceTree();
-    if (currentSidebarTab === 'music' && currentRightSidebarTab === 'music') {
-        ensureWorkspaceMusicPanel({ force: true });
-    }
-    if (currentSidebarTab === 'player' && currentRightSidebarTab === 'player') {
-        ensureWorkspaceVideoPanel({ force: true });
-    }
     registerWorkspaceWatchers();
     scheduleWorkspaceDataWarmup(workspaceRootPath);
 }
@@ -4448,12 +4971,7 @@ function showWorkspaceContextMenu(event, target) {
     menu.classList.add('show');
     markContextMenuRecentlyOpened();
     hideWorkspaceSortSubmenu();
-    const menuWidth = menu.offsetWidth || 168;
-    const menuHeight = menu.offsetHeight || 88;
-    const left = Math.min(event.clientX, window.innerWidth - menuWidth - 8);
-    const top = Math.min(event.clientY, window.innerHeight - menuHeight - 8);
-    menu.style.left = `${Math.max(left, 8)}px`;
-    menu.style.top = `${Math.max(top, 8)}px`;
+    positionContextMenu(menu, event, { kind: 'workspace', minWidth: 152 });
 }
 
 async function revealWorkspaceTarget(targetPath) {
@@ -4501,22 +5019,24 @@ async function closeWorkspaceEntryTabs(targetPath) {
     return true;
 }
 
-async function deleteWorkspaceEntry(target) {
+async function deleteWorkspaceEntry(target, options = {}) {
     if (!target?.path) return false;
 
     const normalizedPath = path.resolve(target.path);
     const entryName = path.basename(normalizedPath) || normalizedPath;
     const isFolder = !target.isBundle;
-    const decision = await ipcRenderer.invoke('dialog:confirmDeleteWorkspaceEntry', {
-        entryName,
-        isFolder
-    });
+    if (options.prompt !== false) {
+        const decision = await ipcRenderer.invoke('dialog:confirmDeleteWorkspaceEntry', {
+            entryName,
+            isFolder
+        });
 
-    if (decision !== 'delete') {
-        return false;
+        if (decision !== 'delete') {
+            return false;
+        }
     }
 
-    setWorkspaceBusy(isFolder ? '正在删除文件夹…' : '正在删除文档…');
+    setWorkspaceBusy(options.busyMessage || (isFolder ? '正在删除文件夹…' : '正在删除文档…'));
     suspendWorkspaceRefresh();
     await yieldToUiFrame();
 
@@ -4554,6 +5074,10 @@ async function deleteWorkspaceEntry(target) {
         updateWorkspaceSortSettingsAfterPathChange(normalizedPath, null);
         workspaceRefreshPending = false;
         refreshWorkspaceTreeFromFilesystem({ refreshCurrentDocument: false });
+        if (workspaceRootPath) {
+            invalidateWorkspaceTimelineEntriesCache(workspaceRootPath);
+            scheduleTimelinePanelRender();
+        }
         return true;
     } finally {
         resumeWorkspaceRefresh({ immediate: true });
@@ -4901,7 +5425,9 @@ async function createBundleInWorkspace(targetDir = workspaceRootPath) {
         ensureBundleStructure(folderPath);
 
         const initialContent = buildDefaultBundleContent(getDefaultBundleTitleFromPath(folderPath));
-        fs.writeFileSync(path.join(folderPath, DEFAULT_BUNDLE_MARKDOWN_FILE), initialContent, 'utf-8');
+        writeBundlePackageToPath(folderPath, initialContent, null, null, {
+            title: getDefaultBundleTitleFromPath(folderPath)
+        });
         if (workspaceRootPath && isSameOrNestedPath(path.resolve(folderPath), path.resolve(workspaceRootPath))) {
             expandedWorkspaceEntries.add(path.dirname(path.resolve(folderPath)));
             workspaceTreeRenderVersion += 1;
@@ -4955,11 +5481,9 @@ async function createDiaryBundleForDate(dateLike) {
         if (!bundleAlreadyExists) {
             await waitForEditorReady();
             ensureBundleStructure(diaryBundlePath);
-            fs.writeFileSync(
-                path.join(diaryBundlePath, DEFAULT_BUNDLE_MARKDOWN_FILE),
-                buildDefaultBundleContent(diaryTitle),
-                'utf-8'
-            );
+            writeBundlePackageToPath(diaryBundlePath, buildDefaultBundleContent(diaryTitle), null, null, {
+                title: diaryTitle
+            });
         }
 
         appendWorkspaceEntryToManualOrder(diaryFolderPath, diaryBundlePath);
@@ -5305,9 +5829,6 @@ function renderWorkspaceTree(force = false) {
         emptyState.className = 'sidebar-empty';
         emptyState.innerText = '还没有打开工作空间。使用 File -> 打开文件夹 后，这里会显示文件夹目录树。';
         container.appendChild(emptyState);
-        if (currentSidebarTab === 'player' && currentRightSidebarTab === 'player') {
-            ensureWorkspaceVideoPanel();
-        }
         return;
     }
 
@@ -5457,9 +5978,6 @@ function renderWorkspaceTree(force = false) {
         emptyState.className = 'sidebar-empty';
         emptyState.innerText = '这个文件夹目前还没有可打开的 Kangaroo 文档。';
         tree.appendChild(emptyState);
-        if (currentSidebarTab === 'player' && currentRightSidebarTab === 'player') {
-            ensureWorkspaceVideoPanel();
-        }
         return;
     }
 
@@ -5468,9 +5986,6 @@ function renderWorkspaceTree(force = false) {
     }
 
     updateWorkspaceBusyIndicator();
-    if (currentSidebarTab === 'player' && currentRightSidebarTab === 'player') {
-        ensureWorkspaceVideoPanel();
-    }
 }
 
 function rerenderWorkspaceTree() {
@@ -5640,15 +6155,15 @@ function runEditorToolbarCommand(tool, options = {}) {
     }
 
     if (tool === 'undo') {
-        const didRun = undoActiveTabState();
+        void undoActiveTabState();
         refreshEditorToolbarState();
-        return didRun;
+        return true;
     }
 
     if (tool === 'redo') {
-        const didRun = redoActiveTabState();
+        void redoActiveTabState();
         refreshEditorToolbarState();
-        return didRun;
+        return true;
     }
 
     if (tool === 'insert-date' && typeof window.editor.insertText === 'function') {
@@ -5754,11 +6269,6 @@ function updateTimelineToggleButton() {
 
 function getRightSidebarTabMeta(tab) {
     switch (tab) {
-        case 'music':
-            return {
-                title: '音乐',
-                subtitle: '为指定文件夹浏览专辑、播放歌曲并查看歌词'
-            };
         case 'outline':
             return {
                 title: '大纲',
@@ -5773,11 +6283,6 @@ function getRightSidebarTabMeta(tab) {
             return {
                 title: '附件',
                 subtitle: '查看当前文档中的附件、PDF 和图片资源'
-            };
-        case 'player':
-            return {
-                title: '播放器',
-                subtitle: '为指定文档浏览并播放它 attachments 里的视频'
             };
         case 'pomodoro':
             return {
@@ -5797,8 +6302,6 @@ function updateRightSidebarButtons() {
     const outlineButton = document.getElementById('outline-toggle-button');
     const todoButton = document.getElementById('todo-toggle-button');
     const attachmentButton = document.getElementById('attachment-toggle-button');
-    const musicButton = document.getElementById('music-toggle-button');
-    const videoButton = document.getElementById('video-toggle-button');
     const pomodoroButton = document.getElementById('pomodoro-toggle-button');
 
     if (workspaceButton) {
@@ -5829,28 +6332,6 @@ function updateRightSidebarButtons() {
         attachmentButton.setAttribute('aria-label', attachmentButton.title);
     }
 
-    if (musicButton) {
-        const enabled = isFeatureEnabled('music');
-        musicButton.hidden = !enabled;
-        musicButton.disabled = !enabled;
-        musicButton.style.display = enabled ? '' : 'none';
-        const isActive = timelinePanelOpen && currentSidebarTab === 'music' && currentRightSidebarTab === 'music';
-        musicButton.classList.toggle('active', isActive);
-        musicButton.title = isActive ? '返回目录' : '显示音乐播放器';
-        musicButton.setAttribute('aria-label', musicButton.title);
-    }
-
-    if (videoButton) {
-        const enabled = isFeatureEnabled('player');
-        videoButton.hidden = !enabled;
-        videoButton.disabled = !enabled;
-        videoButton.style.display = enabled ? '' : 'none';
-        const isActive = timelinePanelOpen && currentSidebarTab === 'player' && currentRightSidebarTab === 'player';
-        videoButton.classList.toggle('active', isActive);
-        videoButton.title = isActive ? '返回目录' : '显示播放器';
-        videoButton.setAttribute('aria-label', videoButton.title);
-    }
-
     if (pomodoroButton) {
         const enabled = isFeatureEnabled('pomodoro');
         pomodoroButton.hidden = !enabled;
@@ -5871,7 +6352,6 @@ function updateRightSidebarHeader() {
     const title = document.getElementById('right-sidebar-title');
     const subtitle = document.getElementById('timeline-panel-subtitle');
     const todoActions = document.getElementById('todo-header-actions');
-    const musicActions = document.getElementById('music-header-actions');
     const meta = getRightSidebarTabMeta(currentRightSidebarTab);
     const isDetailOpen = timelinePanelOpen && currentSidebarTab !== 'workspace';
 
@@ -5893,8 +6373,6 @@ function updateRightSidebarHeader() {
     }
 
     todoActions?.classList.toggle('active', isDetailOpen && currentRightSidebarTab === 'todo');
-    musicActions?.classList.toggle('active', isDetailOpen && currentRightSidebarTab === 'music' && isFeatureEnabled('music'));
-    applyWorkspaceMusicFullscreenState();
 }
 
 function updateRightSidebarPanels() {
@@ -5903,8 +6381,6 @@ function updateRightSidebarPanels() {
     const outlinePanel = document.getElementById('outline-panel');
     const todoPanel = document.getElementById('todo-panel');
     const attachmentPanel = document.getElementById('attachment-panel');
-    const musicPanel = document.getElementById('music-panel');
-    const videoPanel = document.getElementById('video-panel');
     const pomodoroPanel = document.getElementById('pomodoro-panel');
     const activeDetailTab = timelinePanelOpen ? currentRightSidebarTab : null;
 
@@ -5913,8 +6389,6 @@ function updateRightSidebarPanels() {
     outlinePanel?.classList.toggle('active', activeDetailTab === 'outline');
     todoPanel?.classList.toggle('active', activeDetailTab === 'todo');
     attachmentPanel?.classList.toggle('active', activeDetailTab === 'attachment');
-    musicPanel?.classList.toggle('active', activeDetailTab === 'music');
-    videoPanel?.classList.toggle('active', activeDetailTab === 'player');
     pomodoroPanel?.classList.toggle('active', activeDetailTab === 'pomodoro');
 }
 
@@ -6105,6 +6579,79 @@ function getDiaryBundlePath(dateLike) {
     return path.join(diaryFolderPath, `${getDiaryBundleTitle(dateLike)}${DEFAULT_BUNDLE_EXTENSION}`);
 }
 
+function getSomedayBundlePath() {
+    const diaryFolderPath = getDiaryFolderPath();
+    if (!diaryFolderPath) return '';
+    return path.join(diaryFolderPath, `Someday${DEFAULT_BUNDLE_EXTENSION}`);
+}
+
+async function ensureSomedayBundlePath() {
+    if (!workspaceRootPath) {
+        alert('请先打开工作空间文件夹。');
+        return '';
+    }
+
+    const diaryFolderPath = getDiaryFolderPath();
+    const normalizedWorkspaceRoot = path.resolve(workspaceRootPath);
+    const somedayBundlePath = getSomedayBundlePath();
+
+    try {
+        if (fs.existsSync(diaryFolderPath) && !fs.statSync(diaryFolderPath).isDirectory()) {
+            alert('工作空间中已有一个同名文件 Dairy，无法创建日记文件夹。');
+            return '';
+        }
+
+        let createdDiaryFolder = false;
+        if (!fs.existsSync(diaryFolderPath)) {
+            fs.mkdirSync(diaryFolderPath, { recursive: true });
+            createdDiaryFolder = true;
+        }
+
+        if (createdDiaryFolder && isSameOrNestedPath(diaryFolderPath, normalizedWorkspaceRoot)) {
+            appendWorkspaceEntryToManualOrder(normalizedWorkspaceRoot, diaryFolderPath);
+        }
+
+        if (fs.existsSync(somedayBundlePath) && !isValidTextBundlePath(somedayBundlePath)) {
+            alert('Someday 位置已被同名文件占用，无法创建待办文档。');
+            return '';
+        }
+
+        if (!fs.existsSync(somedayBundlePath)) {
+            await waitForEditorReady();
+            ensureBundleStructure(somedayBundlePath);
+            writeBundlePackageToPath(somedayBundlePath, buildDefaultBundleContent('Someday'), null, null, {
+                title: 'Someday'
+            });
+            appendWorkspaceEntryToManualOrder(diaryFolderPath, somedayBundlePath);
+            invalidateWorkspaceStructureCaches();
+            workspaceTreeRenderVersion += 1;
+            registerWorkspaceWatchers();
+            scheduleWorkspaceTreeRefresh();
+        }
+
+        return somedayBundlePath;
+    } catch (error) {
+        alert(`创建 Someday 文档失败: ${error.message}`);
+        return '';
+    }
+}
+
+function getDiaryBundlePathsForDate(dateLike) {
+    const diaryFolderPath = getDiaryFolderPath();
+    if (!diaryFolderPath || !fs.existsSync(diaryFolderPath)) {
+        return [];
+    }
+
+    const targetDateKey = getDateKey(dateLike || new Date());
+    return getWorkspaceBundlePaths(diaryFolderPath)
+        .map((bundlePath) => path.resolve(bundlePath))
+        .filter((bundlePath) => {
+            const baseName = stripKnownBundleExtension(path.basename(bundlePath));
+            return baseName === `${targetDateKey}日记` || baseName.startsWith(`${targetDateKey}日记 `);
+        })
+        .sort((left, right) => path.basename(left).localeCompare(path.basename(right), 'zh-Hans-CN'));
+}
+
 function getDiaryBundleDateKey(bundlePath) {
     const baseName = stripKnownBundleExtension(path.basename(String(bundlePath || '')));
     const match = baseName.match(/^(\d{4}-\d{2}-\d{2})日记(?:\s+\d+)?$/);
@@ -6145,43 +6692,716 @@ function getDiaryBundlesForCurrentTimelineFilter() {
         }));
 }
 
-function findDiaryBundleForDate(dateLike) {
-    const targetDateKey = getDateKey(dateLike || new Date());
+function getTimelineSeparatorBundlesForCurrentTimelineFilter() {
     const diaryFolderPath = getDiaryFolderPath();
     if (!diaryFolderPath || !fs.existsSync(diaryFolderPath)) {
-        return '';
+        return [];
     }
 
-    const entries = getWorkspaceBundlePaths(diaryFolderPath);
-    const exactMatch = entries.find((bundlePath) => {
-        const baseName = stripKnownBundleExtension(path.basename(bundlePath));
-        return baseName === `${targetDateKey}日记`;
-    });
-    if (exactMatch) {
-        return exactMatch;
-    }
-
-    const prefixMatch = entries.find((bundlePath) => {
-        const baseName = stripKnownBundleExtension(path.basename(bundlePath));
-        return baseName.startsWith(`${targetDateKey}日记`);
-    });
-    return prefixMatch || '';
+    return getWorkspaceBundlePaths(diaryFolderPath)
+        .map((bundlePath) => {
+            const resolvedPath = path.resolve(bundlePath);
+            return {
+                path: resolvedPath,
+                dateKey: getDiaryBundleDateKey(resolvedPath)
+            };
+        })
+        .filter((entry) => !entry.dateKey)
+        .map((entry) => ({
+            ...entry,
+            title: stripKnownBundleExtension(path.basename(entry.path)),
+            relativePath: path.relative(diaryFolderPath, entry.path) || path.basename(entry.path)
+        }));
 }
 
-function buildTimelineCalendarMatrix(monthDate, entries) {
+function getSeparatorTodoGroupsForCurrentTimelineFilter() {
+    return getTimelineSeparatorBundlesForCurrentTimelineFilter().map((separator) => {
+        const todos = sortTodoEntries(
+            getTodoItemsForBundlePath(separator.path)
+                .map((todo, index) => buildTodoEntry({
+                    ...todo,
+                    kindIndex: Number.isInteger(todo.kindIndex) ? todo.kindIndex : index
+                }, separator.path, 0)),
+            'position'
+        );
+
+        return {
+            ...separator,
+            todos
+        };
+    });
+}
+
+function updateTimelineTodoGroupHiddenKey(fromBundlePath, toBundlePath) {
+    const fromKey = getTimelineTodoGroupKey(fromBundlePath);
+    const toKey = getTimelineTodoGroupKey(toBundlePath);
+    if (!fromKey || !toKey || fromKey === toKey) {
+        return false;
+    }
+
+    const settings = loadTimelineTodoGroupSettings();
+    if (Object.prototype.hasOwnProperty.call(settings.hiddenCompletedByGroup, fromKey)) {
+        settings.hiddenCompletedByGroup[toKey] = Boolean(settings.hiddenCompletedByGroup[fromKey]);
+        delete settings.hiddenCompletedByGroup[fromKey];
+        saveTimelineTodoGroupSettings(settings);
+        return true;
+    }
+
+    return false;
+}
+
+function removeTimelineTodoGroupHiddenKey(bundlePath) {
+    const key = getTimelineTodoGroupKey(bundlePath);
+    if (!key) {
+        return false;
+    }
+
+    const settings = loadTimelineTodoGroupSettings();
+    if (!Object.prototype.hasOwnProperty.call(settings.hiddenCompletedByGroup, key)) {
+        return false;
+    }
+
+    delete settings.hiddenCompletedByGroup[key];
+    saveTimelineTodoGroupSettings(settings);
+    return true;
+}
+
+async function createSeparatorBundleInDiaryFolder() {
+    if (!workspaceRootPath) {
+        alert('请先打开工作空间文件夹。');
+        return false;
+    }
+
+    const diaryFolderPath = getDiaryFolderPath();
+    const normalizedWorkspaceRoot = path.resolve(workspaceRootPath);
+
+    try {
+        if (fs.existsSync(diaryFolderPath) && !fs.statSync(diaryFolderPath).isDirectory()) {
+            alert('工作空间中已有一个同名文件 Dairy，无法创建分隔条文件夹。');
+            return false;
+        }
+
+        let createdDiaryFolder = false;
+        if (!fs.existsSync(diaryFolderPath)) {
+            fs.mkdirSync(diaryFolderPath, { recursive: true });
+            createdDiaryFolder = true;
+        }
+
+        if (createdDiaryFolder && isSameOrNestedPath(diaryFolderPath, normalizedWorkspaceRoot)) {
+            appendWorkspaceEntryToManualOrder(normalizedWorkspaceRoot, diaryFolderPath);
+        }
+
+        const separatorName = await openTextInputModal({
+            title: '新增分隔条',
+            message: '请输入分隔条名称。',
+            defaultValue: '新分隔条',
+            confirmText: '创建',
+            allowEmpty: false
+        });
+        if (separatorName == null) {
+            return false;
+        }
+
+        const trimmedName = String(separatorName || '').trim();
+        if (!trimmedName) {
+            alert('分隔条名称不能为空。');
+            return false;
+        }
+
+        const separatorBundlePath = generateUniqueBundlePathInDirectory(diaryFolderPath, trimmedName);
+        await waitForEditorReady();
+        ensureBundleStructure(separatorBundlePath);
+        writeBundlePackageToPath(separatorBundlePath, buildDefaultBundleContent(trimmedName), null, null, {
+            title: trimmedName
+        });
+        appendWorkspaceEntryToManualOrder(diaryFolderPath, separatorBundlePath);
+        invalidateWorkspaceStructureCaches();
+        workspaceTreeRenderVersion += 1;
+        registerWorkspaceWatchers();
+        scheduleWorkspaceTreeRefresh();
+        pendingWorkspaceRevealPath = separatorBundlePath;
+        ensureWorkspacePathExpanded(separatorBundlePath);
+        setWorkspaceSelectedEntryPath(separatorBundlePath);
+        flashWorkspaceEntry(separatorBundlePath, 2000);
+        scheduleTimelinePanelRender();
+        return true;
+    } catch (error) {
+        alert(`创建分隔条失败: ${error.message}`);
+        return false;
+    }
+}
+
+async function renameSeparatorBundle(bundlePath) {
+    if (!bundlePath) {
+        return false;
+    }
+
+    const normalizedPath = path.resolve(bundlePath);
+    const currentTitle = getDefaultBundleTitleFromPath(normalizedPath);
+    const nextTitle = await openTextInputModal({
+        title: '重命名分隔条',
+        message: '请输入新的分隔条名称。',
+        defaultValue: currentTitle,
+        confirmText: '重命名',
+        allowEmpty: false
+    });
+    if (nextTitle == null) {
+        return false;
+    }
+
+    const trimmedName = String(nextTitle || '').trim();
+    if (!trimmedName) {
+        alert('分隔条名称不能为空。');
+        return false;
+    }
+
+    const nextBundlePath = path.join(path.dirname(normalizedPath), `${stripKnownBundleExtension(trimmedName)}${DEFAULT_BUNDLE_EXTENSION}`);
+    const didRename = await renameWorkspaceEntry(normalizedPath, trimmedName, { isBundle: true });
+    if (!didRename) {
+        return false;
+    }
+
+    updateTimelineTodoGroupHiddenKey(normalizedPath, nextBundlePath);
+    scheduleTimelinePanelRender();
+    return true;
+}
+
+async function deleteSeparatorBundle(bundlePath) {
+    if (!bundlePath) {
+        return false;
+    }
+
+    const normalizedPath = path.resolve(bundlePath);
+    const didDelete = await deleteWorkspaceEntry({
+        path: normalizedPath,
+        isBundle: true
+    }, {
+        busyMessage: '正在删除分隔条…'
+    });
+
+    if (!didDelete) {
+        return false;
+    }
+
+    removeTimelineTodoGroupHiddenKey(normalizedPath);
+    scheduleTimelinePanelRender();
+    return true;
+}
+
+function findTodoTaskItemLocationInDocumentJson(documentJson, todo = {}, options = {}) {
+    const shouldClone = options.cloneDocument !== false;
+    const nextDocumentJson = shouldClone ? cloneSerializableValue(documentJson) : documentJson;
+    if (!nextDocumentJson || typeof nextDocumentJson !== 'object') {
+        return null;
+    }
+
+    const stableId = String(todo.stableId || '').trim();
+    const targetKindIndex = Number.isInteger(todo.kindIndex) ? todo.kindIndex : null;
+    let currentKindIndex = 0;
+    let found = null;
+
+    const walk = (node, parentContent = null, indexInParent = -1) => {
+        if (found || !node || typeof node !== 'object') {
+            return;
+        }
+
+        if (node.type === 'taskItem') {
+            const matches = stableId
+                ? String(node.attrs?.id || '').trim() === stableId
+                : (targetKindIndex != null ? currentKindIndex === targetKindIndex : false);
+            if (matches) {
+                found = {
+                    documentJson: nextDocumentJson,
+                    parentContent,
+                    indexInParent,
+                    taskNode: node,
+                    kindIndex: currentKindIndex
+                };
+                return;
+            }
+            currentKindIndex += 1;
+        }
+
+        if (Array.isArray(node.content)) {
+            node.content.forEach((child, index) => {
+                walk(child, node.content, index);
+            });
+        }
+    };
+
+    walk(nextDocumentJson);
+    return found;
+}
+
+function removeTodoTaskItemFromDocumentJson(documentJson, todo = {}) {
+    const location = findTodoTaskItemLocationInDocumentJson(documentJson, todo);
+    if (!location || !location.parentContent || !Number.isInteger(location.indexInParent) || location.indexInParent < 0) {
+        return null;
+    }
+
+    const removedTaskNode = location.parentContent.splice(location.indexInParent, 1)[0] || null;
+    if (!removedTaskNode) {
+        return null;
+    }
+
+    pruneEmptyTaskListNodesFromDocumentJson(location.documentJson);
+
+    return {
+        documentJson: location.documentJson,
+        taskNode: removedTaskNode,
+        kindIndex: location.kindIndex
+    };
+}
+
+function moveTodoTaskItemWithinDocumentJson(documentJson, sourceTodo = {}, targetTodo = {}, placeAfter = false) {
+    const nextDocumentJson = cloneSerializableValue(documentJson);
+    if (!nextDocumentJson || typeof nextDocumentJson !== 'object') {
+        return null;
+    }
+
+    const sourceLocation = findTodoTaskItemLocationInDocumentJson(nextDocumentJson, sourceTodo, {
+        cloneDocument: false
+    });
+    const targetLocation = findTodoTaskItemLocationInDocumentJson(nextDocumentJson, targetTodo, {
+        cloneDocument: false
+    });
+    if (
+        !sourceLocation
+        || !targetLocation
+        || !sourceLocation.parentContent
+        || !targetLocation.parentContent
+        || !Number.isInteger(sourceLocation.indexInParent)
+        || !Number.isInteger(targetLocation.indexInParent)
+        || sourceLocation.indexInParent < 0
+        || targetLocation.indexInParent < 0
+    ) {
+        return null;
+    }
+
+    const sourceStableId = String(sourceTodo.stableId || '').trim();
+    const targetStableId = String(targetTodo.stableId || '').trim();
+    if (sourceStableId && targetStableId && sourceStableId === targetStableId) {
+        return null;
+    }
+
+    const [movedTaskNode] = sourceLocation.parentContent.splice(sourceLocation.indexInParent, 1);
+    if (!movedTaskNode) {
+        return null;
+    }
+
+    let insertIndex = placeAfter ? targetLocation.indexInParent + 1 : targetLocation.indexInParent;
+    if (sourceLocation.parentContent === targetLocation.parentContent && sourceLocation.indexInParent < insertIndex) {
+        insertIndex -= 1;
+    }
+
+    insertIndex = clampNumber(insertIndex, 0, targetLocation.parentContent.length);
+    targetLocation.parentContent.splice(insertIndex, 0, movedTaskNode);
+    pruneEmptyTaskListNodesFromDocumentJson(nextDocumentJson);
+
+    return nextDocumentJson;
+}
+
+function pruneEmptyTaskListNodesFromDocumentJson(node) {
+    if (!node || typeof node !== 'object') {
+        return node;
+    }
+
+    if (Array.isArray(node.content)) {
+        const nextContent = [];
+        for (const child of node.content) {
+            const prunedChild = pruneEmptyTaskListNodesFromDocumentJson(child);
+            if (!prunedChild) {
+                continue;
+            }
+
+            if (prunedChild.type === 'taskList' && Array.isArray(prunedChild.content) && prunedChild.content.length === 0) {
+                continue;
+            }
+
+            nextContent.push(prunedChild);
+        }
+        node.content = nextContent;
+    }
+
+    if (node.type === 'taskList' && Array.isArray(node.content) && node.content.length === 0) {
+        return null;
+    }
+
+    return node;
+}
+
+function appendTodoTaskNodeToDocumentJson(documentJson, taskNode) {
+    const nextDocumentJson = cloneSerializableValue(documentJson);
+    if (!nextDocumentJson || typeof nextDocumentJson !== 'object' || !taskNode) {
+        return null;
+    }
+
+    const rootContent = Array.isArray(nextDocumentJson.content)
+        ? nextDocumentJson.content
+        : (nextDocumentJson.content = []);
+    const clonedTaskNode = cloneSerializableValue(taskNode);
+    const lastNode = rootContent[rootContent.length - 1];
+
+    if (lastNode?.type === 'taskList') {
+        if (!Array.isArray(lastNode.content)) {
+            lastNode.content = [];
+        }
+        lastNode.content.push(clonedTaskNode);
+    } else {
+        rootContent.push({
+            type: 'taskList',
+            attrs: {},
+            content: [clonedTaskNode]
+        });
+    }
+
+    return nextDocumentJson;
+}
+
+function setTodoTextInDocumentJson(documentJson, todo = {}, nextText = '') {
+    const location = findTodoTaskItemLocationInDocumentJson(documentJson, todo);
+    if (!location || !location.taskNode) {
+        return null;
+    }
+
+    const normalizedText = String(nextText ?? '');
+    location.taskNode.content = [{
+        type: 'paragraph',
+        content: normalizedText ? [{
+            type: 'text',
+            text: normalizedText
+        }] : []
+    }];
+
+    return location.documentJson;
+}
+
+async function persistTodoDocumentJsonUpdate(bundlePath, nextDocumentJson, options = {}) {
+    if (!bundlePath || !nextDocumentJson) {
+        return false;
+    }
+
+    const normalizedTarget = path.resolve(bundlePath);
+    const serializedMarkdown = serializeDocumentJsonToMarkdown(nextDocumentJson);
+    const nextMarkdown = serializedMarkdown || (
+        Array.isArray(nextDocumentJson.content) && nextDocumentJson.content.length
+            ? String(getMarkdownContentForBundlePath(normalizedTarget) || '')
+            : ''
+    );
+    const currentBundlePath = window.currentPath ? path.resolve(window.currentPath) : null;
+    const targetTitle = options.title || getDefaultBundleTitleFromPath(normalizedTarget);
+
+    if (currentBundlePath === normalizedTarget && window.editor) {
+        const applied = typeof window.editor.setDocumentJson === 'function'
+            ? window.editor.setDocumentJson(nextDocumentJson, {
+                emitChange: false,
+                preserveSelection: options.preserveSelection !== false,
+                forceRebuild: true
+            })
+            : false;
+        if (!applied) {
+            return false;
+        }
+
+        const savedPackage = writeBundlePackageToPath(normalizedTarget, nextMarkdown, nextDocumentJson, normalizedTarget, {
+            title: targetTitle
+        });
+
+        const openTab = getOpenTabByBundlePath(normalizedTarget);
+        if (openTab) {
+            openTab.content = nextMarkdown;
+            openTab.documentJson = cloneSerializableValue(savedPackage.documentJson || nextDocumentJson);
+            openTab.previousContent = nextMarkdown;
+            openTab.previousIsDirty = false;
+            openTab.isDirty = false;
+        }
+
+        setDirty(false);
+        updateBundleStatus(normalizedTarget);
+
+        if (timelinePanelOpen && currentRightSidebarTab === 'timeline') {
+            scheduleTimelinePanelRender();
+        }
+        if (currentRightSidebarTab === 'todo') {
+            renderTodoList(getActiveEditorSnapshot());
+        }
+
+        return true;
+    }
+
+    return persistTodoBundleUpdate(normalizedTarget, nextMarkdown, nextDocumentJson, {
+        title: targetTitle,
+        refreshWorkspaceTree: options.refreshWorkspaceTree
+    });
+}
+
+async function updateTimelineTodoItemText(todo, nextText) {
+    if (!todo?.bundlePath) {
+        return false;
+    }
+
+    const normalizedTarget = path.resolve(todo.bundlePath);
+    const currentDocumentJson = getDocumentJsonForBundlePath(normalizedTarget);
+    if (!currentDocumentJson) {
+        return false;
+    }
+
+    const nextDocumentJson = setTodoTextInDocumentJson(currentDocumentJson, todo, nextText);
+    if (!nextDocumentJson) {
+        return false;
+    }
+
+    return persistTodoDocumentJsonUpdate(normalizedTarget, nextDocumentJson, {
+        title: getDefaultBundleTitleFromPath(normalizedTarget)
+    });
+}
+
+async function deleteTimelineTodoItem(todo) {
+    if (!todo?.bundlePath) {
+        return false;
+    }
+
+    const normalizedTarget = path.resolve(todo.bundlePath);
+    const currentDocumentJson = getDocumentJsonForBundlePath(normalizedTarget);
+    if (!currentDocumentJson) {
+        return false;
+    }
+
+    const removal = removeTodoTaskItemFromDocumentJson(currentDocumentJson, todo);
+    if (!removal?.taskNode || !removal.documentJson) {
+        return false;
+    }
+
+    if (timelineTodoEditState?.todo?.stableId && String(timelineTodoEditState.todo.stableId || '').trim() === String(todo.stableId || '').trim()) {
+        cancelTimelineTodoInlineEdit();
+    }
+
+    const didDelete = await persistTodoDocumentJsonUpdate(normalizedTarget, removal.documentJson, {
+        title: getDefaultBundleTitleFromPath(normalizedTarget)
+    });
+
+    if (didDelete && currentRightSidebarTab === 'todo') {
+        renderTodoList(getActiveEditorSnapshot());
+    }
+
+    return didDelete;
+}
+
+async function moveTimelineTodoItemToBundle(todo, targetBundlePath) {
+    if (!todo?.bundlePath || !targetBundlePath) {
+        return false;
+    }
+
+    const sourceBundlePath = path.resolve(todo.bundlePath);
+    const normalizedTarget = path.resolve(targetBundlePath);
+    if (sourceBundlePath === normalizedTarget) {
+        return false;
+    }
+
+    const sourceDocumentJson = getDocumentJsonForBundlePath(sourceBundlePath);
+    if (!sourceDocumentJson) {
+        return false;
+    }
+
+    const removal = removeTodoTaskItemFromDocumentJson(sourceDocumentJson, todo);
+    if (!removal?.taskNode) {
+        return false;
+    }
+
+    let targetDocumentJson = getDocumentJsonForBundlePath(normalizedTarget);
+    if (!targetDocumentJson && normalizedTarget === getSomedayBundlePath()) {
+        const ensuredSomedayPath = await ensureSomedayBundlePath();
+        if (ensuredSomedayPath && path.resolve(ensuredSomedayPath) === normalizedTarget) {
+            targetDocumentJson = getDocumentJsonForBundlePath(normalizedTarget);
+        }
+    }
+    if (!targetDocumentJson) {
+        return false;
+    }
+
+    const nextTargetDocumentJson = appendTodoTaskNodeToDocumentJson(targetDocumentJson, removal.taskNode);
+    if (!nextTargetDocumentJson) {
+        return false;
+    }
+
+    const didRemove = await persistTodoDocumentJsonUpdate(sourceBundlePath, removal.documentJson, {
+        title: getDefaultBundleTitleFromPath(sourceBundlePath)
+    });
+    if (!didRemove) {
+        return false;
+    }
+
+    const didAppend = await persistTodoDocumentJsonUpdate(normalizedTarget, nextTargetDocumentJson, {
+        title: getDefaultBundleTitleFromPath(normalizedTarget)
+    });
+
+    if (didAppend && timelinePanelOpen && currentRightSidebarTab === 'timeline') {
+        scheduleTimelinePanelRender();
+    }
+
+    return didAppend;
+}
+
+async function reorderTimelineTodoItemWithinBundle(todo, targetTodo, placeAfter = false) {
+    if (!todo?.bundlePath || !targetTodo?.bundlePath) {
+        return false;
+    }
+
+    const sourceBundlePath = path.resolve(todo.bundlePath);
+    const targetBundlePath = path.resolve(targetTodo.bundlePath);
+    if (sourceBundlePath !== targetBundlePath) {
+        return false;
+    }
+
+    const currentDocumentJson = getDocumentJsonForBundlePath(sourceBundlePath);
+    if (!currentDocumentJson) {
+        return false;
+    }
+
+    const nextDocumentJson = moveTodoTaskItemWithinDocumentJson(currentDocumentJson, todo, targetTodo, placeAfter);
+    if (!nextDocumentJson) {
+        return false;
+    }
+
+    const didPersist = await persistTodoDocumentJsonUpdate(sourceBundlePath, nextDocumentJson, {
+        title: getDefaultBundleTitleFromPath(sourceBundlePath)
+    });
+    if (didPersist && timelinePanelOpen && currentRightSidebarTab === 'timeline') {
+        scheduleTimelinePanelRender();
+    }
+    return didPersist;
+}
+
+async function commitTimelineTodoDragReorder() {
+    const state = timelineTodoDropState;
+    if (!state || state.committed) {
+        return false;
+    }
+
+    state.committed = true;
+    const didReorder = await reorderTimelineTodoItemWithinBundle(
+        state.sourceTodo,
+        state.targetTodo,
+        state.placeAfter
+    );
+    if (!didReorder) {
+        state.committed = false;
+    }
+    return didReorder;
+}
+
+function getDiaryTodoGroupsForCurrentTimelineFilter(diaryEntries = getDiaryBundlesForCurrentTimelineFilter()) {
+    return diaryEntries.map((diary) => {
+        const todos = sortTodoEntries(
+            getTodoItemsForBundlePath(diary.path)
+                .map((todo, index) => buildTodoEntry({
+                    ...todo,
+                    kindIndex: Number.isInteger(todo.kindIndex) ? todo.kindIndex : index
+                }, diary.path, 0)),
+            'position'
+        );
+
+        return {
+            ...diary,
+            todos
+        };
+    });
+}
+
+async function addTodoToDiaryBundle(diaryBundlePath, todoText = '') {
+    if (!diaryBundlePath) {
+        return false;
+    }
+
+    return appendTodoToBundlePath(diaryBundlePath, todoText);
+}
+
+async function addTodoToSomedayBundle(todoText = '') {
+    const somedayBundlePath = await ensureSomedayBundlePath();
+    if (!somedayBundlePath) {
+        return false;
+    }
+
+    return appendTodoToBundlePath(somedayBundlePath, todoText);
+}
+
+function getDiaryDateKeysForMonth(monthDate) {
+    const diaryFolderPath = getDiaryFolderPath();
+    if (!diaryFolderPath || !fs.existsSync(diaryFolderPath)) {
+        return new Set();
+    }
+
+    const monthKey = getMonthKey(monthDate || new Date());
+    const keys = new Set();
+    for (const bundlePath of getWorkspaceBundlePaths(diaryFolderPath)) {
+        const dateKey = getDiaryBundleDateKey(bundlePath);
+        if (dateKey && dateKey.startsWith(monthKey)) {
+            keys.add(dateKey);
+        }
+    }
+    return keys;
+}
+
+function findDiaryBundleForDate(dateLike) {
+    const diaryPaths = getDiaryBundlePathsForDate(dateLike);
+    return diaryPaths[0] || '';
+}
+
+async function deleteDiaryBundlePath(diaryBundlePath) {
+    if (!diaryBundlePath) return false;
+
+    return deleteWorkspaceEntry({
+        path: diaryBundlePath,
+        isBundle: true
+    }, {
+        busyMessage: '正在删除日记…'
+    });
+}
+
+async function deleteDiaryBundlesForDate(dateLike) {
+    const diaryPaths = getDiaryBundlePathsForDate(dateLike);
+    if (!diaryPaths.length) {
+        alert('这一天还没有日记。');
+        return false;
+    }
+
+    const dateKey = getDateKey(dateLike || new Date());
+    const targetLabel = diaryPaths.length === 1
+        ? path.basename(diaryPaths[0])
+        : `${dateKey} 的 ${diaryPaths.length} 篇日记`;
+    if (!confirm(`要删除${targetLabel}吗？删除后会进入系统废纸篓。`)) {
+        return false;
+    }
+
+    for (const diaryPath of diaryPaths) {
+        const deleted = await deleteWorkspaceEntry({
+            path: diaryPath,
+            isBundle: true
+        }, {
+            prompt: false,
+            busyMessage: '正在删除日记…'
+        });
+        if (!deleted) {
+            return false;
+        }
+    }
+
+    if (workspaceRootPath) {
+        invalidateWorkspaceTimelineEntriesCache(workspaceRootPath);
+        scheduleTimelinePanelRender();
+    }
+    return true;
+}
+
+function buildTimelineCalendarMatrix(monthDate, diaryDateKeys = new Set()) {
     const monthStart = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1);
     const monthEnd = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0);
     const gridStart = getStartOfWeek(monthStart);
     const gridEnd = getStartOfWeek(monthEnd);
     gridEnd.setDate(gridEnd.getDate() + 6);
 
-    const countsByDay = new Map();
-    for (const entry of entries) {
-        const key = getDateKey(entry.timestamp);
-        countsByDay.set(key, (countsByDay.get(key) || 0) + 1);
-    }
-
     const weeks = [];
+    const todayKey = getDateKey(new Date());
     let cursor = new Date(gridStart);
     while (cursor <= gridEnd) {
         const weekStart = new Date(cursor);
@@ -6193,7 +7413,8 @@ function buildTimelineCalendarMatrix(monthDate, entries) {
                 date: current,
                 dateKey,
                 isCurrentMonth: current.getMonth() === monthStart.getMonth(),
-                count: countsByDay.get(dateKey) || 0
+                hasDiary: diaryDateKeys.has(dateKey),
+                isToday: dateKey === todayKey
             });
             cursor.setDate(cursor.getDate() + 1);
         }
@@ -6363,7 +7584,8 @@ function renderTimelinePanel(options = {}) {
     updateTimelinePanelSubtitle(getTimelineFilterSummary());
 
     container.innerHTML = '';
-    const calendarWeeks = buildTimelineCalendarMatrix(timelineCalendarMonthCursor, entries);
+    const diaryDateKeys = getDiaryDateKeysForMonth(timelineCalendarMonthCursor);
+    const calendarWeeks = buildTimelineCalendarMatrix(timelineCalendarMonthCursor, diaryDateKeys);
 
     const calendar = document.createElement('div');
     calendar.className = 'timeline-calendar';
@@ -6400,11 +7622,22 @@ function renderTimelinePanel(options = {}) {
     nav.appendChild(prevMonthButton);
     nav.appendChild(monthButton);
     nav.appendChild(nextMonthButton);
+    const calendarActions = document.createElement('div');
+    calendarActions.className = 'timeline-calendar-actions';
+    const todayButton = document.createElement('button');
+    todayButton.type = 'button';
+    todayButton.className = 'timeline-today-button';
+    todayButton.textContent = '今天';
+    todayButton.addEventListener('click', () => {
+        setTimelineFilter('month', new Date());
+    });
     const calendarSummary = document.createElement('div');
     calendarSummary.className = 'timeline-calendar-summary';
     calendarSummary.textContent = `${calendarWeeks.length} 周`;
+    calendarActions.appendChild(todayButton);
+    calendarActions.appendChild(calendarSummary);
     calendarHeader.appendChild(nav);
-    calendarHeader.appendChild(calendarSummary);
+    calendarHeader.appendChild(calendarActions);
     calendar.appendChild(calendarHeader);
 
     const calendarGrid = document.createElement('div');
@@ -6419,7 +7652,6 @@ function renderTimelinePanel(options = {}) {
         calendarGrid.appendChild(weekday);
     }
 
-    const maxCount = Math.max(1, ...calendarWeeks.flatMap((week) => week.days.map((day) => day.count)));
     for (const week of calendarWeeks) {
         const weekButton = document.createElement('button');
         weekButton.type = 'button';
@@ -6438,15 +7670,13 @@ function renderTimelinePanel(options = {}) {
             if (!day.isCurrentMonth) {
                 dayButton.classList.add('muted');
             }
-            if (day.count > 0) {
-                dayButton.classList.add('has-events');
-                const intensity = Math.min(58, 10 + Math.round((day.count / maxCount) * 44));
-                dayButton.style.setProperty('--timeline-intensity', `${intensity}%`);
+            if (day.isToday) {
+                dayButton.classList.add('today');
             }
             if (timelineFilterMode === 'day' && timelineFilterAnchor === day.dateKey) {
                 dayButton.classList.add('active');
             }
-            dayButton.title = `${day.dateKey}${day.count ? ` · ${day.count} 条记录` : ''}`;
+            dayButton.title = `${day.dateKey}${day.hasDiary ? ' · 有日记' : ''}`;
             dayButton.addEventListener('click', () => {
                 setTimelineFilter('day', day.date);
             });
@@ -6460,6 +7690,12 @@ function renderTimelinePanel(options = {}) {
             number.className = 'timeline-day-number';
             number.textContent = String(day.date.getDate());
             dayButton.appendChild(number);
+            if (day.hasDiary) {
+                const marker = document.createElement('span');
+                marker.className = 'timeline-day-marker';
+                marker.setAttribute('aria-hidden', 'true');
+                dayButton.appendChild(marker);
+            }
             calendarGrid.appendChild(dayButton);
         }
     }
@@ -6484,6 +7720,19 @@ function renderTimelinePanel(options = {}) {
     diaryMeta.appendChild(diaryTitle);
     diaryMeta.appendChild(diarySubtitle);
     diaryHead.appendChild(diaryMeta);
+
+    const diaryActionButton = document.createElement('button');
+    diaryActionButton.type = 'button';
+    diaryActionButton.className = 'todo-header-button timeline-diary-card-action';
+    diaryActionButton.title = '新建当天日记';
+    diaryActionButton.setAttribute('aria-label', diaryActionButton.title);
+    diaryActionButton.innerHTML = '<i class="fa-solid fa-plus" aria-hidden="true"></i>';
+    diaryActionButton.addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        await createDiaryBundleForDate(new Date());
+    });
+    diaryHead.appendChild(diaryActionButton);
     diaryCard.appendChild(diaryHead);
 
     const diaryBody = document.createElement('div');
@@ -6491,16 +7740,23 @@ function renderTimelinePanel(options = {}) {
     if (!diaryEntries.length) {
         const emptyState = document.createElement('div');
         emptyState.className = 'sidebar-empty';
-        emptyState.innerText = '这个时间范围内还没有日记。右键日历日期可以新建当天日记。';
+        emptyState.innerText = '这个时间范围内还没有日记。点击右上角按钮可以新建当天日记，也可以右键日历日期创建。';
         diaryBody.appendChild(emptyState);
     } else {
         for (const diary of diaryEntries) {
-            const item = document.createElement('button');
-            item.type = 'button';
+            const item = document.createElement('div');
             item.className = 'timeline-diary-item';
-            item.title = diary.path;
-            item.addEventListener('click', () => {
+            const itemMain = document.createElement('button');
+            itemMain.type = 'button';
+            itemMain.className = 'timeline-diary-item-main';
+            itemMain.title = diary.path;
+            itemMain.addEventListener('click', () => {
                 void openWorkspaceBundle(diary.path);
+            });
+            itemMain.addEventListener('contextmenu', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                showTimelineDiaryContextMenu(event, diary);
             });
 
             const itemTitle = document.createElement('div');
@@ -6509,8 +7765,10 @@ function renderTimelinePanel(options = {}) {
             const itemMeta = document.createElement('div');
             itemMeta.className = 'timeline-diary-item-meta';
             itemMeta.textContent = '日记';
-            item.appendChild(itemTitle);
-            item.appendChild(itemMeta);
+            itemMain.appendChild(itemTitle);
+            itemMain.appendChild(itemMeta);
+
+            item.appendChild(itemMain);
             diaryBody.appendChild(item);
         }
     }
@@ -6625,6 +7883,13 @@ function renderTimelinePanel(options = {}) {
 
     timelineCard.appendChild(list);
     container.appendChild(timelineCard);
+
+    window.requestAnimationFrame(() => {
+        if (tryActivatePendingTimelineTodoInlineEdit()) {
+            return;
+        }
+        restoreTimelineTodoInlineEdit();
+    });
 }
 
 function scheduleTimelinePanelRender() {
@@ -6653,7 +7918,6 @@ function applyTimelinePanelVisibility(visible, options = {}) {
     if (timelinePanelOpen && currentRightSidebarTab === 'timeline') {
         renderTimelinePanel({ force: true });
     }
-    applyWorkspaceMusicFullscreenState();
     return timelinePanelOpen;
 }
 
@@ -6664,34 +7928,21 @@ function toggleTimelinePanelVisibility() {
     if (timelinePanelOpen && currentSidebarTab === 'timeline' && currentRightSidebarTab === 'timeline') {
         return setSidebarTab('workspace');
     }
-    if (currentSidebarTab === 'player' && currentRightSidebarTab === 'player') {
-        rememberWorkspaceVideoPlaybackState({ preservePlayingIntent: true });
-        workspaceVideoIgnorePauseUntil = Date.now() + 1000;
-        parkWorkspaceVideoElement();
-    }
     currentSidebarTab = 'timeline';
     currentRightSidebarTab = 'timeline';
     return applyTimelinePanelVisibility(true);
 }
 
 function toggleRightSidebarTab(tab) {
-    const normalizedTab = ['timeline', 'outline', 'todo', 'attachment', 'music', 'player', 'pomodoro'].includes(tab) ? tab : 'timeline';
+    const normalizedTab = ['timeline', 'outline', 'todo', 'attachment', 'pomodoro'].includes(tab) ? tab : 'timeline';
     if (
         (normalizedTab === 'timeline' && !isFeatureEnabled('timeline'))
-        || (normalizedTab === 'music' && !isFeatureEnabled('music'))
-        || (normalizedTab === 'player' && !isFeatureEnabled('player'))
         || (normalizedTab === 'pomodoro' && !isFeatureEnabled('pomodoro'))
     ) {
         return setSidebarTab('workspace');
     }
     if (timelinePanelOpen && currentSidebarTab === normalizedTab && currentRightSidebarTab === normalizedTab) {
         return setSidebarTab('workspace');
-    }
-
-    if (currentSidebarTab === 'player' && currentRightSidebarTab === 'player' && normalizedTab !== 'player') {
-        rememberWorkspaceVideoPlaybackState({ preservePlayingIntent: true });
-        workspaceVideoIgnorePauseUntil = Date.now() + 1000;
-        parkWorkspaceVideoElement();
     }
 
     currentSidebarTab = normalizedTab;
@@ -6704,11 +7955,7 @@ function toggleRightSidebarTab(tab) {
     if (normalizedTab === 'outline') {
         updateOutline();
     } else if (normalizedTab === 'todo') {
-        renderTodoList(getTabMarkdownContent());
-    } else if (normalizedTab === 'music') {
-        ensureWorkspaceMusicPanel();
-    } else if (normalizedTab === 'player') {
-        ensureWorkspaceVideoPanel();
+        renderTodoList(getActiveEditorSnapshot());
     } else if (normalizedTab === 'pomodoro') {
         renderPomodoroPanel();
     }
@@ -6770,8 +8017,6 @@ function saveThemePreference(themeId) {
 function normalizeFeatureVisibilitySettings(settings = {}) {
     return {
         timeline: settings.timeline !== false,
-        music: settings.music !== false,
-        player: settings.player !== false,
         pomodoro: settings.pomodoro !== false
     };
 }
@@ -6796,8 +8041,6 @@ function isFeatureEnabled(featureKey) {
 function updateFeatureControlledUi() {
     const controlledButtons = [
         { id: 'timeline-toggle-button', enabled: isFeatureEnabled('timeline') },
-        { id: 'music-toggle-button', enabled: isFeatureEnabled('music') },
-        { id: 'video-toggle-button', enabled: isFeatureEnabled('player') },
         { id: 'pomodoro-toggle-button', enabled: isFeatureEnabled('pomodoro') }
     ];
 
@@ -6816,8 +8059,6 @@ function applyFeatureVisibility(settings = {}) {
 
     const activeFeatureDisabled = (
         (currentSidebarTab === 'timeline' && !normalized.timeline)
-        || (currentSidebarTab === 'music' && !normalized.music)
-        || (currentSidebarTab === 'player' && !normalized.player)
         || (currentSidebarTab === 'pomodoro' && !normalized.pomodoro)
     );
 
@@ -6830,15 +8071,11 @@ function applyFeatureVisibility(settings = {}) {
         currentSidebarTab = 'workspace';
         timelinePanelOpen = false;
     }
-    if (!normalized.music) {
-        workspaceMusicFullscreen = false;
-    }
 
     updateFeatureControlledUi();
     updateRightSidebarHeader();
     updateRightSidebarPanels();
     updateRightSidebarButtons();
-    applyWorkspaceMusicFullscreenState();
     return normalized;
 }
 
@@ -7040,6 +8277,11 @@ function loadTypographySettings() {
 
 function applyTypographySettings(settings) {
     const normalized = normalizeTypographySettings(settings);
+    ensureTypographyFontStylesheets([
+        ...DEFAULT_TYPOGRAPHY_FONT_IDS,
+        normalized.uiFont,
+        normalized.editorFont
+    ]);
     const root = document.documentElement;
     root.style.setProperty('--ui-font-family', FONT_FAMILY_MAP[normalized.uiFont]);
     root.style.setProperty('--editor-font-family', FONT_FAMILY_MAP[normalized.editorFont]);
@@ -7114,7 +8356,7 @@ function updateSidebarToggleButton() {
     button.classList.toggle('active', !isVisible);
     button.title = isVisible ? '隐藏侧边栏' : '显示侧边栏';
     button.setAttribute('aria-label', button.title);
-    if (icon) icon.className = 'fa-solid fa-table-columns';
+    if (icon) icon.className = isVisible ? 'fa-solid fa-angles-left' : 'fa-solid fa-angles-right';
 }
 
 function applySidebarVisibility(visible) {
@@ -7189,6 +8431,9 @@ function applyLayoutSettings(settings) {
 }
 
 function normalizeViewMode(mode) {
+    if (RICH_TEXT_EDITOR_ONLY) {
+        return 'editor';
+    }
     return ['split', 'editor', 'preview'].includes(mode) ? mode : DEFAULT_VIEW_MODE;
 }
 
@@ -7220,6 +8465,46 @@ function saveLayoutSettings(settings) {
     const normalized = normalizeLayoutSettings(settings);
     window.localStorage.setItem(LAYOUT_SETTINGS_KEY, JSON.stringify(normalized));
     applyLayoutSettings(normalized);
+}
+
+function normalizeInlineMediaPositionSettings(settings = {}) {
+    const source = settings && typeof settings === 'object' ? settings : {};
+    const position = ['left', 'center', 'right', 'offset'].includes(source.position)
+        ? source.position
+        : DEFAULT_INLINE_MEDIA_POSITION_SETTINGS.position;
+    let leftOffset = Number(source.leftOffset);
+    if (!Number.isFinite(leftOffset)) {
+        leftOffset = DEFAULT_INLINE_MEDIA_POSITION_SETTINGS.leftOffset;
+    }
+    leftOffset = clamp(leftOffset, 0, 40);
+    return {
+        position,
+        leftOffset: Math.round(leftOffset * 10) / 10
+    };
+}
+
+function loadInlineMediaPositionSettings() {
+    try {
+        const raw = window.localStorage.getItem(INLINE_MEDIA_POSITION_SETTINGS_KEY);
+        if (!raw) return { ...DEFAULT_INLINE_MEDIA_POSITION_SETTINGS };
+        return normalizeInlineMediaPositionSettings(JSON.parse(raw));
+    } catch {
+        return { ...DEFAULT_INLINE_MEDIA_POSITION_SETTINGS };
+    }
+}
+
+function applyInlineMediaPositionSettings(settings = {}) {
+    const normalized = normalizeInlineMediaPositionSettings(settings);
+    const root = document.documentElement;
+    const body = document.body;
+    root.style.setProperty('--inline-media-left-offset', `${normalized.leftOffset}ch`);
+    body?.setAttribute('data-inline-media-position', normalized.position);
+    return normalized;
+}
+
+function saveInlineMediaPositionSettings(settings = {}) {
+    const normalized = applyInlineMediaPositionSettings(settings);
+    window.localStorage.setItem(INLINE_MEDIA_POSITION_SETTINGS_KEY, JSON.stringify(normalized));
 }
 
 function setupSidebarResizeHandle() {
@@ -7285,6 +8570,7 @@ function openSettingsModal() {
     const theme = loadThemePreference();
     const typography = loadTypographySettings();
     const layout = loadLayoutSettings();
+    const inlineMediaPosition = loadInlineMediaPositionSettings();
     const featureVisibility = loadFeatureVisibilitySettings();
 
     document.getElementById('settings-theme').value = theme;
@@ -7296,9 +8582,10 @@ function openSettingsModal() {
     document.getElementById('settings-editor-paragraph-spacing').value = typography.editorParagraphSpacing;
     document.getElementById('settings-sidebar-width').value = layout.sidebarWidth;
     document.getElementById('settings-editor-width').value = layout.editorWidth;
+    document.getElementById('settings-inline-media-position').value = inlineMediaPosition.position;
+    document.getElementById('settings-inline-media-left-offset').value = inlineMediaPosition.leftOffset;
+    syncInlineMediaPositionControls();
     document.getElementById('settings-feature-timeline').checked = featureVisibility.timeline;
-    document.getElementById('settings-feature-music').checked = featureVisibility.music;
-    document.getElementById('settings-feature-player').checked = featureVisibility.player;
     document.getElementById('settings-feature-pomodoro').checked = featureVisibility.pomodoro;
 
     setSettingsTab(currentSettingsTab);
@@ -7309,8 +8596,126 @@ function closeSettingsModal() {
     document.getElementById('settings-modal').classList.remove('show');
 }
 
+function hideTextInputModal() {
+    const modal = document.getElementById('text-input-modal');
+    if (!modal) return;
+
+    modal.classList.remove('show');
+    modal.setAttribute('aria-hidden', 'true');
+}
+
+function openTextInputModal(options = {}) {
+    const {
+        title = '输入',
+        message = '',
+        defaultValue = '',
+        placeholder = '',
+        confirmText = '确定',
+        cancelText = '取消',
+        allowEmpty = true
+    } = options;
+
+    const modal = document.getElementById('text-input-modal');
+    const titleNode = document.getElementById('text-input-title');
+    const messageNode = document.getElementById('text-input-message');
+    const input = document.getElementById('text-input-field');
+    const cancelButton = document.getElementById('text-input-cancel');
+    const confirmButton = document.getElementById('text-input-confirm');
+
+    if (!modal || !titleNode || !messageNode || !input || !cancelButton || !confirmButton) {
+        return Promise.resolve(null);
+    }
+
+    if (textInputModalState?.cleanup) {
+        try {
+            textInputModalState.cleanup();
+        } catch {
+            // ignore cleanup failures
+        }
+    }
+    if (textInputModalState?.resolve) {
+        textInputModalState.resolve(null);
+    }
+
+    return new Promise((resolve) => {
+        const state = {
+            resolve,
+            cleanup: () => {}
+        };
+        textInputModalState = state;
+
+        titleNode.textContent = title;
+        messageNode.textContent = message;
+        input.value = String(defaultValue ?? '');
+        input.placeholder = placeholder;
+        cancelButton.textContent = cancelText;
+        confirmButton.textContent = confirmText;
+        modal.classList.add('show');
+        modal.setAttribute('aria-hidden', 'false');
+
+        const finish = (value) => {
+            if (textInputModalState !== state) {
+                return;
+            }
+            textInputModalState = null;
+            hideTextInputModal();
+            state.cleanup();
+            resolve(value);
+        };
+
+        const confirmValue = () => {
+            const nextValue = String(input.value ?? '');
+            if (!allowEmpty && !nextValue.trim()) {
+                alert('名称不能为空。');
+                input.focus();
+                input.select();
+                return;
+            }
+            finish(nextValue);
+        };
+
+        const cancelValue = () => {
+            finish(null);
+        };
+
+        const onInputKeydown = (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                confirmValue();
+            } else if (event.key === 'Escape') {
+                event.preventDefault();
+                cancelValue();
+            }
+        };
+
+        const onBackdropClick = (event) => {
+            if (event.target === modal) {
+                cancelValue();
+            }
+        };
+
+        const cleanup = () => {
+            input.removeEventListener('keydown', onInputKeydown);
+            confirmButton.removeEventListener('click', confirmValue);
+            cancelButton.removeEventListener('click', cancelValue);
+            modal.removeEventListener('click', onBackdropClick);
+        };
+        state.cleanup = cleanup;
+
+        input.addEventListener('keydown', onInputKeydown);
+        confirmButton.addEventListener('click', confirmValue);
+        cancelButton.addEventListener('click', cancelValue);
+        modal.addEventListener('click', onBackdropClick);
+
+        window.requestAnimationFrame(() => {
+            input.focus();
+            input.select();
+        });
+    });
+}
+
 function setSettingsTab(tab) {
-    const nextTab = ['theme', 'font', 'feature'].includes(tab) ? tab : 'theme';
+    const nextTab = ['theme', 'font', 'media', 'feature'].includes(tab) ? tab : 'theme';
     currentSettingsTab = nextTab;
 
     for (const button of document.querySelectorAll('.settings-tab')) {
@@ -7320,6 +8725,17 @@ function setSettingsTab(tab) {
     for (const panel of document.querySelectorAll('.settings-panel')) {
         panel.classList.toggle('active', panel.id === `settings-panel-${nextTab}`);
     }
+}
+
+function syncInlineMediaPositionControls() {
+    const positionSelect = document.getElementById('settings-inline-media-position');
+    const leftOffsetInput = document.getElementById('settings-inline-media-left-offset');
+    if (!positionSelect || !leftOffsetInput) {
+        return;
+    }
+
+    const isCustomOffset = positionSelect.value === 'offset';
+    leftOffsetInput.disabled = !isCustomOffset;
 }
 
 function handleSaveSettings() {
@@ -7337,10 +8753,12 @@ function handleSaveSettings() {
         sidebarWidth: document.getElementById('settings-sidebar-width').value,
         editorWidth: document.getElementById('settings-editor-width').value
     });
+    saveInlineMediaPositionSettings({
+        position: document.getElementById('settings-inline-media-position').value,
+        leftOffset: document.getElementById('settings-inline-media-left-offset').value
+    });
     saveFeatureVisibilitySettings({
         timeline: document.getElementById('settings-feature-timeline').checked,
-        music: document.getElementById('settings-feature-music').checked,
-        player: document.getElementById('settings-feature-player').checked,
         pomodoro: document.getElementById('settings-feature-pomodoro').checked
     });
     closeSettingsModal();
@@ -7350,6 +8768,7 @@ function resetLayoutSettings() {
     saveThemePreference(DEFAULT_THEME_ID);
     saveTypographySettings(DEFAULT_TYPOGRAPHY_SETTINGS);
     saveLayoutSettings(DEFAULT_LAYOUT_SETTINGS);
+    saveInlineMediaPositionSettings(DEFAULT_INLINE_MEDIA_POSITION_SETTINGS);
     saveFeatureVisibilitySettings(DEFAULT_FEATURE_VISIBILITY_SETTINGS);
     document.getElementById('settings-theme').value = DEFAULT_THEME_ID;
     document.getElementById('settings-ui-font').value = DEFAULT_TYPOGRAPHY_SETTINGS.uiFont;
@@ -7360,9 +8779,10 @@ function resetLayoutSettings() {
     document.getElementById('settings-editor-paragraph-spacing').value = DEFAULT_TYPOGRAPHY_SETTINGS.editorParagraphSpacing;
     document.getElementById('settings-sidebar-width').value = DEFAULT_LAYOUT_SETTINGS.sidebarWidth;
     document.getElementById('settings-editor-width').value = DEFAULT_LAYOUT_SETTINGS.editorWidth;
+    document.getElementById('settings-inline-media-position').value = DEFAULT_INLINE_MEDIA_POSITION_SETTINGS.position;
+    document.getElementById('settings-inline-media-left-offset').value = DEFAULT_INLINE_MEDIA_POSITION_SETTINGS.leftOffset;
+    syncInlineMediaPositionControls();
     document.getElementById('settings-feature-timeline').checked = DEFAULT_FEATURE_VISIBILITY_SETTINGS.timeline;
-    document.getElementById('settings-feature-music').checked = DEFAULT_FEATURE_VISIBILITY_SETTINGS.music;
-    document.getElementById('settings-feature-player').checked = DEFAULT_FEATURE_VISIBILITY_SETTINGS.player;
     document.getElementById('settings-feature-pomodoro').checked = DEFAULT_FEATURE_VISIBILITY_SETTINGS.pomodoro;
 }
 
@@ -7372,7 +8792,9 @@ function initializeEditor() {
     }
 
     setupWindowDragAndDrop();
-    setupPreviewScrollSync();
+    if (!RICH_TEXT_EDITOR_ONLY) {
+        setupPreviewScrollSync();
+    }
     setupJumpNavigation();
     isUsingFallbackEditor = false;
     const typography = loadTypographySettings();
@@ -7479,7 +8901,7 @@ function bindWysiwygEditorEvents(editorInstance) {
             if (applyPendingAttachmentRenameUndo()) {
                 return;
             }
-            undoActiveTabState();
+            void undoActiveTabState();
             return;
         }
 
@@ -7487,7 +8909,7 @@ function bindWysiwygEditorEvents(editorInstance) {
             event.preventDefault();
             event.stopPropagation();
             event.stopImmediatePropagation?.();
-            redoActiveTabState();
+            void redoActiveTabState();
             return;
         }
 
@@ -7516,6 +8938,19 @@ function bindWysiwygEditorEvents(editorInstance) {
         }
     };
 
+    root.addEventListener('beforeinput', () => {
+        capturePendingSelectionSnapshot();
+    }, true);
+    root.addEventListener('keydown', (event) => {
+        if (event.defaultPrevented) return;
+        if (event.metaKey || event.ctrlKey || event.altKey) return;
+        if (event.isComposing) return;
+
+        const key = String(event.key || '');
+        if (key.length === 1 || key === 'Backspace' || key === 'Delete' || key === 'Enter' || key === 'Tab' || key === ' ') {
+            capturePendingSelectionSnapshot();
+        }
+    }, true);
     root.addEventListener('keydown', handleEditorShortcut, true);
     document.addEventListener('keydown', handleEditorShortcut, true);
     root.addEventListener('keyup', scheduleToolbarRefresh, true);
@@ -7547,6 +8982,7 @@ function bindWysiwygEditorEvents(editorInstance) {
     }, true);
 
     root.addEventListener('paste', async (event) => {
+        capturePendingSelectionSnapshot();
         const internalSlicePayload = readEditorClipboardSlicePayload(event);
         if (internalSlicePayload) {
             event.preventDefault();
@@ -7809,7 +9245,9 @@ function bindWysiwygEditorEvents(editorInstance) {
         event.preventDefault();
         event.stopPropagation();
         event.stopImmediatePropagation?.();
-        editorInstance.selectAttachment?.(attachmentInfo);
+        editorInstance.selectAttachment?.(attachmentInfo, {
+            preserveScroll: true
+        });
         hideEditorLinkContextMenu();
         hideAttachmentContextMenu();
         showAttachmentContextMenu(event, attachmentReference);
@@ -8356,33 +9794,64 @@ function setupWindowDragAndDrop() {
             applyPendingDropLocation(e.clientX, e.clientY);
         }
 
+        const draggedNode = getPendingEditorNodeDrag();
+        const droppedFilePath = getDroppedFilePath(Array.from(e.dataTransfer?.files || [])[0] || null);
+        if (
+            draggedNode
+            && droppedFilePath
+            && draggedNode.documentPath
+            && window.currentPath
+            && path.resolve(draggedNode.documentPath) === path.resolve(window.currentPath)
+            && path.resolve(droppedFilePath) === path.resolve(draggedNode.sourcePath || '')
+            && isPointInsideElement(getEditorInteractiveElement(), e.clientX, e.clientY)
+        ) {
+            const targetPos = pendingDropLocation?.pos;
+            const sourcePos = Number(draggedNode.pos);
+            const didMove = window.editor && typeof window.editor.moveNodeAtPosToPosition === 'function'
+                && Number.isInteger(sourcePos)
+                && Number.isInteger(targetPos)
+                ? window.editor.moveNodeAtPosToPosition(sourcePos, targetPos, {
+                    nodeJSON: draggedNode.nodeJSON
+                })
+                : false;
+
+            clearPendingEditorNodeDrag();
+            hideDragCaretIndicator();
+            if (!didMove) {
+                return;
+            }
+            return;
+        }
+
         hideDragCaretIndicator();
 
-        const files = e.dataTransfer.files;
-        const errors = [];
+        await runHistoryTransaction('拖拽导入', async () => {
+            const files = e.dataTransfer.files;
+            const errors = [];
 
-        for (let file of files) {
-            try {
-                const filePath = getDroppedFilePath(file);
-                if (!filePath) continue;
+            for (let file of files) {
+                try {
+                    const filePath = getDroppedFilePath(file);
+                    if (!filePath) continue;
 
-                const stat = fs.statSync(filePath);
+                    const stat = fs.statSync(filePath);
 
-                if (stat.isFile() && ((file.type && file.type.startsWith('image/')) || isImageFilePath(filePath))) {
-                    handleImageBuffer(fs.readFileSync(filePath));
+                    if (stat.isFile() && ((file.type && file.type.startsWith('image/')) || isImageFilePath(filePath))) {
+                        handleImageBuffer(fs.readFileSync(filePath));
+                        continue;
+                    }
+
+                    await handleAttachmentPath(filePath, stat);
+                } catch (error) {
+                    errors.push(`${file.name || getDroppedFilePath(file) || '未知项目'}: ${error.message}`);
                     continue;
                 }
-
-                await handleAttachmentPath(filePath, stat);
-            } catch (error) {
-                errors.push(`${file.name || getDroppedFilePath(file) || '未知项目'}: ${error.message}`);
-                continue;
             }
-        }
 
-        if (errors.length) {
-            alert(`拖拽导入失败：\n${errors.join('\n')}`);
-        }
+            if (errors.length) {
+                alert(`拖拽导入失败：\n${errors.join('\n')}`);
+            }
+        });
     });
 }
 
@@ -8620,6 +10089,14 @@ function applyPendingDropLocation(clientX = null, clientY = null) {
         window.editor.setPosition(pendingDropLocation.position);
         window.editor.focus();
     }
+}
+
+function getPendingEditorNodeDrag() {
+    return window.__kangarooPendingEditorNodeDrag || null;
+}
+
+function clearPendingEditorNodeDrag() {
+    window.__kangarooPendingEditorNodeDrag = null;
 }
 
 function setupPreviewScrollSync() {
@@ -8897,6 +10374,11 @@ function escapeMarkdownTitleForRename(value) {
     return String(value || '').replace(/(["\\])/g, '\\$1');
 }
 
+function parseAttachmentIdentityFromTitle(title) {
+    const match = String(title || '').match(/\[kangaroo-attachment-id=([^\]]+)\]/i);
+    return match?.[1]?.trim() || null;
+}
+
 function normalizeMarkdown(markdown) {
     return String(markdown || '').replace(/\r\n/g, '\n');
 }
@@ -8927,6 +10409,34 @@ function rewriteAttachmentReferencesAfterRenameInMarkdown(markdown, oldAbsoluteP
     const oldRelativePrefix = `${normalizedOldPrefix}/`;
     const previousIdentity = getAttachmentIdentityFromPath(previousAbsolutePath);
     const nextIdentity = getAttachmentIdentityFromPath(nextAbsolutePath) || previousIdentity;
+    const resolveAnyLocalPath = (href) => {
+        const normalizedHref = safeDecodeUri(String(href || '').trim()).replace(/\\/g, '/');
+        if (!normalizedHref || normalizedHref.startsWith('#')) {
+            return '';
+        }
+
+        if (/^file:/i.test(normalizedHref)) {
+            try {
+                return path.resolve(url.fileURLToPath(normalizedHref));
+            } catch {
+                return '';
+            }
+        }
+
+        if (/^[a-zA-Z][a-zA-Z\d+.-]*:/i.test(normalizedHref)) {
+            return '';
+        }
+
+        if (normalizedHref.startsWith('~/')) {
+            return path.resolve(os.homedir(), normalizedHref.slice(2));
+        }
+
+        if (path.isAbsolute(normalizedHref)) {
+            return path.resolve(normalizedHref);
+        }
+
+        return path.resolve(normalizedBundlePath, normalizedHref);
+    };
     const attachmentRegex = /\[((?:\\.|[^\]])*)\]\((?:\.?\/)?(attachments\/(?:<[^>]+>|[^)\s]+))(?:\s+"((?:[^"\\]|\\.)*)")?\)/g;
 
     const nextMarkdown = String(markdown || '').replace(attachmentRegex, (fullMatch, rawLabel, rawHref, rawTitle = '') => {
@@ -8965,13 +10475,17 @@ function rewriteAttachmentReferencesAfterRenameInMarkdown(markdown, oldAbsoluteP
 
     const genericLinkRegex = /\[((?:\\.|[^\]])*)\]\((<[^>]+>|[^)\s]+)(?:\s+"((?:[^"\\]|\\.)*)")?\)/g;
     const nextMarkdownWithAbsolutePaths = nextMarkdown.replace(genericLinkRegex, (fullMatch, rawLabel, rawHref, rawTitle = '') => {
-        const normalizedHref = normalizeAttachmentMarkdownHref(String(rawHref || '').replace(/^<|>$/g, ''));
-        const target = resolvePreviewLinkTarget(normalizedHref);
-        if (!target || target.type !== 'path') {
+        const normalizedHref = safeDecodeUri(String(rawHref || '').trim()).replace(/\\/g, '/');
+        const resolvedAbsolutePath = resolveAnyLocalPath(normalizedHref);
+        if (!resolvedAbsolutePath) {
             return fullMatch;
         }
 
-        if (path.resolve(String(target.value || '')) !== previousAbsolutePath) {
+        const isMatch = isDirectoryRename
+            ? resolvedAbsolutePath === previousAbsolutePath
+                || !path.relative(previousAbsolutePath, resolvedAbsolutePath).startsWith('..')
+            : resolvedAbsolutePath === previousAbsolutePath;
+        if (!isMatch) {
             return fullMatch;
         }
 
@@ -9017,6 +10531,211 @@ function rewriteAttachmentReferencesAfterRenameInMarkdown(markdown, oldAbsoluteP
     return normalizeMarkdown(nextMarkdownWithDirectPaths);
 }
 
+function rewriteAttachmentReferencesAfterRenameInDocumentJson(documentJson, oldAbsolutePath, newAbsolutePath, bundlePath = window.currentPath) {
+    const nextDocumentJson = cloneSerializableValue(documentJson);
+    if (!nextDocumentJson) {
+        return null;
+    }
+
+    const normalizedBundlePath = bundlePath ? path.resolve(String(bundlePath)) : '';
+    const previousAbsolutePath = path.resolve(String(oldAbsolutePath || ''));
+    const nextAbsolutePath = path.resolve(String(newAbsolutePath || ''));
+    if (!normalizedBundlePath || !previousAbsolutePath || !nextAbsolutePath) {
+        return nextDocumentJson;
+    }
+
+    let isDirectoryRename = false;
+    try {
+        isDirectoryRename = fs.existsSync(previousAbsolutePath) && fs.statSync(previousAbsolutePath).isDirectory();
+    } catch {
+        isDirectoryRename = false;
+    }
+
+    const oldRelativeHref = normalizeAttachmentMarkdownHref(path.relative(normalizedBundlePath, previousAbsolutePath));
+    const nextRelativeHref = normalizeAttachmentMarkdownHref(path.relative(normalizedBundlePath, nextAbsolutePath));
+    if (!oldRelativeHref || !nextRelativeHref) {
+        return nextDocumentJson;
+    }
+
+    const normalizedOldPrefix = oldRelativeHref.replace(/\/+$/, '');
+    const oldRelativePrefix = `${normalizedOldPrefix}/`;
+    const previousIdentity = getAttachmentIdentityFromPath(previousAbsolutePath);
+    const nextIdentity = getAttachmentIdentityFromPath(nextAbsolutePath) || previousIdentity;
+
+    const resolveAnyLocalPath = (href) => {
+        const normalizedHref = safeDecodeUri(String(href || '').trim()).replace(/\\/g, '/');
+        if (!normalizedHref || normalizedHref.startsWith('#')) {
+            return '';
+        }
+
+        if (/^file:/i.test(normalizedHref)) {
+            try {
+                return path.resolve(url.fileURLToPath(normalizedHref));
+            } catch {
+                return '';
+            }
+        }
+
+        if (/^[a-zA-Z][a-zA-Z\d+.-]*:/i.test(normalizedHref)) {
+            return '';
+        }
+
+        if (normalizedHref.startsWith('~/')) {
+            return path.resolve(os.homedir(), normalizedHref.slice(2));
+        }
+
+        if (path.isAbsolute(normalizedHref)) {
+            return path.resolve(normalizedHref);
+        }
+
+        return path.resolve(normalizedBundlePath, normalizedHref);
+    };
+
+    const shouldMatchAttachmentRef = (href, title = null, identityAttr = null) => {
+        const normalizedHref = normalizeAttachmentMarkdownHref(String(href || '').replace(/^<|>$/g, ''));
+        const resolvedAbsolutePath = resolveAnyLocalPath(normalizedHref);
+        const effectiveIdentity = identityAttr
+            || parseAttachmentIdentityFromTitle(title)
+            || (resolvedAbsolutePath ? getAttachmentIdentityFromPath(resolvedAbsolutePath) : null);
+        const isAttachmentHref = normalizedHref.startsWith('attachments/');
+
+        if (isDirectoryRename) {
+            return (isAttachmentHref && (
+                normalizedHref === normalizedOldPrefix
+                || normalizedHref.startsWith(oldRelativePrefix)
+            )) || (resolvedAbsolutePath && (
+                resolvedAbsolutePath === previousAbsolutePath
+                || !path.relative(previousAbsolutePath, resolvedAbsolutePath).startsWith('..')
+            )) || (Boolean(previousIdentity) && effectiveIdentity === previousIdentity);
+        }
+
+        return (isAttachmentHref && normalizedHref === oldRelativeHref)
+            || (resolvedAbsolutePath && resolvedAbsolutePath === previousAbsolutePath)
+            || (Boolean(previousIdentity) && effectiveIdentity === previousIdentity);
+    };
+
+    const rewriteHref = (href) => {
+        const normalizedHref = normalizeAttachmentMarkdownHref(String(href || '').replace(/^<|>$/g, ''));
+        if (!normalizedHref) {
+            return { href: String(href || ''), changed: false };
+        }
+
+        const resolvedAbsolutePath = resolveAnyLocalPath(normalizedHref);
+        const isMatch = shouldMatchAttachmentRef(normalizedHref, null, null) || shouldMatchAttachmentRef(href, null, null);
+        if (!isMatch) {
+            return { href, changed: false };
+        }
+
+        let nextHref = nextRelativeHref;
+        if (isDirectoryRename && normalizedHref.startsWith(normalizedOldPrefix)) {
+            nextHref = `${nextRelativeHref}${normalizedHref.slice(normalizedOldPrefix.length)}`;
+        } else if (isDirectoryRename && resolvedAbsolutePath) {
+            const relativeWithinPrevious = path.relative(previousAbsolutePath, resolvedAbsolutePath).replace(/\\/g, '/');
+            if (relativeWithinPrevious && !relativeWithinPrevious.startsWith('..') && !path.isAbsolute(relativeWithinPrevious)) {
+                nextHref = `${nextRelativeHref.replace(/\/+$/, '')}/${relativeWithinPrevious.replace(/^\/+/, '')}`;
+            } else {
+                nextHref = nextRelativeHref;
+            }
+        }
+
+        if (!normalizedHref.startsWith('attachments/')) {
+            nextHref = nextRelativeHref;
+        }
+
+        return {
+            href: nextHref,
+            changed: nextHref !== href
+        };
+    };
+
+    const visit = (node) => {
+        if (!node || typeof node !== 'object') {
+            return node;
+        }
+
+        let didChange = false;
+        const nextNode = Array.isArray(node) ? node.slice() : { ...node };
+
+        if (Array.isArray(nextNode.marks) && typeof nextNode.text === 'string') {
+            let nextText = nextNode.text;
+            const nextMarks = nextNode.marks.map((mark) => {
+                if (!mark || typeof mark !== 'object' || mark.type !== 'link') {
+                    return mark;
+                }
+
+                const attrs = mark.attrs || {};
+                if (!shouldMatchAttachmentRef(attrs.href || '', attrs.title || null, null)) {
+                    return mark;
+                }
+
+                const nextLink = rewriteHref(attrs.href || '');
+                const nextLabel = safeDecodeUri(path.basename(nextLink.href)) || path.basename(nextLink.href) || nextText;
+                if (nextLabel && nextLabel !== nextText) {
+                    nextText = nextLabel;
+                    didChange = true;
+                }
+
+                if (!nextLink.changed && nextText === node.text) {
+                    return mark;
+                }
+
+                didChange = true;
+                return {
+                    ...mark,
+                    attrs: {
+                        ...attrs,
+                        href: nextLink.href
+                    }
+                };
+            });
+
+            if (didChange) {
+                nextNode.text = nextText;
+                nextNode.marks = nextMarks;
+            }
+        }
+
+        if (nextNode.attrs && typeof nextNode.attrs === 'object') {
+            const typeName = String(nextNode.type || '');
+            if (['kangarooAttachment', 'kangarooVideo', 'kangarooPdf'].includes(typeName)) {
+                if (shouldMatchAttachmentRef(nextNode.attrs.href || '', nextNode.attrs.title || null, nextNode.attrs.identity || null)) {
+                    const nextLink = rewriteHref(nextNode.attrs.href || '');
+                    const nextLabel = safeDecodeUri(path.basename(nextLink.href)) || path.basename(nextLink.href) || nextNode.attrs.label || '';
+                    const nextAttrs = {
+                        ...nextNode.attrs,
+                        href: nextLink.href,
+                        label: nextLabel,
+                        identity: nextIdentity || nextNode.attrs.identity || null
+                    };
+
+                    if (nextAttrs.href !== nextNode.attrs.href || nextAttrs.label !== nextNode.attrs.label || nextAttrs.identity !== nextNode.attrs.identity) {
+                        nextNode.attrs = nextAttrs;
+                        didChange = true;
+                    }
+                }
+            }
+        }
+
+        if (Array.isArray(nextNode.content)) {
+            const nextContent = nextNode.content.map((child) => {
+                const nextChild = visit(child);
+                if (nextChild !== child) {
+                    didChange = true;
+                }
+                return nextChild;
+            });
+
+            if (didChange) {
+                nextNode.content = nextContent;
+            }
+        }
+
+        return didChange ? nextNode : node;
+    };
+
+    return visit(nextDocumentJson);
+}
+
 function isAttachmentRenameInsideBundle(bundlePath, sourcePath, targetPath = sourcePath) {
     if (!bundlePath || !sourcePath || !targetPath) return false;
     const normalizedBundlePath = path.resolve(bundlePath);
@@ -9031,9 +10750,6 @@ function isAttachmentRenameInsideBundle(bundlePath, sourcePath, targetPath = sou
 
 function syncOpenTabsAfterAttachmentRename(oldAbsolutePath, newAbsolutePath, activeMarkdown = null) {
     let didChange = false;
-    const nextActiveMarkdown = typeof activeMarkdown === 'string'
-        ? activeMarkdown
-        : (window.editor && typeof window.editor.getValue === 'function' ? window.editor.getValue() : '');
 
     for (const tab of editorTabs) {
         if (!tab?.path || !isAttachmentRenameInsideBundle(tab.path, oldAbsolutePath, newAbsolutePath)) {
@@ -9041,23 +10757,39 @@ function syncOpenTabsAfterAttachmentRename(oldAbsolutePath, newAbsolutePath, act
         }
 
         const currentContent = typeof tab.content === 'string' ? tab.content : '';
+        const currentDocumentJson = cloneSerializableValue(tab.documentJson);
+        const nextDocumentJson = currentDocumentJson
+            ? rewriteAttachmentReferencesAfterRenameInDocumentJson(currentDocumentJson, oldAbsolutePath, newAbsolutePath, tab.path)
+            : null;
         const nextContent = rewriteAttachmentReferencesAfterRenameInMarkdown(currentContent, oldAbsolutePath, newAbsolutePath, tab.path);
-        if (nextContent === currentContent) {
+        const didUpdateDocumentJson = Boolean(
+            nextDocumentJson
+            && JSON.stringify(nextDocumentJson || null) !== JSON.stringify(currentDocumentJson || null)
+        );
+        const didUpdateContent = nextContent !== currentContent;
+
+        if (!didUpdateDocumentJson && !didUpdateContent) {
             continue;
         }
 
         didChange = true;
-        if (tab.id === activeTabId) {
+        if (didUpdateDocumentJson) {
+            tab.documentJson = nextDocumentJson;
+        }
+        if (didUpdateContent) {
             tab.content = nextContent;
+        }
+        tab.attachmentSnapshot = captureBundleAttachmentSnapshot(tab.path);
+        tab.attachmentSnapshotRoot = tab.path ? path.resolve(tab.path) : null;
+        if (tab.id === activeTabId) {
             tab.previousContent = tab.content;
             continue;
         }
 
         if (tab.isDirty) {
             tab.previousContent = tab.content;
-            tab.content = nextContent;
         } else {
-            resetTabHistory(tab, nextContent);
+            resetTabHistory(tab, didUpdateContent ? nextContent : tab.content);
         }
     }
 
@@ -9115,6 +10847,80 @@ function normalizePreviewImageSourceRef(sourceRef) {
     }
 
     return normalized.replace(/^\.?\//, '').replace(/^\/+/, '');
+}
+
+function normalizeImageResourceHrefForWrite(href) {
+    const normalized = normalizePreviewImageSourceRef(href);
+    if (!normalized) return '';
+    const relativePath = normalizeImageResourceRelativePath(normalized);
+    return relativePath ? `attachments/${IMAGE_RESOURCE_DIR_NAME}/${relativePath}` : normalized;
+}
+
+function normalizeImageResourceRelativePath(href) {
+    const normalized = normalizePreviewImageSourceRef(href);
+    if (!normalized) return '';
+
+    const prefixes = [
+        `attachments/${IMAGE_RESOURCE_DIR_NAME}/`,
+        `${IMAGE_RESOURCE_DIR_NAME}/`,
+        `${LEGACY_IMAGE_RESOURCE_DIR_NAME}/`,
+        'attachments/'
+    ];
+
+    for (const prefix of prefixes) {
+        if (normalized.startsWith(prefix)) {
+            return normalized.slice(prefix.length).replace(/^\/+/, '');
+        }
+    }
+
+    return normalized.replace(/^\/+/, '');
+}
+
+function resolveImageResourceSourceDir(bundlePath) {
+    return resolveExistingImageResourceDir(bundlePath);
+}
+
+function normalizeMarkdownImageResourcePaths(markdown) {
+    const source = String(markdown || '');
+    if (!source) {
+        return source;
+    }
+
+    return source
+        .replace(/(!\[[^\]]*\]\()\s*(?:\.?\/)?(?:attachments\/images|images|assets|attachments)\//gi, `$1attachments/${IMAGE_RESOURCE_DIR_NAME}/`)
+        .replace(/(<img\b[^>]*\bsrc\s*=\s*(?:"|')\s*(?:\.?\/)?(?:attachments\/images|images|assets|attachments)\/)/gi, (match) => match.replace(/(?:attachments\/images|images|assets|attachments)\//i, `attachments/${IMAGE_RESOURCE_DIR_NAME}/`));
+}
+
+function normalizeDocumentJsonImageResourcePaths(documentJson) {
+    const root = cloneSerializableValue(documentJson);
+    if (!root || typeof root !== 'object') {
+        return root;
+    }
+
+    const visit = (node) => {
+        if (!node || typeof node !== 'object') {
+            return;
+        }
+
+        if (node.type === 'image' && node.attrs && typeof node.attrs === 'object') {
+            const nextSrc = normalizeImageResourceHrefForWrite(node.attrs.src || '');
+            if (nextSrc && nextSrc !== node.attrs.src) {
+                node.attrs = {
+                    ...node.attrs,
+                    src: nextSrc
+                };
+            }
+        }
+
+        if (Array.isArray(node.content)) {
+            for (const child of node.content) {
+                visit(child);
+            }
+        }
+    };
+
+    visit(root);
+    return root;
 }
 
 function extractHtmlAttribute(tag, attributeName) {
@@ -9194,7 +11000,29 @@ function resolvePreviewImageFilePath(sourceRef) {
             return null;
         }
     } else if (!path.isAbsolute(resolvedPath)) {
-        resolvedPath = path.resolve(window.currentPath || process.cwd(), resolvedPath);
+        const normalizedSrc = resolvedPath.replace(/^\.?\//, '');
+        const baseDir = window.currentPath || process.cwd();
+        const candidates = [path.resolve(baseDir, normalizedSrc)];
+        if (normalizedSrc.startsWith(`attachments/${IMAGE_RESOURCE_DIR_NAME}/`)) {
+            candidates.push(path.resolve(baseDir, normalizedSrc.replace(/^attachments\/images\//, 'images/')));
+            candidates.push(path.resolve(baseDir, normalizedSrc.replace(/^attachments\/images\//, 'assets/')));
+        } else if (normalizedSrc.startsWith(IMAGE_RESOURCE_DIR_NAME + '/')) {
+            candidates.push(path.resolve(baseDir, normalizedSrc.replace(/^images\//, 'attachments/images/')));
+            candidates.push(path.resolve(baseDir, normalizedSrc.replace(/^images\//, 'assets/')));
+        } else if (normalizedSrc.startsWith(LEGACY_IMAGE_RESOURCE_DIR_NAME + '/')) {
+            candidates.push(path.resolve(baseDir, normalizedSrc.replace(/^assets\//, 'attachments/images/')));
+            candidates.push(path.resolve(baseDir, normalizedSrc.replace(/^assets\//, 'images/')));
+        } else if (normalizedSrc.startsWith('attachments/')) {
+            candidates.push(path.resolve(baseDir, normalizedSrc.replace(/^attachments\//, 'attachments/images/')));
+            candidates.push(path.resolve(baseDir, normalizedSrc.replace(/^attachments\//, 'images/')));
+            candidates.push(path.resolve(baseDir, normalizedSrc.replace(/^attachments\//, 'assets/')));
+        }
+        for (const candidate of candidates) {
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+        }
+        resolvedPath = candidates[0];
     }
 
     return resolvedPath;
@@ -9243,24 +11071,36 @@ function transformMarkdownForPreview(raw) {
         return raw.replace(/<img\b[^>]*>/gi, (tag) => decorateHtmlImageTagForPreview(tag, 1));
     }
 
-    const assetsDir = path.join(window.currentPath, 'assets');
     const lines = raw.split('\n');
 
     return lines.map((line, index) => {
         const lineNumber = index + 1;
         let nextLine = line.replace(
-            /!\[(.*?)\]\((?:\.?\/)?assets\/(.+?)\)/g,
-            (_, alt, file) => {
+            /!\[(.*?)\]\((?:\.?\/)?(attachments\/images|images|assets|attachments)\/(.+?)\)/g,
+            (_, alt, resourceDir, file) => {
                 const relativeFile = safeDecodeUri(file || '').replace(/\\/g, '/').replace(/^\/+/, '');
-                const absolutePath = path.join(assetsDir, relativeFile);
-                if (!fs.existsSync(absolutePath)) {
+                const primaryPath = path.join(window.currentPath, resourceDir, relativeFile);
+                const fallbackDirs = resourceDir === 'attachments'
+                    ? [path.join('attachments', IMAGE_RESOURCE_DIR_NAME), IMAGE_RESOURCE_DIR_NAME, LEGACY_IMAGE_RESOURCE_DIR_NAME]
+                    : (resourceDir === path.join('attachments', IMAGE_RESOURCE_DIR_NAME)
+                        ? [IMAGE_RESOURCE_DIR_NAME, LEGACY_IMAGE_RESOURCE_DIR_NAME]
+                        : (resourceDir === IMAGE_RESOURCE_DIR_NAME
+                            ? [path.join('attachments', IMAGE_RESOURCE_DIR_NAME), LEGACY_IMAGE_RESOURCE_DIR_NAME]
+                            : [path.join('attachments', IMAGE_RESOURCE_DIR_NAME), IMAGE_RESOURCE_DIR_NAME]));
+                const fallbackPath = fallbackDirs
+                    .map((dirName) => path.join(window.currentPath, dirName, relativeFile))
+                    .find((candidate) => fs.existsSync(candidate)) || '';
+                const absolutePath = fs.existsSync(primaryPath)
+                    ? primaryPath
+                    : fallbackPath;
+                if (!absolutePath) {
                     return _;
                 }
 
                 return buildPreviewImageHtml({
                     alt,
                     absolutePath,
-                    sourceRef: `assets/${relativeFile}`,
+                    sourceRef: `${resourceDir}/${relativeFile}`,
                     lineNumber
                 });
             }
@@ -9293,33 +11133,44 @@ function getDroppedFilePath(file) {
     }
 }
 
+function normalizeHttpImageUrlLike(value) {
+    const normalized = String(value || '').trim();
+    const webUrlMatch = normalized.match(/^(https?:)\/(?!\/)(.*)$/i);
+    if (webUrlMatch) {
+        return `${webUrlMatch[1]}//${webUrlMatch[2]}`;
+    }
+    return normalized;
+}
+
 async function handleClipboardPaste(event = null) {
-    const clipboardPaths = getClipboardPathEntries(event);
-    if (clipboardPaths.length) {
-        for (const filePath of clipboardPaths) {
-            const stat = fs.statSync(filePath);
-            if (stat.isFile() && isImageFilePath(filePath)) {
-                handleImageBuffer(fs.readFileSync(filePath));
-                continue;
+    return runHistoryTransaction('粘贴', async () => {
+        const clipboardPaths = getClipboardPathEntries(event);
+        if (clipboardPaths.length) {
+            for (const filePath of clipboardPaths) {
+                const stat = fs.statSync(filePath);
+                if (stat.isFile() && isImageFilePath(filePath)) {
+                    handleImageBuffer(fs.readFileSync(filePath));
+                    continue;
+                }
+
+                await handleAttachmentPath(filePath, stat);
             }
-
-            await handleAttachmentPath(filePath, stat);
+            return;
         }
-        return;
-    }
 
-    const image = clipboard.readImage();
-    if (!image.isEmpty()) return handleImagePaste(image);
+        const image = clipboard.readImage();
+        if (!image.isEmpty()) return handleImagePaste(image);
 
-    const html = clipboard.readHTML();
-    const match = html.match(/<img.*?src="(.*?)"/);
+        const html = clipboard.readHTML();
+        const match = html.match(/<img.*?src="(.*?)"/);
 
-    if (match && match[1].startsWith('http')) {
-        return downloadImage(match[1]);
-    }
+        if (match && match[1].startsWith('http')) {
+            return downloadImage(match[1]);
+        }
 
-    const text = clipboard.readText();
-    if (text) insertText(text);
+        const text = clipboard.readText();
+        if (text) insertText(text);
+    });
 }
 
 
@@ -9340,7 +11191,7 @@ async function saveFile(options = {}) {
         autoSaveTimer = null;
     }
 
-    const markdown = window.editor.getValue();
+    const { markdown, documentJson } = getActiveEditorSnapshot();
 
     try {
         suppressWorkspaceWatcherUntil = Math.max(suppressWorkspaceWatcherUntil, Date.now() + 1500);
@@ -9350,24 +11201,26 @@ async function saveFile(options = {}) {
                 window.currentPath = migratedPath;
             }
         }
-        const restoredEntries = restoreRecoveredEntries(markdown);
-        cleanUnusedImages(markdown);
-        const canContinueSave = await cleanUnusedAttachments(markdown);
+        const restoredEntries = restoreRecoveredEntries(markdown, documentJson);
+        const canContinueSave = await cleanupUnusedResourcesForTab({
+            path: window.currentPath,
+            content: markdown,
+            documentJson,
+            preservedEntries: Array.from(preservedUnusedAttachmentEntries)
+        });
         if (!canContinueSave) {
             return false;
         }
 
-        fs.writeFileSync(
-            resolveBundleMarkdownFilePath(window.currentPath, { createIfMissing: true }),
-            markdown,
-            'utf-8'
-        );
+        const savedPackage = writeBundlePackageToPath(window.currentPath, markdown, documentJson, window.currentPath);
 
         setDirty(false);
         const activeTab = getActiveTab();
         if (activeTab) {
             activeTab.path = window.currentPath;
             activeTab.content = markdown;
+            activeTab.documentJson = savedPackage.documentJson || documentJson;
+            activeTab.manifest = savedPackage.manifest || activeTab.manifest;
             activeTab.previousContent = markdown;
             activeTab.isDirty = false;
             activeTab.previousIsDirty = false;
@@ -9444,22 +11297,65 @@ function doesEntryNameExist(kind, targetDir, entryName) {
         return false;
     }
 
-    const recoveryPath = path.join(window.currentPath, RECOVERY_DIR_NAME, kind, entryName);
-    return fs.existsSync(recoveryPath);
+    const normalizedBundlePath = path.resolve(window.currentPath);
+    const normalizedTargetDir = path.resolve(targetDir);
+    const relativeTargetDir = path.relative(normalizedBundlePath, normalizedTargetDir).replace(/\\/g, '/');
+
+    for (const recoveryRoot of getRecoveryRootCandidates(window.currentPath)) {
+        if (relativeTargetDir && !relativeTargetDir.startsWith('..') && !path.isAbsolute(relativeTargetDir)) {
+            const relativeRecoveryPath = path.join(recoveryRoot, relativeTargetDir, entryName);
+            if (fs.existsSync(relativeRecoveryPath)) {
+                return true;
+            }
+        }
+
+        const legacyRecoveryPath = path.join(recoveryRoot, kind, entryName);
+        if (fs.existsSync(legacyRecoveryPath)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
-function generateFileName(assetsDir) {
-    const date = new Date().toISOString().split('T')[0];
+function getImageFileExtensionFromMimeType(mimeType) {
+    const normalized = String(mimeType || '').trim().toLowerCase();
+    const map = {
+        'image/png': '.png',
+        'image/jpeg': '.jpg',
+        'image/jpg': '.jpg',
+        'image/gif': '.gif',
+        'image/webp': '.webp',
+        'image/bmp': '.bmp',
+        'image/svg+xml': '.svg',
+        'image/x-icon': '.ico',
+        'image/vnd.microsoft.icon': '.ico',
+        'image/tiff': '.tiff',
+        'image/heic': '.heic',
+        'image/heif': '.heif'
+    };
 
-    let i = 1;
-    let name;
+    return map[normalized] || '.png';
+}
 
-    do {
-        name = `image-${date}-${String(i).padStart(3, '0')}.png`;
-        i++;
-    } while (doesEntryNameExist('assets', assetsDir, name));
+function generateFileName(imagesDir, options = {}) {
+    const prefix = String(options.prefix || 'image').trim() || 'image';
+    const extension = String(options.extension || '.png').trim() || '.png';
+    const compactTimestamp = new Date().toISOString()
+        .replace(/[-:]/g, '')
+        .replace(/\.\d{3}Z$/, 'Z')
+        .replace('T', '-');
+    const sessionNonce = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
 
-    return name;
+    let suffix = 0;
+    while (true) {
+        const nextSuffix = suffix ? `-${String(suffix).padStart(2, '0')}` : '';
+        const candidate = `${prefix}-${compactTimestamp}-${sessionNonce}${nextSuffix}${extension}`;
+        if (!doesEntryNameExist(path.basename(imagesDir), imagesDir, candidate)) {
+            return candidate;
+        }
+        suffix += 1;
+    }
 }
 
 function ensureDirectory(dirPath) {
@@ -9468,8 +11364,70 @@ function ensureDirectory(dirPath) {
     }
 }
 
+function getRecoveryRootCandidates(bundlePath = window.currentPath) {
+    if (!bundlePath) return [];
+
+    const normalizedBundlePath = path.resolve(bundlePath);
+    return [
+        path.join(normalizedBundlePath, SESSION_HISTORY_DIR_NAME),
+        path.join(normalizedBundlePath, RECOVERY_DIR_NAME),
+        ...LEGACY_RECOVERY_DIR_NAMES.map((legacyName) => path.join(normalizedBundlePath, legacyName))
+    ];
+}
+
+function mergeDirectoryContents(sourceDir, targetDir) {
+    if (!fs.existsSync(sourceDir)) {
+        return;
+    }
+
+    ensureDirectory(targetDir);
+    for (const entryName of fs.readdirSync(sourceDir)) {
+        const sourcePath = path.join(sourceDir, entryName);
+        const targetPath = path.join(targetDir, entryName);
+        if (!fs.existsSync(targetPath)) {
+            movePathRobustSync(sourcePath, targetPath);
+            continue;
+        }
+
+        const sourceStat = fs.statSync(sourcePath);
+        const targetStat = fs.statSync(targetPath);
+        if (sourceStat.isDirectory() && targetStat.isDirectory()) {
+            mergeDirectoryContents(sourcePath, targetPath);
+            removeDirectoryIfExists(sourcePath);
+        }
+    }
+}
+
+function migrateLegacyRecoveryRoot(bundlePath = window.currentPath) {
+    if (!bundlePath) return;
+
+    const normalizedBundlePath = path.resolve(bundlePath);
+    const preferredRoot = path.join(normalizedBundlePath, RECOVERY_DIR_NAME);
+
+    for (const legacyName of LEGACY_RECOVERY_DIR_NAMES) {
+        const legacyRoot = path.join(normalizedBundlePath, legacyName);
+        if (!fs.existsSync(legacyRoot)) {
+            continue;
+        }
+
+        if (!fs.existsSync(preferredRoot)) {
+            try {
+                fs.renameSync(legacyRoot, preferredRoot);
+                continue;
+            } catch {
+                // fall through to merge below
+            }
+        }
+
+        ensureDirectory(preferredRoot);
+        mergeDirectoryContents(legacyRoot, preferredRoot);
+        removeDirectoryIfExists(legacyRoot);
+    }
+}
+
 function ensureRecoveryDir(kind) {
-    const recoveryRoot = path.join(window.currentPath, RECOVERY_DIR_NAME);
+    migrateLegacyRecoveryRoot(window.currentPath);
+    const recoveryRoot = getSessionHistoryRoot(window.currentPath);
     const recoveryDir = path.join(recoveryRoot, kind);
     ensureDirectory(recoveryDir);
     return recoveryDir;
@@ -9511,7 +11469,7 @@ function backupEntryToRecoveryForBundle(bundlePath, kind, entryName) {
     const sourcePath = path.join(sourceDir, entryName);
     if (!fs.existsSync(sourcePath)) return false;
 
-    const recoveryDir = path.join(normalizedBundlePath, RECOVERY_DIR_NAME, kind);
+    const recoveryDir = path.join(normalizedBundlePath, SESSION_HISTORY_DIR_NAME, kind);
     ensureDirectory(recoveryDir);
     const targetPath = path.join(recoveryDir, entryName);
 
@@ -9529,7 +11487,7 @@ function moveEntryToRecoveryForBundle(bundlePath, kind, entryName) {
     const sourcePath = path.join(sourceDir, entryName);
     if (!fs.existsSync(sourcePath)) return false;
 
-    const recoveryDir = path.join(normalizedBundlePath, RECOVERY_DIR_NAME, kind);
+    const recoveryDir = path.join(normalizedBundlePath, SESSION_HISTORY_DIR_NAME, kind);
     ensureDirectory(recoveryDir);
     const targetPath = path.join(recoveryDir, entryName);
 
@@ -9562,11 +11520,11 @@ function getBundleEntryBackupInfo(absolutePath, bundlePath = null) {
     }
 
     const kind = segments[0];
-    if (kind !== 'attachments' && kind !== 'assets') {
+    if (kind !== 'attachments' && kind !== IMAGE_RESOURCE_DIR_NAME && kind !== LEGACY_IMAGE_RESOURCE_DIR_NAME) {
         return null;
     }
 
-    const entryName = segments[1];
+    const entryName = segments.slice(1).join('/');
     if (!entryName) {
         return null;
     }
@@ -9579,28 +11537,44 @@ function getBundleEntryBackupInfo(absolutePath, bundlePath = null) {
 }
 
 function restoreEntryFromRecovery(kind, entryName) {
-    const recoveryDir = path.join(window.currentPath, RECOVERY_DIR_NAME, kind);
-    const sourcePath = path.join(recoveryDir, entryName);
-    if (!fs.existsSync(sourcePath)) return false;
+    for (const recoveryRoot of getRecoveryRootCandidates(window.currentPath)) {
+        const sourcePath = path.join(recoveryRoot, kind, entryName);
+        if (!fs.existsSync(sourcePath)) {
+            continue;
+        }
 
-    const targetDir = path.join(window.currentPath, kind);
-    ensureDirectory(targetDir);
-    const targetPath = path.join(targetDir, entryName);
+        const targetDir = path.join(window.currentPath, kind);
+        ensureDirectory(targetDir);
+        const targetPath = path.join(targetDir, entryName);
+        if (fs.existsSync(targetPath)) {
+            return false;
+        }
 
-    removeDirectoryIfExists(targetPath);
-    fs.rmSync(targetPath, { recursive: true, force: true });
-    fs.renameSync(sourcePath, targetPath);
-    return true;
+        removeDirectoryIfExists(targetPath);
+        fs.rmSync(targetPath, { recursive: true, force: true });
+        fs.renameSync(sourcePath, targetPath);
+        return true;
+    }
+
+    return false;
 }
 
-function restoreRecoveredEntries(markdown) {
+function restoreRecoveredEntries(markdown, documentJson = null) {
     if (!window.currentPath) return false;
-    const usedAttachmentEntries = getUsedAttachmentEntries(markdown, { preferEditorState: true });
+    const structuredDocument = documentJson || window.editor?.getDocumentJson?.() || null;
+    const usedAttachmentEntries = structuredDocument
+        ? getUsedAttachmentEntriesFromDocumentJson(structuredDocument)
+        : getUsedAttachmentEntries(markdown, { preferEditorState: true });
+    const usedImageEntries = structuredDocument
+        ? getUsedImageEntriesFromDocumentJson(structuredDocument)
+        : getUsedImageEntries(markdown);
 
     let restored = false;
 
-    for (const entryName of getUsedImageEntries(markdown)) {
-        restored = restoreEntryFromRecovery('assets', entryName) || restored;
+    for (const entryName of usedImageEntries) {
+        restored = restoreEntryFromRecovery('attachments', path.join(IMAGE_RESOURCE_DIR_NAME, entryName)) || restored;
+        restored = restoreEntryFromRecovery(IMAGE_RESOURCE_DIR_NAME, entryName) || restored;
+        restored = restoreEntryFromRecovery(LEGACY_IMAGE_RESOURCE_DIR_NAME, entryName) || restored;
     }
 
     for (const entryName of usedAttachmentEntries) {
@@ -9631,19 +11605,39 @@ function backupClipboardAttachmentEntriesToRecovery(payload) {
         }
 
         const normalizedBundlePath = path.resolve(sourceBundlePath);
-        const assetsDir = path.join(normalizedBundlePath, 'assets');
         const normalizedSourcePath = path.resolve(absolutePath);
-        const relative = path.relative(assetsDir, normalizedSourcePath);
-        if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
-            continue;
-        }
+        const attachmentImagesDir = getImageResourceDirPath(normalizedBundlePath);
+        for (const imagesDir of [...getImageResourceDirCandidates(normalizedBundlePath), path.join(normalizedBundlePath, 'attachments')]) {
+            if (!fs.existsSync(imagesDir)) {
+                continue;
+            }
+            const relative = path.relative(imagesDir, normalizedSourcePath);
+            if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+                continue;
+            }
 
-        const topLevelEntry = relative.split(path.sep)[0];
-        if (!topLevelEntry) {
-            continue;
+            const entryName = relative.replace(/\\/g, '/');
+            if (path.resolve(imagesDir) === path.resolve(attachmentImagesDir)) {
+                didBackup = moveEntryToRecoveryForBundle(
+                    normalizedBundlePath,
+                    'attachments',
+                    path.join(IMAGE_RESOURCE_DIR_NAME, entryName)
+                ) || didBackup;
+            } else if (path.basename(imagesDir) === 'attachments') {
+                didBackup = moveEntryToRecoveryForBundle(
+                    normalizedBundlePath,
+                    'attachments',
+                    entryName
+                ) || didBackup;
+            } else {
+                didBackup = moveEntryToRecoveryForBundle(
+                    normalizedBundlePath,
+                    path.basename(imagesDir),
+                    entryName
+                ) || didBackup;
+            }
+            break;
         }
-
-        didBackup = moveEntryToRecoveryForBundle(normalizedBundlePath, 'assets', topLevelEntry) || didBackup;
     }
 
     for (const attachmentPayload of attachmentPayloads) {
@@ -9687,18 +11681,31 @@ function resolveRecoveredClipboardSourcePath(sourceBundlePath, sourcePath) {
     const absoluteSourcePath = path.isAbsolute(normalizedSourcePath)
         ? path.resolve(normalizedSourcePath)
         : path.resolve(sourceBundleRoot, normalizedSourcePath);
-    const relative = path.relative(attachmentsDir, absoluteSourcePath).replace(/\\/g, '/');
-    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
-        return '';
+    const roots = [
+        path.join(sourceBundleRoot, 'attachments'),
+        path.join(sourceBundleRoot, IMAGE_RESOURCE_DIR_NAME),
+        path.join(sourceBundleRoot, LEGACY_IMAGE_RESOURCE_DIR_NAME)
+    ];
+
+    for (const root of roots) {
+        const relative = path.relative(root, absoluteSourcePath).replace(/\\/g, '/');
+        if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+            continue;
+        }
+
+        for (const recoveryRoot of getRecoveryRootCandidates(sourceBundleRoot)) {
+            const recoveredPath = path.join(
+                recoveryRoot,
+                path.relative(sourceBundleRoot, root).replace(/\\/g, '/'),
+                relative
+            );
+            if (fs.existsSync(recoveredPath)) {
+                return recoveredPath;
+            }
+        }
     }
 
-    const topLevelEntry = relative.split('/')[0];
-    if (!topLevelEntry) {
-        return '';
-    }
-
-    const recoveredPath = path.join(sourceBundleRoot, RECOVERY_DIR_NAME, 'attachments', topLevelEntry);
-    return fs.existsSync(recoveredPath) ? recoveredPath : '';
+    return '';
 }
 
 function backupSelectedAttachmentEntriesForEditor(editorInstance) {
@@ -9733,17 +11740,33 @@ function backupSelectedAttachmentEntriesForEditor(editorInstance) {
                     const sourceBundlePath = findContainingTextBundlePath(absolutePath);
                     const normalizedBundlePath = String(sourceBundlePath || '').trim();
                     if (normalizedBundlePath) {
-                        const assetsDir = path.join(path.resolve(normalizedBundlePath), 'assets');
                         const normalizedSourcePath = path.resolve(absolutePath);
-                        const relative = path.relative(assetsDir, normalizedSourcePath).replace(/\\/g, '/');
-                        if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
-                            const topLevelEntry = relative.split('/')[0];
-                            if (topLevelEntry) {
-                                didBackup = moveEntryToRecoveryForBundle(
-                                    normalizedBundlePath,
-                                    'assets',
-                                    topLevelEntry
-                                ) || didBackup;
+                        for (const imagesDir of [...getImageResourceDirCandidates(normalizedBundlePath), path.join(normalizedBundlePath, 'attachments')]) {
+                            if (!fs.existsSync(imagesDir)) {
+                                continue;
+                            }
+                            const relative = path.relative(imagesDir, normalizedSourcePath).replace(/\\/g, '/');
+                            if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+                                if (path.resolve(imagesDir) === path.resolve(getImageResourceDirPath(normalizedBundlePath))) {
+                                    didBackup = moveEntryToRecoveryForBundle(
+                                        normalizedBundlePath,
+                                        'attachments',
+                                        path.join(IMAGE_RESOURCE_DIR_NAME, relative)
+                                    ) || didBackup;
+                                } else if (path.basename(imagesDir) === 'attachments') {
+                                    didBackup = moveEntryToRecoveryForBundle(
+                                        normalizedBundlePath,
+                                        'attachments',
+                                        relative
+                                    ) || didBackup;
+                                } else {
+                                    didBackup = moveEntryToRecoveryForBundle(
+                                        normalizedBundlePath,
+                                        path.basename(imagesDir),
+                                        relative
+                                    ) || didBackup;
+                                }
+                                break;
                             }
                         }
                     }
@@ -9785,17 +11808,86 @@ function backupSelectedAttachmentEntriesForEditor(editorInstance) {
     return didBackup;
 }
 
-function cleanupRecoveryDir(bundlePath = window.currentPath) {
+function cleanupRecoveryDir(bundlePath = window.currentPath, options = {}) {
+    const { preservePrimary = false } = options;
     if (!bundlePath) return;
 
-    const recoveryRoot = path.join(bundlePath, RECOVERY_DIR_NAME);
-    if (!fs.existsSync(recoveryRoot)) return;
+    for (const recoveryRoot of getRecoveryRootCandidates(bundlePath)) {
+        if (preservePrimary && path.basename(recoveryRoot) === RECOVERY_DIR_NAME) {
+            continue;
+        }
+        if (!fs.existsSync(recoveryRoot)) continue;
+        fs.rmSync(recoveryRoot, { recursive: true, force: true });
+    }
+}
 
-    fs.rmSync(recoveryRoot, { recursive: true, force: true });
+function getSessionHistoryRoot(bundlePath = window.currentPath) {
+    if (!bundlePath) return '';
+    return path.join(path.resolve(bundlePath), SESSION_HISTORY_DIR_NAME);
+}
+
+function cleanupSessionHistoryDir(bundlePath = window.currentPath) {
+    const historyRoot = getSessionHistoryRoot(bundlePath);
+    if (!historyRoot || !fs.existsSync(historyRoot)) {
+        return;
+    }
+
+    fs.rmSync(historyRoot, { recursive: true, force: true });
+}
+
+function createHistoryEntryId() {
+    const nonce = String(nextHistoryEntryId++).padStart(4, '0');
+    return `${Date.now().toString(36)}-${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}-${nonce}`;
+}
+
+function getSessionHistoryEntryRoot(bundlePath, entryId) {
+    if (!bundlePath || !entryId) return '';
+    return path.join(getSessionHistoryRoot(bundlePath), 'entries', entryId);
+}
+
+function moveEntryToSessionHistoryForBundle(bundlePath, kind, entryName, entryId) {
+    if (!bundlePath || !kind || !entryName || !entryId) return false;
+
+    const normalizedBundlePath = path.resolve(bundlePath);
+    const sourceDir = path.join(normalizedBundlePath, kind);
+    const sourcePath = path.resolve(sourceDir, entryName);
+    if (!isSameOrNestedPath(sourcePath, sourceDir)) return false;
+    if (!fs.existsSync(sourcePath)) return false;
+
+    const entryRoot = getSessionHistoryEntryRoot(normalizedBundlePath, entryId);
+    const targetPath = path.resolve(entryRoot, kind, entryName);
+    if (!isSameOrNestedPath(targetPath, entryRoot)) return false;
+    removeDirectoryIfExists(targetPath);
+    fs.rmSync(targetPath, { recursive: true, force: true });
+    movePathRobustSync(sourcePath, targetPath);
+    return true;
+}
+
+function restoreEntryFromSessionHistoryForBundle(bundlePath, kind, entryName, entryId) {
+    if (!bundlePath || !kind || !entryName || !entryId) return false;
+
+    const normalizedBundlePath = path.resolve(bundlePath);
+    const entryRoot = getSessionHistoryEntryRoot(normalizedBundlePath, entryId);
+    const sourcePath = path.resolve(entryRoot, kind, entryName);
+    if (!isSameOrNestedPath(sourcePath, entryRoot)) return false;
+    if (!fs.existsSync(sourcePath)) return false;
+
+    const targetDir = path.join(normalizedBundlePath, kind);
+    ensureDirectory(targetDir);
+    const targetPath = path.resolve(targetDir, entryName);
+    if (!isSameOrNestedPath(targetPath, targetDir)) return false;
+    if (fs.existsSync(targetPath)) {
+        return false;
+    }
+
+    removeDirectoryIfExists(targetPath);
+    fs.rmSync(targetPath, { recursive: true, force: true });
+    movePathRobustSync(sourcePath, targetPath);
+    return true;
 }
 
 function restoreActiveTabFromPreviousSnapshot() {
-    return undoActiveTabState();
+    return void undoActiveTabState();
 }
 
 function ensureAttachmentsDir() {
@@ -10285,7 +12377,8 @@ function createBundleSnapshot(bundlePath = window.currentPath, options = {}) {
     ensureDirectory(filesRoot);
 
     const resources = [
-        ...collectBundleHistoryResourceEntries(normalizedBundlePath, 'assets', filesRoot),
+        ...collectBundleHistoryResourceEntries(normalizedBundlePath, IMAGE_RESOURCE_DIR_NAME, filesRoot),
+        ...collectBundleHistoryResourceEntries(normalizedBundlePath, LEGACY_IMAGE_RESOURCE_DIR_NAME, filesRoot),
         ...collectBundleHistoryResourceEntries(normalizedBundlePath, 'attachments', filesRoot)
     ];
     const contentHash = buildHistoryContentHash(markdown, resources);
@@ -10402,7 +12495,7 @@ function deleteHistorySnapshot(bundlePath, snapshotId) {
 
 function restoreBundleSnapshotResources(bundlePath, snapshot) {
     const normalizedBundlePath = path.resolve(bundlePath);
-    for (const dirName of ['assets', 'attachments']) {
+    for (const dirName of [path.join('attachments', IMAGE_RESOURCE_DIR_NAME), IMAGE_RESOURCE_DIR_NAME, LEGACY_IMAGE_RESOURCE_DIR_NAME, 'attachments']) {
         const targetDir = path.join(normalizedBundlePath, dirName);
         if (fs.existsSync(targetDir)) {
             fs.rmSync(targetDir, { recursive: true, force: true });
@@ -10413,7 +12506,7 @@ function restoreBundleSnapshotResources(bundlePath, snapshot) {
     const filesRoot = path.join(getBundleHistoryRoot(normalizedBundlePath), HISTORY_FILE_POOL_DIR);
     for (const resource of snapshot.resources || []) {
         const relativePath = normalizeAttachmentMarkdownHref(resource.relativePath || '');
-        if (!relativePath || (!relativePath.startsWith('assets/') && !relativePath.startsWith('attachments/'))) {
+        if (!relativePath || (!relativePath.startsWith(`${IMAGE_RESOURCE_DIR_NAME}/`) && !relativePath.startsWith(`${LEGACY_IMAGE_RESOURCE_DIR_NAME}/`) && !relativePath.startsWith('attachments/'))) {
             continue;
         }
 
@@ -10514,6 +12607,7 @@ function formatHistoryBytes(bytes) {
 function collectBundleCurrentResourceEntries(bundlePath) {
     const bundleRoot = path.resolve(bundlePath || '');
     const entries = [];
+    const seen = new Set();
     const visitRoot = (relativeRoot) => {
         const sourceRoot = path.join(bundleRoot, relativeRoot);
         if (!fs.existsSync(sourceRoot)) return;
@@ -10530,7 +12624,8 @@ function collectBundleCurrentResourceEntries(bundlePath) {
             if (!stat.isFile()) return;
 
             const relativePath = normalizeAttachmentMarkdownHref(path.relative(bundleRoot, absolutePath));
-            if (!relativePath || relativePath.startsWith('..')) return;
+            if (!relativePath || relativePath.startsWith('..') || seen.has(relativePath)) return;
+            seen.add(relativePath);
             entries.push({
                 relativePath,
                 sha256: hashBuffer(fs.readFileSync(absolutePath)),
@@ -10542,7 +12637,9 @@ function collectBundleCurrentResourceEntries(bundlePath) {
         visit(sourceRoot);
     };
 
-    visitRoot('assets');
+    visitRoot(path.join('attachments', IMAGE_RESOURCE_DIR_NAME));
+    visitRoot(IMAGE_RESOURCE_DIR_NAME);
+    visitRoot(LEGACY_IMAGE_RESOURCE_DIR_NAME);
     visitRoot('attachments');
     entries.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
     return entries;
@@ -10896,7 +12993,7 @@ function updateHistorySnapshotMetadata(bundlePath, snapshotId, patch) {
     return true;
 }
 
-function handleEditHistorySnapshotMetadata(bundlePath, snapshotId) {
+async function handleEditHistorySnapshotMetadata(bundlePath, snapshotId) {
     if (!HISTORY_FEATURE_ENABLED) {
         return false;
     }
@@ -10907,9 +13004,19 @@ function handleEditHistorySnapshotMetadata(bundlePath, snapshotId) {
         return false;
     }
 
-    const title = prompt('版本标题', snapshot.title || getHistoryReasonLabel(snapshot.reason));
+    const title = await openTextInputModal({
+        title: '版本标题',
+        message: '请输入版本标题。',
+        defaultValue: snapshot.title || getHistoryReasonLabel(snapshot.reason),
+        confirmText: '下一步'
+    });
     if (title === null) return false;
-    const note = prompt('版本备注', snapshot.note || '');
+    const note = await openTextInputModal({
+        title: '版本备注',
+        message: '请输入版本备注。',
+        defaultValue: snapshot.note || '',
+        confirmText: '保存'
+    });
     if (note === null) return false;
 
     const updated = updateHistorySnapshotMetadata(bundlePath, snapshotId, { title, note });
@@ -10982,17 +13089,14 @@ function saveHistorySnapshotToPath(sourceBundlePath, snapshot, targetBundlePath)
     }
 
     ensureBundleStructure(normalizedTargetBundlePath);
-    const assetsDir = path.join(normalizedTargetBundlePath, 'assets');
     const attachmentsDir = path.join(normalizedTargetBundlePath, 'attachments');
-    removeDirectoryIfExists(assetsDir);
     removeDirectoryIfExists(attachmentsDir);
-    ensureDirectory(assetsDir);
     ensureDirectory(attachmentsDir);
 
     const filesRoot = path.join(getBundleHistoryRoot(normalizedSourceBundlePath), HISTORY_FILE_POOL_DIR);
     for (const resource of snapshot.resources || []) {
-        const relativePath = normalizeAttachmentMarkdownHref(resource.relativePath || '');
-        if (!relativePath || (!relativePath.startsWith('assets/') && !relativePath.startsWith('attachments/'))) {
+        const relativePath = normalizeImageResourceHrefForWrite(normalizeAttachmentMarkdownHref(resource.relativePath || ''));
+        if (!relativePath || !relativePath.startsWith('attachments/')) {
             continue;
         }
 
@@ -11252,7 +13356,7 @@ function renderHistoryPanel() {
             const warningText = healthState.ok
                 ? ''
                 : `\n\n注意：这个快照缺少 ${healthState.missingResources.length} 个资源文件，恢复全部时这些资源无法还原。`;
-            if (!confirm(`要恢复这个版本的正文、assets 和 attachments 吗？当前状态会先创建“恢复前”快照。${warningText}`)) {
+            if (!confirm(`要恢复这个版本的正文、images 和 attachments 吗？当前状态会先创建“恢复前”快照。${warningText}`)) {
                 return;
             }
             selectedHistorySnapshotId = snapshotMeta.id;
@@ -11452,6 +13556,46 @@ function copyNamedEntries(sourceDir, targetDir, entryNames) {
     }
 }
 
+function copyUsedImageEntriesToAttachments(sourceBundlePath, targetBundlePath, usedImageEntries) {
+    if (!sourceBundlePath || !targetBundlePath || !usedImageEntries || !usedImageEntries.size) {
+        return;
+    }
+
+    const normalizedSourceBundlePath = path.resolve(sourceBundlePath);
+    const targetImagesDir = getImageResourceDirPath(path.resolve(targetBundlePath));
+    ensureDirectory(targetImagesDir);
+
+    for (const entryName of usedImageEntries) {
+        if (!entryName) continue;
+
+        const targetPath = path.join(targetImagesDir, entryName);
+        const candidates = [
+            ...getImageResourceDirCandidates(normalizedSourceBundlePath),
+            path.join(normalizedSourceBundlePath, 'attachments', IMAGE_RESOURCE_DIR_NAME),
+            path.join(normalizedSourceBundlePath, 'attachments')
+        ];
+
+        let sourcePath = '';
+        for (const candidateDir of candidates) {
+            const candidatePath = path.join(candidateDir, entryName);
+            if (fs.existsSync(candidatePath)) {
+                sourcePath = candidatePath;
+                break;
+            }
+        }
+
+        if (!sourcePath) {
+            continue;
+        }
+
+        if (path.resolve(sourcePath) === path.resolve(targetPath)) {
+            continue;
+        }
+
+        copyPathRecursive(sourcePath, targetPath);
+    }
+}
+
 function toMarkdownRelativeLink(relativePath) {
     return relativePath
         .split(path.sep)
@@ -11568,77 +13712,96 @@ function insertPdfAttachment(relativePath) {
 }
 
 async function handleAttachmentPath(sourcePath, stat = null) {
-    if (!window.currentPath) {
-        alert("请先打开项目！");
-        return;
-    }
+    return runHistoryTransaction('导入附件', async () => {
+        const bundlePath = window.currentPath;
+        if (!bundlePath) {
+            alert("请先打开项目！");
+            return;
+        }
 
-    const sourceStat = stat || fs.statSync(sourcePath);
-    const attachmentsDir = ensureAttachmentsDir();
-    const normalizedSourcePath = path.resolve(sourcePath);
-    const relativeToAttachments = path.relative(attachmentsDir, normalizedSourcePath);
+        const sourceStat = stat || fs.statSync(sourcePath);
+        const attachmentsDir = ensureAttachmentsDir();
+        const normalizedSourcePath = path.resolve(sourcePath);
+        const relativeToAttachments = path.relative(attachmentsDir, normalizedSourcePath);
 
-    if (relativeToAttachments && !relativeToAttachments.startsWith('..') && !path.isAbsolute(relativeToAttachments)) {
-        const relativePath = path.join('attachments', relativeToAttachments);
+        if (relativeToAttachments && !relativeToAttachments.startsWith('..') && !path.isAbsolute(relativeToAttachments)) {
+            const relativePath = path.join('attachments', relativeToAttachments);
+            if (!sourceStat.isDirectory() && isVideoFilePath(normalizedSourcePath)) {
+                insertVideoAttachment(relativePath);
+                return;
+            }
+            if (!sourceStat.isDirectory() && isPdfFilePath(normalizedSourcePath)) {
+                insertPdfAttachment(relativePath);
+                return;
+            }
+            insertAttachmentLink(relativePath);
+            return;
+        }
+
+        const entryName = generateUniqueEntryName(attachmentsDir, path.basename(normalizedSourcePath));
+        const targetPath = path.join(attachmentsDir, entryName);
+        const historyEntryId = createHistoryEntryId();
+
+        recordHistoryAttachmentStep({
+            kind: 'attachment-import',
+            label: '导入附件',
+            undo() {
+                return moveEntryToSessionHistoryForBundle(bundlePath, 'attachments', entryName, historyEntryId);
+            },
+            redo() {
+                return restoreEntryFromSessionHistoryForBundle(bundlePath, 'attachments', entryName, historyEntryId);
+            }
+        });
+
+        if (sourceStat.isDirectory()) {
+            const folderLabel = path.basename(normalizedSourcePath) || '附件文件夹';
+            showImportProgressModal({
+                title: '正在导入附件文件夹',
+                detail: `${folderLabel} · 正在分析内容…`,
+                total: 0,
+                completed: 0
+            });
+            setWorkspaceBusy('正在导入附件文件夹…');
+            try {
+                await yieldToUiFrame();
+                const totalEntries = Math.max(await countPathEntriesAsync(normalizedSourcePath), 1);
+                const progressState = { completed: 0 };
+                setImportProgressModalProgress(0, totalEntries, `${folderLabel} · 0/${totalEntries}`);
+                await copyPathRecursiveAsync(normalizedSourcePath, targetPath, {
+                    totalEntries,
+                    progressState,
+                    onProgress: (completed, total) => {
+                        setImportProgressModalProgress(
+                            completed,
+                            total,
+                            `${folderLabel} · ${completed}/${total}`
+                        );
+                    }
+                });
+            } finally {
+                hideImportProgressModal();
+                clearWorkspaceBusy();
+            }
+        } else {
+            await copyFileRobustAsync(normalizedSourcePath, targetPath, sourceStat);
+        }
+
+        if (activeHistoryTransaction && activeHistoryTransaction.tabId !== activeTabId) {
+            return;
+        }
+
+        const insertedRelativePath = path.join('attachments', entryName);
         if (!sourceStat.isDirectory() && isVideoFilePath(normalizedSourcePath)) {
-            insertVideoAttachment(relativePath);
+            insertVideoAttachment(insertedRelativePath);
             return;
         }
         if (!sourceStat.isDirectory() && isPdfFilePath(normalizedSourcePath)) {
-            insertPdfAttachment(relativePath);
+            insertPdfAttachment(insertedRelativePath);
             return;
         }
-        insertAttachmentLink(relativePath);
-        return;
-    }
 
-    const entryName = generateUniqueEntryName(attachmentsDir, path.basename(normalizedSourcePath));
-    const targetPath = path.join(attachmentsDir, entryName);
-
-    if (sourceStat.isDirectory()) {
-        const folderLabel = path.basename(normalizedSourcePath) || '附件文件夹';
-        showImportProgressModal({
-            title: '正在导入附件文件夹',
-            detail: `${folderLabel} · 正在分析内容…`,
-            total: 0,
-            completed: 0
-        });
-        setWorkspaceBusy('正在导入附件文件夹…');
-        try {
-            await yieldToUiFrame();
-            const totalEntries = Math.max(await countPathEntriesAsync(normalizedSourcePath), 1);
-            const progressState = { completed: 0 };
-            setImportProgressModalProgress(0, totalEntries, `${folderLabel} · 0/${totalEntries}`);
-            await copyPathRecursiveAsync(normalizedSourcePath, targetPath, {
-                totalEntries,
-                progressState,
-                onProgress: (completed, total) => {
-                    setImportProgressModalProgress(
-                        completed,
-                        total,
-                        `${folderLabel} · ${completed}/${total}`
-                    );
-                }
-            });
-        } finally {
-            hideImportProgressModal();
-            clearWorkspaceBusy();
-        }
-    } else {
-        await copyFileRobustAsync(normalizedSourcePath, targetPath, sourceStat);
-    }
-
-    const insertedRelativePath = path.join('attachments', entryName);
-    if (!sourceStat.isDirectory() && isVideoFilePath(normalizedSourcePath)) {
-        insertVideoAttachment(insertedRelativePath);
-        return;
-    }
-    if (!sourceStat.isDirectory() && isPdfFilePath(normalizedSourcePath)) {
-        insertPdfAttachment(insertedRelativePath);
-        return;
-    }
-
-    insertAttachmentLink(insertedRelativePath);
+        insertAttachmentLink(insertedRelativePath);
+    });
 }
 
 
@@ -11646,14 +13809,36 @@ async function handleAttachmentPath(sourcePath, stat = null) {
 // 图片保存
 // ==============================
 function saveImage(buffer) {
-    const assetsDir = path.join(window.currentPath, 'assets');
-    ensureDirectory(assetsDir);
+    const bundlePath = window.currentPath;
+    const imagesDir = getImageResourceDirPath(bundlePath);
+    ensureDirectory(imagesDir);
 
-    const filename = generateFileName(assetsDir);
-    const filePath = path.join(assetsDir, filename);
+    const filename = generateFileName(imagesDir, {
+        extension: '.png'
+    });
+    const filePath = path.join(imagesDir, filename);
+    const historyEntryId = createHistoryEntryId();
+    const historyEntryName = path.join(IMAGE_RESOURCE_DIR_NAME, filename);
+
+    if (activeHistoryTransaction && activeHistoryTransaction.tabId === getActiveTab()?.id) {
+        recordHistoryAttachmentStep({
+            kind: 'attachment-import',
+            label: '插入图片',
+            undo() {
+                return moveEntryToSessionHistoryForBundle(bundlePath, 'attachments', historyEntryName, historyEntryId);
+            },
+            redo() {
+                return restoreEntryFromSessionHistoryForBundle(bundlePath, 'attachments', historyEntryName, historyEntryId);
+            }
+        });
+    }
 
     fs.writeFileSync(filePath, buffer);
-    const relativePath = `assets/${filename}`;
+    if (activeHistoryTransaction && activeHistoryTransaction.tabId !== activeTabId) {
+        return;
+    }
+
+    const relativePath = `attachments/${IMAGE_RESOURCE_DIR_NAME}/${filename}`;
     if (window.editor && typeof window.editor.insertImage === 'function') {
         window.editor.insertImage(relativePath, { alt: filename });
         return;
@@ -11853,7 +14038,7 @@ function importReferencedEntryIntoCurrentBundle(absolutePath, options = {}) {
     const topLevelDir = relativeInsideBundle.split('/')[0];
     const sourceStat = fs.statSync(normalizedSourcePath);
     const shouldTreatAsImage = (
-        topLevelDir === 'assets'
+        (topLevelDir === IMAGE_RESOURCE_DIR_NAME || topLevelDir === LEGACY_IMAGE_RESOURCE_DIR_NAME || topLevelDir === 'attachments')
         && !sourceStat.isDirectory()
         && isImageFilePath(normalizedSourcePath)
     );
@@ -11861,7 +14046,7 @@ function importReferencedEntryIntoCurrentBundle(absolutePath, options = {}) {
     if (path.resolve(sourceBundlePath) === currentBundlePath) {
         return {
             relativePath: shouldTreatAsImage
-                ? toMarkdownRelativeLink(relativeInsideBundle)
+                ? toMarkdownRelativeLink(normalizeImageResourceHrefForWrite(relativeInsideBundle))
                 : toMarkdownRelativeLink(relativeInsideBundle),
             kind: shouldTreatAsImage ? 'image' : 'attachment',
             absolutePath: normalizedSourcePath
@@ -11869,34 +14054,111 @@ function importReferencedEntryIntoCurrentBundle(absolutePath, options = {}) {
     }
 
     const targetRootDir = shouldTreatAsImage
-        ? path.join(currentBundlePath, 'assets')
+        ? getImageResourceDirPath(currentBundlePath)
         : path.join(currentBundlePath, 'attachments');
     ensureDirectory(targetRootDir);
 
     const entryName = generateUniqueEntryName(targetRootDir, path.basename(normalizedSourcePath));
     const targetPath = path.join(targetRootDir, entryName);
+    const targetHistoryEntryId = createHistoryEntryId();
+    const targetHistoryEntryName = shouldTreatAsImage
+        ? path.join(IMAGE_RESOURCE_DIR_NAME, entryName)
+        : entryName;
+    let importSourcePath = normalizedSourcePath;
+    let importSourceStat = sourceStat;
+    let sourceHistoryEntryId = '';
+    let sourceBackupPath = '';
+    const backupInfo = shouldMoveSourceEntry
+        ? getBundleEntryBackupInfo(normalizedSourcePath, normalizedSourceBundlePath)
+        : null;
 
-    if (shouldMoveSourceEntry) {
-        const backupInfo = getBundleEntryBackupInfo(normalizedSourcePath, normalizedSourceBundlePath);
-        if (backupInfo) {
-            backupEntryToRecoveryForBundle(
-                backupInfo.bundlePath,
-                backupInfo.kind,
-                backupInfo.entryName
-            );
+    if (shouldMoveSourceEntry && backupInfo) {
+        sourceHistoryEntryId = createHistoryEntryId();
+        sourceBackupPath = path.join(
+            getSessionHistoryEntryRoot(normalizedSourceBundlePath, sourceHistoryEntryId),
+            backupInfo.kind,
+            backupInfo.entryName
+        );
+        if (moveEntryToSessionHistoryForBundle(
+            normalizedSourceBundlePath,
+            backupInfo.kind,
+            backupInfo.entryName,
+            sourceHistoryEntryId
+        )) {
+            importSourcePath = sourceBackupPath;
+            importSourceStat = sourceStat;
         }
     }
 
+    if (activeHistoryTransaction && activeHistoryTransaction.tabId === getActiveTab()?.id) {
+        recordHistoryAttachmentStep({
+            kind: 'attachment-import',
+            label: '导入引用附件',
+            undo() {
+                let didUndo = true;
+                if (fs.existsSync(targetPath)) {
+                    didUndo = moveEntryToSessionHistoryForBundle(
+                        currentBundlePath,
+                        'attachments',
+                        targetHistoryEntryName,
+                        targetHistoryEntryId
+                    );
+                }
+                if (shouldMoveSourceEntry && sourceBackupPath && fs.existsSync(sourceBackupPath)) {
+                    if (!fs.existsSync(normalizedSourcePath)) {
+                        didUndo = restoreEntryFromSessionHistoryForBundle(
+                            normalizedSourceBundlePath,
+                            backupInfo.kind,
+                            backupInfo.entryName,
+                            sourceHistoryEntryId
+                        ) && didUndo;
+                    }
+                }
+                return didUndo;
+            },
+            redo() {
+                if (shouldMoveSourceEntry && sourceBackupPath) {
+                    if (fs.existsSync(normalizedSourcePath)) {
+                        movePathRobustSync(normalizedSourcePath, sourceBackupPath, sourceStat);
+                    }
+                }
+                return restoreEntryFromSessionHistoryForBundle(
+                    currentBundlePath,
+                    'attachments',
+                    targetHistoryEntryName,
+                    targetHistoryEntryId
+                );
+            }
+        });
+    }
+
     if (shouldMoveSourceEntry) {
-        movePathRobustSync(normalizedSourcePath, targetPath, sourceStat);
-    } else if (sourceStat.isDirectory()) {
-        copyPathRecursive(normalizedSourcePath, targetPath, sourceStat);
+        if (sourceHistoryEntryId && sourceBackupPath) {
+            if (fs.existsSync(normalizedSourcePath)) {
+                movePathRobustSync(normalizedSourcePath, sourceBackupPath, sourceStat);
+            }
+            if (fs.existsSync(sourceBackupPath)) {
+                importSourcePath = sourceBackupPath;
+                importSourceStat = fs.statSync(sourceBackupPath);
+            }
+        }
+        if (importSourceStat.isDirectory()) {
+            copyPathRecursive(importSourcePath, targetPath, importSourceStat);
+        } else {
+            copyFileRobustSync(importSourcePath, targetPath, importSourceStat);
+        }
+    } else if (importSourceStat.isDirectory()) {
+        copyPathRecursive(importSourcePath, targetPath, importSourceStat);
     } else {
-        copyFileRobustSync(normalizedSourcePath, targetPath, sourceStat);
+        copyFileRobustSync(importSourcePath, targetPath, importSourceStat);
     }
 
     return {
-        relativePath: toMarkdownRelativeLink(path.join(shouldTreatAsImage ? 'assets' : 'attachments', entryName)),
+        relativePath: toMarkdownRelativeLink(
+            shouldTreatAsImage
+                ? path.join('attachments', IMAGE_RESOURCE_DIR_NAME, entryName)
+                : path.join('attachments', entryName)
+        ),
         kind: shouldTreatAsImage ? 'image' : 'attachment',
         absolutePath: targetPath
     };
@@ -11929,7 +14191,7 @@ async function importReferencedEntryIntoCurrentBundleAsync(absolutePath, options
     const topLevelDir = relativeInsideBundle.split('/')[0];
     const sourceStat = await fs.promises.stat(normalizedSourcePath);
     const shouldTreatAsImage = (
-        topLevelDir === 'assets'
+        (topLevelDir === IMAGE_RESOURCE_DIR_NAME || topLevelDir === LEGACY_IMAGE_RESOURCE_DIR_NAME || topLevelDir === 'attachments')
         && !sourceStat.isDirectory()
         && isImageFilePath(normalizedSourcePath)
     );
@@ -11937,7 +14199,7 @@ async function importReferencedEntryIntoCurrentBundleAsync(absolutePath, options
     if (path.resolve(sourceBundlePath) === currentBundlePath) {
         return {
             relativePath: shouldTreatAsImage
-                ? toMarkdownRelativeLink(relativeInsideBundle)
+                ? toMarkdownRelativeLink(normalizeImageResourceHrefForWrite(relativeInsideBundle))
                 : toMarkdownRelativeLink(relativeInsideBundle),
             kind: shouldTreatAsImage ? 'image' : 'attachment',
             absolutePath: normalizedSourcePath
@@ -11945,35 +14207,84 @@ async function importReferencedEntryIntoCurrentBundleAsync(absolutePath, options
     }
 
     const targetRootDir = shouldTreatAsImage
-        ? path.join(currentBundlePath, 'assets')
+        ? getImageResourceDirPath(currentBundlePath)
         : path.join(currentBundlePath, 'attachments');
     ensureDirectory(targetRootDir);
 
     const entryName = generateUniqueEntryName(targetRootDir, path.basename(normalizedSourcePath));
     const targetPath = path.join(targetRootDir, entryName);
-
+    const targetHistoryEntryId = createHistoryEntryId();
+    const targetHistoryEntryName = shouldTreatAsImage
+        ? path.join(IMAGE_RESOURCE_DIR_NAME, entryName)
+        : entryName;
     let importSourcePath = normalizedSourcePath;
     let importSourceStat = sourceStat;
+    let sourceHistoryEntryId = '';
+    let sourceBackupPath = '';
+    const backupInfo = shouldMoveSourceEntry
+        ? getBundleEntryBackupInfo(normalizedSourcePath, normalizedSourceBundlePath)
+        : null;
 
-    if (shouldMoveSourceEntry) {
-        const backupInfo = getBundleEntryBackupInfo(normalizedSourcePath, normalizedSourceBundlePath);
-        if (backupInfo) {
-            const recoveryPath = path.join(
-                normalizedSourceBundlePath,
-                RECOVERY_DIR_NAME,
-                backupInfo.kind,
-                backupInfo.entryName
-            );
-            moveEntryToRecoveryForBundle(
-                backupInfo.bundlePath,
-                backupInfo.kind,
-                backupInfo.entryName
-            );
-            if (fs.existsSync(recoveryPath)) {
-                importSourcePath = recoveryPath;
-                importSourceStat = await fs.promises.stat(recoveryPath);
-            }
+    if (shouldMoveSourceEntry && backupInfo) {
+        sourceHistoryEntryId = createHistoryEntryId();
+        sourceBackupPath = path.join(
+            getSessionHistoryEntryRoot(normalizedSourceBundlePath, sourceHistoryEntryId),
+            backupInfo.kind,
+            backupInfo.entryName
+        );
+        if (moveEntryToSessionHistoryForBundle(
+            normalizedSourceBundlePath,
+            backupInfo.kind,
+            backupInfo.entryName,
+            sourceHistoryEntryId
+        )) {
+            importSourcePath = sourceBackupPath;
+            importSourceStat = await fs.promises.stat(sourceBackupPath);
         }
+    }
+
+    const historyStep = {
+        kind: 'attachment-import',
+        label: '导入引用附件',
+        async undo() {
+            let didUndo = true;
+            if (fs.existsSync(targetPath)) {
+                didUndo = moveEntryToSessionHistoryForBundle(
+                    currentBundlePath,
+                    'attachments',
+                    targetHistoryEntryName,
+                    targetHistoryEntryId
+                );
+            }
+            if (shouldMoveSourceEntry && sourceBackupPath && fs.existsSync(sourceBackupPath)) {
+                if (!fs.existsSync(normalizedSourcePath)) {
+                    didUndo = restoreEntryFromSessionHistoryForBundle(
+                        normalizedSourceBundlePath,
+                        backupInfo.kind,
+                        backupInfo.entryName,
+                        sourceHistoryEntryId
+                    ) && didUndo;
+                }
+            }
+            return didUndo;
+        },
+        async redo() {
+            if (shouldMoveSourceEntry && sourceBackupPath) {
+                if (fs.existsSync(normalizedSourcePath)) {
+                    movePathRobustSync(normalizedSourcePath, sourceBackupPath, sourceStat);
+                }
+            }
+            return restoreEntryFromSessionHistoryForBundle(
+                currentBundlePath,
+                'attachments',
+                targetHistoryEntryName,
+                targetHistoryEntryId
+            );
+        }
+    };
+
+    if (activeHistoryTransaction && activeHistoryTransaction.tabId === getActiveTab()?.id) {
+        recordHistoryAttachmentStep(historyStep);
     }
 
     if (importSourceStat.isDirectory()) {
@@ -12009,7 +14320,11 @@ async function importReferencedEntryIntoCurrentBundleAsync(absolutePath, options
     }
 
     return {
-        relativePath: toMarkdownRelativeLink(path.join(shouldTreatAsImage ? 'assets' : 'attachments', entryName)),
+        relativePath: toMarkdownRelativeLink(
+            shouldTreatAsImage
+                ? path.join('attachments', IMAGE_RESOURCE_DIR_NAME, entryName)
+                : path.join('attachments', entryName)
+        ),
         kind: shouldTreatAsImage ? 'image' : 'attachment',
         absolutePath: targetPath
     };
@@ -12712,15 +15027,13 @@ function getClipboardPathEntries(event = null) {
 // 下载图片
 // ==============================
 function downloadImage(imageUrl) {
-    const assetsDir = path.join(window.currentPath, 'assets');
-    ensureDirectory(assetsDir);
-
-    const filename = generateFileName(assetsDir);
-    const filePath = path.join(assetsDir, filename);
+    const bundlePath = window.currentPath;
+    const imagesDir = getImageResourceDirPath(bundlePath);
+    ensureDirectory(imagesDir);
 
     let parsedUrl;
     try {
-        parsedUrl = new URL(imageUrl);
+        parsedUrl = new URL(normalizeHttpImageUrlLike(imageUrl));
     } catch {
         alert('图片地址无效，无法下载。');
         return Promise.resolve(false);
@@ -12736,6 +15049,7 @@ function downloadImage(imageUrl) {
     return new Promise((resolve) => {
         let settled = false;
         let receivedBytes = 0;
+        let filePath = '';
         const cleanupPartialFile = () => {
             try {
                 if (fs.existsSync(filePath)) {
@@ -12761,6 +15075,12 @@ function downloadImage(imageUrl) {
             const statusCode = Number(res.statusCode || 0);
             const contentType = String(res.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
             const contentLength = Number(res.headers['content-length'] || 0);
+            const filename = generateFileName(imagesDir, {
+                extension: getImageFileExtensionFromMimeType(contentType)
+            });
+            filePath = path.join(imagesDir, filename);
+            const historyEntryId = createHistoryEntryId();
+            const historyEntryName = path.join(IMAGE_RESOURCE_DIR_NAME, filename);
 
             if (statusCode < 200 || statusCode >= 300) {
                 res.resume();
@@ -12801,7 +15121,23 @@ function downloadImage(imageUrl) {
 
             stream.on('finish', () => {
                 stream.close(() => {
-                    const relativePath = `assets/${filename}`;
+                    if (activeHistoryTransaction && activeHistoryTransaction.tabId === getActiveTab()?.id) {
+                        recordHistoryAttachmentStep({
+                            kind: 'attachment-import',
+                            label: '下载图片',
+                            undo() {
+                                return moveEntryToSessionHistoryForBundle(bundlePath, 'attachments', historyEntryName, historyEntryId);
+                            },
+                            redo() {
+                                return restoreEntryFromSessionHistoryForBundle(bundlePath, 'attachments', historyEntryName, historyEntryId);
+                            }
+                        });
+                    }
+                    if (activeHistoryTransaction && activeHistoryTransaction.tabId !== activeTabId) {
+                        finish(false);
+                        return;
+                    }
+                    const relativePath = `attachments/${IMAGE_RESOURCE_DIR_NAME}/${filename}`;
                     if (window.editor && typeof window.editor.insertImage === 'function') {
                         window.editor.insertImage(relativePath, { alt: filename });
                     } else {
@@ -12859,12 +15195,12 @@ function insertMarkdown(text) {
 
 function getUsedImageEntries(markdown) {
     const used = new Set();
-    const markdownRegex = /!\[.*?\]\((?:\.?\/)?assets\/([^)]+)\)/g;
-    const htmlRegex = /<img\b[^>]*\bsrc\s*=\s*(?:"((?:\.?\/)?assets\/[^"]+)"|'((?:\.?\/)?assets\/[^']+)'|((?:\.?\/)?assets\/[^\s>]+))[^>]*>/gi;
+    const markdownRegex = /!\[.*?\]\((?:\.?\/)?(?:attachments\/images|images|assets|attachments)\/([^)]+)\)/g;
+    const htmlRegex = /<img\b[^>]*\bsrc\s*=\s*(?:"((?:\.?\/)?(?:attachments\/images|images|assets|attachments)\/[^"]+)"|'((?:\.?\/)?(?:attachments\/images|images|assets|attachments)\/[^']+)'|((?:\.?\/)?(?:attachments\/images|images|assets|attachments)\/[^\s>]+))[^>]*>/gi;
 
     let match;
     while ((match = markdownRegex.exec(markdown))) {
-        const decodedPath = decodeRelativePathSegments(match[1] || '');
+        const decodedPath = decodeRelativePathSegments(normalizeImageResourceRelativePath(match[1] || ''));
         const normalized = decodedPath.replace(/\\/g, '/').replace(/^\/+/, '');
         const topLevelEntry = normalized.split('/')[0];
 
@@ -12875,7 +15211,7 @@ function getUsedImageEntries(markdown) {
 
     while ((match = htmlRegex.exec(markdown))) {
         const src = match[1] || match[2] || match[3] || '';
-        const decodedPath = decodeRelativePathSegments(normalizePreviewImageSourceRef(src).replace(/^assets\//, ''));
+        const decodedPath = decodeRelativePathSegments(normalizeImageResourceRelativePath(src));
         const normalized = decodedPath.replace(/\\/g, '/').replace(/^\/+/, '');
         const topLevelEntry = normalized.split('/')[0];
 
@@ -12884,6 +15220,39 @@ function getUsedImageEntries(markdown) {
         }
     }
 
+    return used;
+}
+
+function getUsedImageEntriesFromDocumentJson(documentJson) {
+    const used = new Set();
+    const root = documentJson && typeof documentJson === 'object' ? documentJson : null;
+    if (!root) {
+        return used;
+    }
+
+    const visit = (node) => {
+        if (!node || typeof node !== 'object') {
+            return;
+        }
+
+        if (node.type === 'image') {
+            const rawSrc = String(node.attrs?.src || '').trim();
+            const normalizedSrc = decodeRelativePathSegments(normalizeImageResourceRelativePath(rawSrc));
+            const normalized = normalizedSrc.replace(/\\/g, '/').replace(/^\/+/, '');
+            const topLevelEntry = normalized.split('/')[0];
+            if (topLevelEntry) {
+                used.add(topLevelEntry);
+            }
+        }
+
+        if (Array.isArray(node.content)) {
+            for (const child of node.content) {
+                visit(child);
+            }
+        }
+    };
+
+    visit(root);
     return used;
 }
 
@@ -12945,64 +15314,32 @@ function replaceEditorLine(lineNumber, newLineText, options = {}) {
 }
 
 function replaceEditorLines(startLine, endLine, newLines, options = {}) {
-    if (!window.editor) return;
+    if (!isUsingFallbackEditor || !fallbackTextarea) return;
 
-    if (typeof window.editor.replaceLines === 'function') {
-        window.editor.replaceLines(startLine, endLine, newLines, options);
-        return;
-    }
+    const value = fallbackTextarea.value;
+    const lines = value.split('\n');
+    const startIndex = getIndexFromLineAndColumn(value, startLine, 1);
+    const endIndex = endLine < lines.length
+        ? getIndexFromLineAndColumn(value, endLine + 1, 1)
+        : value.length;
+    const replacementText = newLines.join('\n') + (endLine < lines.length ? '\n' : '');
 
-    if (isUsingFallbackEditor && fallbackTextarea) {
-        const value = fallbackTextarea.value;
-        const lines = value.split('\n');
-        const startIndex = getIndexFromLineAndColumn(value, startLine, 1);
-        const endIndex = endLine < lines.length
-            ? getIndexFromLineAndColumn(value, endLine + 1, 1)
-            : value.length;
-        const replacementText = newLines.join('\n') + (endLine < lines.length ? '\n' : '');
+    pushFallbackUndoSnapshot(createFallbackSnapshot(fallbackTextarea));
+    fallbackRedoStack = [];
+    fallbackTextarea.value = value.slice(0, startIndex) + replacementText + value.slice(endIndex);
 
-        pushFallbackUndoSnapshot(createFallbackSnapshot(fallbackTextarea));
-        fallbackRedoStack = [];
-        fallbackTextarea.value = value.slice(0, startIndex) + replacementText + value.slice(endIndex);
-
-        const selectionStart = getIndexFromLineAndColumn(fallbackTextarea.value, startLine, 1);
-        const selectionEndLine = startLine + Math.max(newLines.length - 1, 0);
-        const selectionEnd = getIndexFromLineAndColumn(
-            fallbackTextarea.value,
-            selectionEndLine,
-            (newLines[newLines.length - 1] || '').length + 1
-        );
-
-        fallbackTextarea.setSelectionRange(selectionStart, selectionEnd);
-        renderFallbackHighlight(fallbackTextarea, fallbackHighlightLayer);
-        handleEditorContentChanged();
-        return;
-    }
-
-    const model = typeof window.editor.getModel === 'function' ? window.editor.getModel() : null;
-    if (!model || typeof monaco === 'undefined') return;
-
-    const range = new monaco.Range(
-        startLine,
-        1,
-        endLine,
-        model.getLineMaxColumn(endLine)
+    const selectionStart = getIndexFromLineAndColumn(fallbackTextarea.value, startLine, 1);
+    const selectionEndLine = startLine + Math.max(newLines.length - 1, 0);
+    const selectionEnd = getIndexFromLineAndColumn(
+        fallbackTextarea.value,
+        selectionEndLine,
+        (newLines[newLines.length - 1] || '').length + 1
     );
 
-    window.editor.pushUndoStop();
-    window.editor.executeEdits('todo-lines', [{
-        range,
-        text: newLines.join('\n')
-    }]);
-
-    const selectionEndLine = startLine + Math.max(newLines.length - 1, 0);
-    const selectionEndColumn = (newLines[newLines.length - 1] || '').length + 1;
-
-    if (typeof window.editor.setSelection === 'function') {
-        window.editor.setSelection(new monaco.Range(startLine, 1, selectionEndLine, selectionEndColumn));
-    }
-
-    window.editor.pushUndoStop();
+    fallbackTextarea.setSelectionRange(selectionStart, selectionEnd);
+    renderFallbackHighlight(fallbackTextarea, fallbackHighlightLayer);
+    handleEditorContentChanged();
+    return;
 }
 
 function normalizeLineAsTodo(line, checked = false) {
@@ -13041,8 +15378,8 @@ function updateBundleStatus(folderPath) {
     updateWindowTitle();
 }
 
-function loadBundleContent(folderPath, content) {
-    openTabWithContent(folderPath, content);
+function loadBundleContent(folderPath, content, options = {}) {
+    openTabWithContent(folderPath, content, options);
     pendingWorkspaceRevealPath = null;
 }
 
@@ -13051,47 +15388,105 @@ function ensureBundleStructure(folderPath) {
         throw new Error("目标路径已存在同名文件，请换一个名称或先删除该文件。");
     }
 
+    migrateLegacyRecoveryRoot(folderPath);
     ensureDirectory(folderPath);
-    ensureDirectory(path.join(folderPath, 'assets'));
     ensureDirectory(path.join(folderPath, 'attachments'));
+    ensureDirectory(getImageResourceDirPath(folderPath));
 }
 
-function saveBundleSnapshotToPath(folderPath, markdown, sourceBundlePath = window.currentPath) {
+function removeLegacyImageStorageDirs(folderPath) {
+    if (!folderPath) return;
+    removeDirectoryIfExists(getOldImageResourceDirPath(folderPath));
+    removeDirectoryIfExists(getLegacyImageResourceDirPath(folderPath));
+}
+
+function writeBundlePackageToPath(folderPath, markdown, documentJson = null, sourceBundlePath = window.currentPath, options = {}) {
     ensureBundleStructure(folderPath);
 
-    const assetsDir = path.join(folderPath, 'assets');
+    const imagesDir = getImageResourceDirPath(folderPath);
     const attachmentsDir = path.join(folderPath, 'attachments');
+    const normalizedTargetBundlePath = path.resolve(String(folderPath));
+    const normalizedSourceBundlePath = sourceBundlePath ? path.resolve(String(sourceBundlePath)) : '';
+    const isSameBundlePath = normalizedSourceBundlePath && normalizedSourceBundlePath === normalizedTargetBundlePath;
+    const resolvedMarkdown = String(markdown || '');
+    const markdownForWrite = normalizeMarkdownImageResourcePaths(resolvedMarkdown);
+    const nextDocumentJson = normalizeDocumentJsonImageResourcePaths(
+        cloneSerializableValue(documentJson) || createDocumentJsonFromMarkdown(resolvedMarkdown) || null
+    );
 
-    removeDirectoryIfExists(assetsDir);
-    removeDirectoryIfExists(attachmentsDir);
-    ensureDirectory(assetsDir);
+    if (!isSameBundlePath) {
+        removeDirectoryIfExists(imagesDir);
+        removeDirectoryIfExists(getOldImageResourceDirPath(folderPath));
+        removeDirectoryIfExists(getLegacyImageResourceDirPath(folderPath));
+        removeDirectoryIfExists(attachmentsDir);
+    }
+    ensureDirectory(imagesDir);
     ensureDirectory(attachmentsDir);
 
-    if (sourceBundlePath && fs.existsSync(sourceBundlePath)) {
-        copyNamedEntries(
-            path.join(sourceBundlePath, 'assets'),
-            assetsDir,
-            getUsedImageEntries(markdown)
-        );
-        copyNamedEntries(
-            path.join(sourceBundlePath, 'attachments'),
-            attachmentsDir,
-            getUsedAttachmentEntries(markdown, {
+    if (sourceBundlePath && fs.existsSync(sourceBundlePath) && !isSameBundlePath) {
+        const usedImageEntries = nextDocumentJson
+            ? getUsedImageEntriesFromDocumentJson(nextDocumentJson)
+            : getUsedImageEntries(resolvedMarkdown);
+        copyUsedImageEntriesToAttachments(sourceBundlePath, folderPath, usedImageEntries);
+        const usedAttachmentEntries = nextDocumentJson
+            ? getUsedAttachmentEntriesFromDocumentJson(nextDocumentJson)
+            : getUsedAttachmentEntries(resolvedMarkdown, {
                 preferEditorState: Boolean(
                     sourceBundlePath
                     && window.currentPath
                     && path.resolve(sourceBundlePath) === path.resolve(window.currentPath)
                 )
-            })
+            });
+        copyNamedEntries(
+            path.join(sourceBundlePath, 'attachments'),
+            attachmentsDir,
+            usedAttachmentEntries
         );
+    } else if (sourceBundlePath && fs.existsSync(sourceBundlePath) && isSameBundlePath) {
+        const usedImageEntries = nextDocumentJson
+            ? getUsedImageEntriesFromDocumentJson(nextDocumentJson)
+            : getUsedImageEntries(resolvedMarkdown);
+        copyUsedImageEntriesToAttachments(sourceBundlePath, folderPath, usedImageEntries);
     }
 
-    const preferredFileName = DEFAULT_BUNDLE_MARKDOWN_FILE;
+    const existingManifest = readJsonFileIfExists(getBundleManifestPath(folderPath));
+    const nextManifest = buildBundleManifest(folderPath, {
+        existingManifest,
+        title: options.title || getBundleDisplayTitleFromManifest(folderPath),
+        documentId: options.documentId || existingManifest?.documentId || null
+    });
+
+    writeJsonFile(getBundleManifestPath(folderPath), nextManifest);
+    if (nextDocumentJson) {
+        writeJsonFile(getBundleDocumentJsonPath(folderPath), nextDocumentJson);
+    } else {
+        const staleDocumentJsonPath = getBundleDocumentJsonPath(folderPath);
+        if (staleDocumentJsonPath && fs.existsSync(staleDocumentJsonPath)) {
+            try {
+                fs.rmSync(staleDocumentJsonPath, { force: true });
+            } catch {
+                // ignore cleanup failures
+            }
+        }
+    }
+
     const markdownFilePath = resolveBundleMarkdownFilePath(folderPath, {
-        preferredName: preferredFileName,
+        preferredName: DEFAULT_BUNDLE_MARKDOWN_FILE,
         createIfMissing: true
     });
-    fs.writeFileSync(markdownFilePath, markdown, 'utf-8');
+    fs.writeFileSync(markdownFilePath, markdownForWrite, 'utf-8');
+
+    removeLegacyImageStorageDirs(folderPath);
+
+    return {
+        manifest: nextManifest,
+        documentJson: nextDocumentJson,
+        markdownPath: markdownFilePath
+    };
+}
+
+function saveBundleSnapshotToPath(folderPath, markdown, sourceBundlePath = window.currentPath, documentJson = null, options = {}) {
+    return writeBundlePackageToPath(folderPath, markdown, documentJson, sourceBundlePath, options);
 }
 
 function needsBundleFormatMigration(bundlePath) {
@@ -13184,11 +15579,13 @@ function migrateBundleToKangarooFormat(bundlePath, markdown = '') {
 
 function getDefaultSaveAsPath() {
     if (window.currentPath) {
-        const currentBaseName = stripKnownBundleExtension(path.basename(window.currentPath)) || path.basename(window.currentPath);
+        const currentBaseName = sanitizeFileNameSegment(
+            stripKnownBundleExtension(path.basename(window.currentPath)) || path.basename(window.currentPath)
+        );
         if (isValidTextBundlePath(window.currentPath)) {
             return `${currentBaseName}${DEFAULT_BUNDLE_EXTENSION}`;
         }
-        return path.basename(window.currentPath);
+        return sanitizeFileNameSegment(path.basename(window.currentPath));
     }
 
     return `我的文档${DEFAULT_BUNDLE_EXTENSION}`;
@@ -13219,7 +15616,7 @@ function listMarkdownFilesRecursively(folderPath, results = []) {
 }
 
 function generateUniqueBundlePathInDirectory(targetDir, baseName, reservedPaths = null) {
-    const sanitizedBaseName = stripKnownBundleExtension(baseName || '未命名文档');
+    const sanitizedBaseName = sanitizeFileNameSegment(stripKnownBundleExtension(baseName || '未命名文档'));
     let candidateName = `${sanitizedBaseName}${DEFAULT_BUNDLE_EXTENSION}`;
     let counter = 2;
     let candidatePath = path.join(targetDir, candidateName);
@@ -13289,8 +15686,8 @@ function transformImportedMarkdown(content, context) {
     } = context;
 
     const sourceDir = path.dirname(sourceFilePath);
-    const bundleAssetsDir = path.join(bundlePath, 'assets');
     const bundleAttachmentsDir = path.join(bundlePath, 'attachments');
+    const bundleImagesDir = getImageResourceDirPath(bundlePath);
 
     const rewriteLocalHref = (href, options = {}) => {
         const normalizedRef = normalizeImportSourceRef(href);
@@ -13317,12 +15714,12 @@ function transformImportedMarkdown(content, context) {
         if (!stat.isDirectory() && isImageFilePath(resolvedSourcePath)) {
             const targetRelativePath = ensureImportedEntryCopy(
                 resolvedSourcePath,
-                bundleAssetsDir,
+                bundleImagesDir,
                 normalizedRefPath,
                 copiedAssets,
                 { flatten: true }
             );
-            return toMarkdownRelativeLink(path.join('assets', targetRelativePath));
+            return toMarkdownRelativeLink(path.join('attachments', IMAGE_RESOURCE_DIR_NAME, targetRelativePath));
         }
 
         const targetRelativePath = ensureImportedEntryCopy(
@@ -13442,14 +15839,27 @@ async function replaceWithAsync(input, regex, replacer) {
 
 async function readBundleContentForOpenAsync(bundlePath) {
     const normalizedBundlePath = path.resolve(bundlePath);
-    const markdownPath = resolveBundleMarkdownFilePath(normalizedBundlePath);
-    if (!markdownPath) {
-        throw new Error('所选文件夹缺少 text.md 或 text.markdown，不是有效的 Kangaroo bundle。');
+    const markdownPath = resolveBundleMarkdownFilePath(normalizedBundlePath, {
+        createIfMissing: false
+    });
+    const manifestPath = getBundleManifestPath(normalizedBundlePath);
+    const documentJsonPath = getBundleDocumentJsonPath(normalizedBundlePath);
+    const hasPrivateStructure = fs.existsSync(manifestPath) && fs.existsSync(documentJsonPath);
+
+    if (!markdownPath && !hasPrivateStructure) {
+        throw new Error('所选文件夹缺少 text.md、text.markdown 或 private format 文件，不是有效的 Kangaroo bundle。');
     }
 
+    const content = markdownPath && fs.existsSync(markdownPath)
+        ? await fs.promises.readFile(markdownPath, 'utf-8')
+        : '';
+
     return {
-        markdownPath,
-        content: await fs.promises.readFile(markdownPath, 'utf-8')
+        markdownPath: markdownPath || path.join(normalizedBundlePath, DEFAULT_BUNDLE_MARKDOWN_FILE),
+        content,
+        manifest: hasPrivateStructure ? readJsonFileIfExists(manifestPath) : null,
+        documentJson: hasPrivateStructure ? readJsonFileIfExists(documentJsonPath) : null,
+        isPrivateFormat: hasPrivateStructure
     };
 }
 
@@ -13467,8 +15877,8 @@ function normalizeBundleToKangarooFormat(bundlePath) {
         fs.renameSync(resolvedMarkdownPath, standardMarkdownPath);
     }
 
-    const assetsDir = path.join(normalizedBundlePath, 'assets');
     const attachmentsDir = path.join(normalizedBundlePath, 'attachments');
+    const imagesDir = getImageResourceDirPath(normalizedBundlePath);
     const movedAssets = new Map();
     const movedAttachments = new Map();
     const sourceDir = path.dirname(standardMarkdownPath);
@@ -13487,8 +15897,8 @@ function normalizeBundleToKangarooFormat(bundlePath) {
 
         const stat = fs.statSync(resolvedSourcePath);
         if (!stat.isDirectory() && isImageFilePath(resolvedSourcePath)) {
-            const targetEntryName = ensureNormalizedBundleEntry(resolvedSourcePath, assetsDir, movedAssets);
-            return toMarkdownRelativeLink(path.join('assets', targetEntryName));
+            const targetEntryName = ensureNormalizedBundleEntry(resolvedSourcePath, imagesDir, movedAssets);
+            return toMarkdownRelativeLink(path.join('attachments', IMAGE_RESOURCE_DIR_NAME, targetEntryName));
         }
 
         const targetEntryName = ensureNormalizedBundleEntry(resolvedSourcePath, attachmentsDir, movedAttachments);
@@ -13518,12 +15928,12 @@ function normalizeBundleToKangarooFormat(bundlePath) {
         return `${prefix}[${label}](${nextDestination})`;
     });
 
-    if (nextContent !== rawContent || path.resolve(resolvedMarkdownPath) !== path.resolve(standardMarkdownPath)) {
-        fs.writeFileSync(standardMarkdownPath, nextContent, 'utf-8');
-    }
+    const savedPackage = writeBundlePackageToPath(normalizedBundlePath, nextContent, null, normalizedBundlePath, {
+        title: getCanonicalBundleDisplayName(normalizedBundlePath)
+    });
 
     return {
-        markdownPath: standardMarkdownPath,
+        markdownPath: savedPackage.markdownPath || standardMarkdownPath,
         content: nextContent
     };
 }
@@ -13543,8 +15953,8 @@ async function normalizeBundleToKangarooFormatAsync(bundlePath) {
         await fs.promises.rename(resolvedMarkdownPath, standardMarkdownPath);
     }
 
-    const assetsDir = path.join(normalizedBundlePath, 'assets');
     const attachmentsDir = path.join(normalizedBundlePath, 'attachments');
+    const imagesDir = getImageResourceDirPath(normalizedBundlePath);
     const movedAssets = new Map();
     const movedAttachments = new Map();
     const sourceDir = path.dirname(standardMarkdownPath);
@@ -13563,8 +15973,8 @@ async function normalizeBundleToKangarooFormatAsync(bundlePath) {
 
         const stat = await fs.promises.stat(resolvedSourcePath);
         if (!stat.isDirectory() && isImageFilePath(resolvedSourcePath)) {
-            const targetEntryName = await ensureNormalizedBundleEntryAsync(resolvedSourcePath, assetsDir, movedAssets);
-            return toMarkdownRelativeLink(path.join('assets', targetEntryName));
+            const targetEntryName = await ensureNormalizedBundleEntryAsync(resolvedSourcePath, imagesDir, movedAssets);
+            return toMarkdownRelativeLink(path.join('attachments', IMAGE_RESOURCE_DIR_NAME, targetEntryName));
         }
 
         const targetEntryName = await ensureNormalizedBundleEntryAsync(resolvedSourcePath, attachmentsDir, movedAttachments);
@@ -13597,12 +16007,12 @@ async function normalizeBundleToKangarooFormatAsync(bundlePath) {
         return `${prefix}[${label}](${nextDestination})`;
     });
 
-    if (nextContent !== rawContent || path.resolve(resolvedMarkdownPath) !== path.resolve(standardMarkdownPath)) {
-        await fs.promises.writeFile(standardMarkdownPath, nextContent, 'utf-8');
-    }
+    const savedPackage = writeBundlePackageToPath(normalizedBundlePath, nextContent, null, normalizedBundlePath, {
+        title: getCanonicalBundleDisplayName(normalizedBundlePath)
+    });
 
     return {
-        markdownPath: standardMarkdownPath,
+        markdownPath: savedPackage.markdownPath || standardMarkdownPath,
         content: nextContent
     };
 }
@@ -13649,7 +16059,9 @@ async function importMarkdownFolderToTarget(sourceRootPath, targetRootPath) {
         });
 
         ensureBundleStructure(bundlePath);
-        fs.writeFileSync(path.join(bundlePath, DEFAULT_BUNDLE_MARKDOWN_FILE), transformedContent, 'utf-8');
+        writeBundlePackageToPath(bundlePath, transformedContent, null, null, {
+            title: path.basename(bundlePath, DEFAULT_BUNDLE_EXTENSION)
+        });
         importedBundlePaths.push(bundlePath);
     }
 
@@ -13663,7 +16075,7 @@ async function handleOpenBundle() {
         if (folderPath) {
             await waitForEditorReady();
             const normalized = await readBundleContentForOpenAsync(folderPath);
-            loadBundleContent(folderPath, normalized.content);
+            loadBundleContent(folderPath, normalized.content, normalized);
         }
     } catch (err) {
         alert("打开失败: " + err.message);
@@ -13724,12 +16136,21 @@ async function handleNewBundleInWorkspace() {
 async function openBundleFromExternalPath(folderPath, options = {}) {
     try {
         const normalizedPath = path.resolve(folderPath);
+        const currentBundlePath = window.currentPath ? path.resolve(window.currentPath) : null;
+        if (!options.skipConfirm && currentBundlePath !== normalizedPath) {
+            const shouldContinue = await confirmUnsavedChanges('打开文档');
+            if (!shouldContinue) {
+                return false;
+            }
+        }
         await waitForEditorReady();
         const normalized = await readBundleContentForOpenAsync(normalizedPath);
-        loadBundleContent(normalizedPath, normalized.content);
+        loadBundleContent(normalizedPath, normalized.content, normalized);
         ipcRenderer.send('bundle:clearPendingOpen', normalizedPath);
+        return true;
     } catch (err) {
         alert(`打开失败: ${err.message}`);
+        return false;
     }
 }
 
@@ -13742,8 +16163,11 @@ async function handleNewBundle() {
             ensureBundleStructure(folderPath);
 
             const initialContent = "# 新建文档\n\n在此开始编写内容...";
-            fs.writeFileSync(path.join(folderPath, DEFAULT_BUNDLE_MARKDOWN_FILE), initialContent, 'utf-8');
-            loadBundleContent(folderPath, initialContent);
+            writeBundlePackageToPath(folderPath, initialContent, null, null, {
+                title: getDefaultBundleTitleFromPath(folderPath)
+            });
+            const normalized = await readBundleContentForOpenAsync(folderPath);
+            loadBundleContent(folderPath, normalized.content, normalized);
         }
     } catch (err) {
         alert("创建失败: " + err.message);
@@ -13767,7 +16191,12 @@ async function handleSaveAs() {
         }
 
         const markdown = window.editor.getValue();
-        saveBundleSnapshotToPath(normalizedTargetPath, markdown, window.currentPath);
+        const documentJson = typeof window.editor.getDocumentJson === 'function'
+            ? cloneSerializableValue(window.editor.getDocumentJson())
+            : null;
+        const savedPackage = saveBundleSnapshotToPath(normalizedTargetPath, markdown, window.currentPath, documentJson, {
+            title: getDefaultBundleTitleFromPath(normalizedTargetPath)
+        });
         window.currentPath = normalizedTargetPath;
         preservedUnusedAttachmentEntries.clear();
         updateBundleStatus(normalizedTargetPath);
@@ -13778,6 +16207,8 @@ async function handleSaveAs() {
         if (activeTab) {
             activeTab.path = normalizedTargetPath;
             activeTab.content = markdown;
+            activeTab.documentJson = savedPackage.documentJson || documentJson;
+            activeTab.manifest = savedPackage.manifest || activeTab.manifest;
             activeTab.isDirty = false;
             activeTab.preservedEntries = [];
             renderEditorTabs();
@@ -13792,7 +16223,7 @@ async function handleSaveAs() {
 }
 
 function getDefaultExportHtmlPath(tab) {
-    const exportTitle = getTabTitle(tab) || '未命名文档';
+    const exportTitle = sanitizeFileNameSegment(getTabTitle(tab) || '未命名文档');
 
     if (tab?.path) {
         return path.join(path.dirname(tab.path), `${exportTitle}.html`);
@@ -13825,8 +16256,10 @@ function getBundleResourceType(href) {
         .replace(/^\/+/, '');
 
     if (!normalizedHref) return '';
+    if (normalizedHref.startsWith(`attachments/${IMAGE_RESOURCE_DIR_NAME}/`)) return 'image';
     if (normalizedHref.startsWith('attachments/')) return 'attachment';
-    if (normalizedHref.startsWith('assets/')) return 'asset';
+    if (normalizedHref.startsWith(`${IMAGE_RESOURCE_DIR_NAME}/`)) return 'image';
+    if (normalizedHref.startsWith(`${LEGACY_IMAGE_RESOURCE_DIR_NAME}/`)) return 'asset';
     return '';
 }
 
@@ -13911,7 +16344,9 @@ function transformRenderedHtmlForExport(renderedHtml, options = {}) {
     nextHtml = nextHtml.replace(/<img\b[^>]*>/gi, (tag) => {
         const src = extractHtmlAttribute(tag, 'src') || '';
         const resourceType = getBundleResourceType(src);
-        if (resourceType !== 'asset') {
+        const assetPath = resolveExportAssetPath(src, bundlePath);
+        const isEmbeddedImage = resourceType === 'image' || resourceType === 'asset' || (resourceType === 'attachment' && isImageFilePath(assetPath));
+        if (!isEmbeddedImage) {
             return tag;
         }
 
@@ -13927,6 +16362,10 @@ function transformRenderedHtmlForExport(renderedHtml, options = {}) {
         const href = hrefA || hrefB || hrefC || '';
         const resourceType = getBundleResourceType(href);
         if (!resourceType) {
+            return match;
+        }
+
+        if (resourceType === 'image') {
             return match;
         }
 
@@ -13988,7 +16427,7 @@ function buildSingleFileHtmlExport(markdown, options = {}) {
                 radial-gradient(circle at top right, rgba(197, 226, 190, 0.12), transparent 30%),
                 linear-gradient(180deg, #f7f2ea 0%, var(--page-bg) 100%);
             color: var(--text);
-            font: 17px/1.72 "Charter", "Palatino Linotype", "Songti SC", serif;
+            font: 17px/1.72 "Libre Baskerville", "Noto Serif SC", "Palatino Linotype", serif;
             padding: 40px 24px 56px;
         }
 
@@ -14019,7 +16458,7 @@ function buildSingleFileHtmlExport(markdown, options = {}) {
             margin-top: 10px;
             color: var(--text-soft);
             font-size: 13px;
-            font-family: "SF Pro Display", "PingFang SC", sans-serif;
+            font-family: "IBM Plex Sans", "Noto Sans SC", "Segoe UI", "Helvetica Neue", sans-serif;
         }
 
         .export-content > *:first-child { margin-top: 0; }
@@ -14076,7 +16515,7 @@ function buildSingleFileHtmlExport(markdown, options = {}) {
             padding: 0.16em 0.42em;
             border-radius: 7px;
             font-size: 0.92em;
-            font-family: "SF Mono", "JetBrains Mono", monospace;
+            font-family: "Maple Mono Normal NL CN", "IBM Plex Mono", "JetBrains Mono", "Fira Code", monospace;
         }
 
         .export-content pre {
@@ -14125,7 +16564,7 @@ function buildSingleFileHtmlExport(markdown, options = {}) {
             background: var(--tag-bg);
             border: 1px solid var(--tag-border);
             color: var(--text-soft);
-            font-family: "SF Pro Display", "PingFang SC", sans-serif;
+            font-family: "IBM Plex Sans", "Noto Sans SC", "Segoe UI", "Helvetica Neue", sans-serif;
             font-size: 0.92em;
         }
 
@@ -14206,6 +16645,10 @@ function toggleSelectedLinesAsTodo() {
         if (didToggle) {
             return;
         }
+
+        if (!isUsingFallbackEditor) {
+            return;
+        }
     }
 
     const { startLine, endLine } = getEditorSelectedLineRange();
@@ -14219,18 +16662,20 @@ function toggleSelectedLinesAsTodo() {
 }
 
 function updateTaskLineCheckedState(lineNumber, checked) {
-    const currentLine = getEditorLineText(lineNumber);
-    const taskMatch = currentLine.match(/^(\s*)([-+*])\s+\[([ xX])\]\s*(.*)$/);
-    if (!taskMatch) return;
-
     const nextChecked = Boolean(checked);
-    const wasChecked = String(taskMatch[3] || '').toLowerCase() === 'x';
+    const todoItems = window.editor && typeof window.editor.getTodoItems === 'function'
+        ? window.editor.getTodoItems()
+        : [];
+    const matchedTodo = todoItems.find((item) => Number(item?.lineNumber) === Number(lineNumber)) || null;
+    if (!matchedTodo) return;
 
-    replaceEditorLine(
-        lineNumber,
-        `${taskMatch[1]}${taskMatch[2]} [${nextChecked ? 'x' : ' '}] ${taskMatch[4] || ''}`,
-        { preserveViewport: true }
-    );
+    const wasChecked = Boolean(matchedTodo.checked);
+    if (window.editor && typeof window.editor.setTaskCheckedByKindIndex === 'function') {
+        const didUpdate = window.editor.setTaskCheckedByKindIndex(matchedTodo.kindIndex, nextChecked);
+        if (!didUpdate) {
+            return;
+        }
+    }
 
     if (nextChecked !== wasChecked) {
         const activeTab = getActiveTab();
@@ -14238,29 +16683,23 @@ function updateTaskLineCheckedState(lineNumber, checked) {
         if (bundlePath) {
             upsertTodoCompletedTimelineEvent({
                 bundlePath,
-                text: stripTodoCompletionTimestamp(taskMatch[4] || ''),
-                lineNumber
+                text: stripTodoCompletionTimestamp(matchedTodo.text || ''),
+                lineNumber,
+                kindIndex: matchedTodo.kindIndex,
+                stableId: matchedTodo.stableId || null
             }, { checked: nextChecked });
         }
     }
 }
 
 function setSidebarTab(tab) {
-    const normalizedTab = ['workspace', 'timeline', 'outline', 'todo', 'attachment', 'music', 'player', 'pomodoro'].includes(tab) ? tab : 'workspace';
+    const normalizedTab = ['workspace', 'timeline', 'outline', 'todo', 'attachment', 'pomodoro'].includes(tab) ? tab : 'workspace';
     if (
         (normalizedTab === 'timeline' && !isFeatureEnabled('timeline'))
-        || (normalizedTab === 'music' && !isFeatureEnabled('music'))
-        || (normalizedTab === 'player' && !isFeatureEnabled('player'))
         || (normalizedTab === 'pomodoro' && !isFeatureEnabled('pomodoro'))
     ) {
         currentSidebarTab = 'workspace';
         return applyTimelinePanelVisibility(false);
-    }
-
-    if (currentSidebarTab === 'player' && currentRightSidebarTab === 'player' && normalizedTab !== 'player') {
-        rememberWorkspaceVideoPlaybackState({ preservePlayingIntent: true });
-        workspaceVideoIgnorePauseUntil = Date.now() + 1000;
-        parkWorkspaceVideoElement();
     }
 
     currentSidebarTab = normalizedTab;
@@ -14278,11 +16717,7 @@ function setSidebarTab(tab) {
     if (normalizedTab === 'outline') {
         updateOutline();
     } else if (normalizedTab === 'todo') {
-        renderTodoList(getTabMarkdownContent());
-    } else if (normalizedTab === 'music') {
-        ensureWorkspaceMusicPanel();
-    } else if (normalizedTab === 'player') {
-        ensureWorkspaceVideoPanel();
+        renderTodoList(getActiveEditorSnapshot());
     } else if (normalizedTab === 'pomodoro') {
         renderPomodoroPanel();
     }
@@ -14301,24 +16736,429 @@ function getLineNumberAtOffset(content, offset) {
     return model.getPositionAt(offset).lineNumber;
 }
 
-function getTodoItemsFromContent(content) {
+function getDocumentJsonTextContent(node) {
+    if (node == null) {
+        return '';
+    }
+
+    if (typeof node === 'string') {
+        return node;
+    }
+
+    if (typeof node.text === 'string' && node.text) {
+        return node.text;
+    }
+
+    if (Array.isArray(node.content)) {
+        return node.content.map((child) => getDocumentJsonTextContent(child)).join('');
+    }
+
+    return '';
+}
+
+function findFirstTextblockJsonNode(node) {
+    if (!node || typeof node !== 'object' || !Array.isArray(node.content)) {
+        return null;
+    }
+
+    return node.content.find((child) => child && typeof child === 'object' && typeof child.type === 'string' && getDocumentJsonTextContent(child).trim()) || null;
+}
+
+function getTodoItemsFromDocumentJson(documentJson) {
     const todos = [];
-    const lines = content.split('\n');
+    const root = documentJson && typeof documentJson === 'object'
+        ? documentJson
+        : null;
 
-    for (let index = 0; index < lines.length; index++) {
-        const match = lines[index].match(/^(\s*)[-+*]\s+\[([ xX])\]\s*(.*)$/);
-        if (!match) continue;
+    if (!root) {
+        return todos;
+    }
 
-        todos.push({
-            lineNumber: index + 1,
-            checked: match[2].toLowerCase() === 'x',
-            text: stripTodoCompletionTimestamp(match[3] || ''),
-            rawLine: lines[index],
-            kindIndex: todos.length
+    let kindIndex = 0;
+    const walk = (node) => {
+        if (!node || typeof node !== 'object') {
+            return;
+        }
+
+        if (node.type === 'taskItem') {
+            const textNode = findFirstTextblockJsonNode(node) || node;
+            todos.push({
+                lineNumber: kindIndex + 1,
+                checked: Boolean(node.attrs?.checked),
+                text: stripTodoCompletionTimestamp(String(getDocumentJsonTextContent(textNode)).trim()),
+                kindIndex,
+                stableId: String(node.attrs?.id || '').trim() || null,
+                isStructured: true
+            });
+            kindIndex += 1;
+        }
+
+        if (Array.isArray(node.content)) {
+            for (const child of node.content) {
+                walk(child);
+            }
+        }
+    };
+
+    walk(root);
+    return todos;
+}
+
+function getTodoItemsForBundlePath(bundlePath) {
+    if (!bundlePath) {
+        return [];
+    }
+
+    const normalizedTarget = path.resolve(bundlePath);
+    const currentBundlePath = window.currentPath ? path.resolve(window.currentPath) : null;
+    if (currentBundlePath === normalizedTarget && window.editor && typeof window.editor.getTodoItems === 'function') {
+        return window.editor.getTodoItems();
+    }
+
+    const openTab = getOpenTabByBundlePath(normalizedTarget);
+    if (openTab?.documentJson) {
+        return getTodoItemsFromDocumentJson(openTab.documentJson);
+    }
+
+    const manifestPath = getBundleManifestPath(normalizedTarget);
+    const documentJsonPath = getBundleDocumentJsonPath(normalizedTarget);
+    if (fs.existsSync(manifestPath) && fs.existsSync(documentJsonPath)) {
+        const documentJson = readJsonFileIfExists(documentJsonPath);
+        if (documentJson) {
+            return getTodoItemsFromDocumentJson(documentJson);
+        }
+    }
+    return [];
+}
+
+function getDocumentJsonForBundlePath(bundlePath) {
+    if (!bundlePath) {
+        return null;
+    }
+
+    const normalizedTarget = path.resolve(bundlePath);
+    const currentBundlePath = window.currentPath ? path.resolve(window.currentPath) : null;
+    if (currentBundlePath === normalizedTarget && window.editor && typeof window.editor.getDocumentJson === 'function') {
+        return cloneSerializableValue(window.editor.getDocumentJson());
+    }
+
+    const openTab = getOpenTabByBundlePath(normalizedTarget);
+    if (openTab?.documentJson) {
+        return cloneSerializableValue(openTab.documentJson);
+    }
+
+    const manifestPath = getBundleManifestPath(normalizedTarget);
+    const documentJsonPath = getBundleDocumentJsonPath(normalizedTarget);
+    if (!fs.existsSync(manifestPath) || !fs.existsSync(documentJsonPath)) {
+        return null;
+    }
+
+    return readJsonFileIfExists(documentJsonPath);
+}
+
+async function persistTodoBundleUpdate(bundlePath, nextMarkdown, nextDocumentJson = null, options = {}) {
+    if (!bundlePath) {
+        return false;
+    }
+
+    const normalizedTarget = path.resolve(bundlePath);
+    const openTab = getOpenTabByBundlePath(normalizedTarget);
+    const targetTitle = options.title || getDefaultBundleTitleFromPath(normalizedTarget);
+
+    writeBundlePackageToPath(normalizedTarget, nextMarkdown, nextDocumentJson, normalizedTarget, {
+        title: targetTitle
+    });
+
+    if (openTab) {
+        openTab.content = nextMarkdown;
+        openTab.documentJson = cloneSerializableValue(nextDocumentJson);
+        openTab.previousContent = nextMarkdown;
+        openTab.previousIsDirty = false;
+        openTab.isDirty = false;
+    }
+
+    if (options.refreshWorkspaceTree && workspaceRootPath && isSameOrNestedPath(normalizedTarget, path.resolve(workspaceRootPath))) {
+        scheduleWorkspaceTreeRefresh();
+    }
+
+    if (timelinePanelOpen && currentRightSidebarTab === 'timeline') {
+        scheduleTimelinePanelRender();
+    }
+    if (currentRightSidebarTab === 'todo') {
+        renderTodoList(getActiveEditorSnapshot());
+    }
+
+    return true;
+}
+
+async function appendTodoToBundlePath(bundlePath, todoText = '') {
+    if (!bundlePath) {
+        return false;
+    }
+
+    const normalizedTarget = path.resolve(bundlePath);
+    const nextTodoText = getDefaultTodoText(todoText);
+    const currentBundlePath = window.currentPath ? path.resolve(window.currentPath) : null;
+
+    if (currentBundlePath === normalizedTarget && window.editor) {
+        const currentDocumentJson = cloneSerializableValue(window.editor.getDocumentJson?.() || null)
+            || getDocumentJsonForBundlePath(normalizedTarget)
+            || null;
+        const nextDocumentJson = appendTodoTaskToDocumentJson(currentDocumentJson, nextTodoText);
+        if (!nextDocumentJson) {
+            return false;
+        }
+        const nextTaskStableId = getTodoItemsFromDocumentJson(nextDocumentJson).slice(-1)[0]?.stableId || '';
+
+        const applied = typeof window.editor.setDocumentJson === 'function'
+            ? window.editor.setDocumentJson(nextDocumentJson, {
+                emitChange: false,
+                preserveSelection: true,
+                forceRebuild: true
+            })
+            : false;
+        if (!applied) {
+            return false;
+        }
+
+        if (!await saveFile({ silent: true })) {
+            return false;
+        }
+
+        if (timelinePanelOpen && currentRightSidebarTab === 'timeline') {
+            queueTimelineTodoInlineEdit(normalizedTarget, nextTaskStableId, nextTodoText);
+        }
+        scheduleTimelinePanelRender();
+        if (currentRightSidebarTab === 'todo') {
+            renderTodoList(getActiveEditorSnapshot());
+        }
+        return true;
+    }
+
+    const currentDocumentJson = getDocumentJsonForBundlePath(normalizedTarget);
+    if (currentDocumentJson) {
+        const nextDocumentJson = appendTodoTaskToDocumentJson(currentDocumentJson, nextTodoText);
+        if (!nextDocumentJson) {
+            return false;
+        }
+
+        const nextMarkdown = serializeDocumentJsonToMarkdown(nextDocumentJson)
+            || `${String(getMarkdownContentForBundlePath(normalizedTarget) || '').replace(/\s*$/, '')}\n\n- [ ] ${nextTodoText}\n`;
+        const nextTaskStableId = getTodoItemsFromDocumentJson(nextDocumentJson).slice(-1)[0]?.stableId || '';
+        const didPersist = await persistTodoBundleUpdate(normalizedTarget, nextMarkdown, nextDocumentJson, {
+            title: getDefaultBundleTitleFromPath(normalizedTarget)
+        });
+        if (didPersist && timelinePanelOpen && currentRightSidebarTab === 'timeline') {
+            queueTimelineTodoInlineEdit(normalizedTarget, nextTaskStableId, nextTodoText);
+        }
+        return didPersist;
+    }
+
+    const currentMarkdown = getMarkdownContentForBundlePath(normalizedTarget);
+    const nextMarkdown = currentMarkdown
+        ? `${String(currentMarkdown || '').replace(/\s*$/, '')}\n\n- [ ] ${nextTodoText}\n`
+        : `# ${getDefaultBundleTitleFromPath(normalizedTarget)}\n\n- [ ] ${nextTodoText}\n`;
+
+    const didPersist = await persistTodoBundleUpdate(normalizedTarget, nextMarkdown, null, {
+        title: getDefaultBundleTitleFromPath(normalizedTarget)
+    });
+    if (didPersist && timelinePanelOpen && currentRightSidebarTab === 'timeline') {
+        const appendedTodoItems = getTodoItemsForBundlePath(normalizedTarget);
+        const lastTodo = appendedTodoItems[appendedTodoItems.length - 1] || null;
+        queueTimelineTodoInlineEdit(normalizedTarget, lastTodo?.stableId || '', nextTodoText);
+    }
+    return didPersist;
+}
+
+function setTaskCheckedInDocumentJson(documentJson, kindIndex, checked) {
+    const targetIndex = Number(kindIndex);
+    if (!Number.isInteger(targetIndex) || targetIndex < 0) {
+        return null;
+    }
+
+    const nextDocumentJson = cloneSerializableValue(documentJson);
+    if (!nextDocumentJson) {
+        return null;
+    }
+
+    let currentIndex = 0;
+    let updated = false;
+    const walk = (node) => {
+        if (!node || typeof node !== 'object' || updated) {
+            return;
+        }
+
+        if (node.type === 'taskItem') {
+            if (currentIndex === targetIndex) {
+                node.attrs = {
+                    ...node.attrs,
+                    checked: Boolean(checked)
+                };
+                updated = true;
+                return;
+            }
+            currentIndex += 1;
+        }
+
+        if (Array.isArray(node.content)) {
+            for (const child of node.content) {
+                walk(child);
+                if (updated) {
+                    return;
+                }
+            }
+        }
+    };
+
+    walk(nextDocumentJson);
+    return updated ? nextDocumentJson : null;
+}
+
+function setTaskCheckedInDocumentJsonByStableId(documentJson, stableId, checked) {
+    const targetId = String(stableId || '').trim();
+    if (!targetId) {
+        return null;
+    }
+
+    const nextDocumentJson = cloneSerializableValue(documentJson);
+    if (!nextDocumentJson) {
+        return null;
+    }
+
+    let updated = false;
+    const walk = (node) => {
+        if (!node || typeof node !== 'object' || updated) {
+            return;
+        }
+
+        if (node.type === 'taskItem' && String(node.attrs?.id || '').trim() === targetId) {
+            node.attrs = {
+                ...node.attrs,
+                checked: Boolean(checked)
+            };
+            updated = true;
+            return;
+        }
+
+        if (Array.isArray(node.content)) {
+            for (const child of node.content) {
+                walk(child);
+                if (updated) {
+                    return;
+                }
+            }
+        }
+    };
+
+    walk(nextDocumentJson);
+    return updated ? nextDocumentJson : null;
+}
+
+function isTodoStableIdUniqueInDocumentJson(documentJson, stableId) {
+    const targetId = String(stableId || '').trim();
+    if (!documentJson || !targetId) {
+        return false;
+    }
+
+    let matchCount = 0;
+    const walk = (node) => {
+        if (!node || typeof node !== 'object' || matchCount > 1) {
+            return;
+        }
+
+        if (node.type === 'taskItem' && String(node.attrs?.id || '').trim() === targetId) {
+            matchCount += 1;
+        }
+
+        if (Array.isArray(node.content)) {
+            for (const child of node.content) {
+                walk(child);
+                if (matchCount > 1) {
+                    return;
+                }
+            }
+        }
+    };
+
+    walk(documentJson);
+    return matchCount === 1;
+}
+
+function setTaskCheckedInDocumentJsonByIdentity(documentJson, todo, checked) {
+    if (!documentJson) {
+        return null;
+    }
+
+    const stableId = String(todo?.stableId || '').trim();
+    if (stableId && isTodoStableIdUniqueInDocumentJson(documentJson, stableId)) {
+        const byStableId = setTaskCheckedInDocumentJsonByStableId(documentJson, stableId, checked);
+        if (byStableId) {
+            return byStableId;
+        }
+    }
+
+    if (Number.isInteger(todo?.kindIndex)) {
+        const byKindIndex = setTaskCheckedInDocumentJson(documentJson, todo.kindIndex, checked);
+        if (byKindIndex) {
+            return byKindIndex;
+        }
+    }
+
+    return null;
+}
+
+function getDefaultTodoText(todoText = '') {
+    const normalized = String(todoText || '').trim();
+    return normalized;
+}
+
+function createTodoTaskNode(todoText = '') {
+    const normalizedText = getDefaultTodoText(todoText);
+    return {
+        type: 'taskItem',
+        attrs: {
+            checked: false,
+            headingLevel: 0,
+            id: `task-${crypto.randomUUID()}`
+        },
+        content: [{
+            type: 'paragraph',
+            ...(normalizedText ? {
+                content: [{
+                    type: 'text',
+                    text: normalizedText
+                }]
+            } : {})
+        }]
+    };
+}
+
+function appendTodoTaskToDocumentJson(documentJson, todoText = '') {
+    const nextDocumentJson = cloneSerializableValue(documentJson);
+    if (!nextDocumentJson || typeof nextDocumentJson !== 'object') {
+        return null;
+    }
+
+    const rootContent = Array.isArray(nextDocumentJson.content)
+        ? nextDocumentJson.content
+        : (nextDocumentJson.content = []);
+    const taskNode = createTodoTaskNode(todoText);
+    const lastNode = rootContent[rootContent.length - 1];
+
+    if (lastNode?.type === 'taskList') {
+        if (!Array.isArray(lastNode.content)) {
+            lastNode.content = [];
+        }
+        lastNode.content.push(taskNode);
+    } else {
+        rootContent.push({
+            type: 'taskList',
+            attrs: {},
+            content: [taskNode]
         });
     }
 
-    return todos;
+    return nextDocumentJson;
 }
 
 const TODO_COMPLETION_TIMESTAMP_REGEX = /\s*@\+(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)\s*$/;
@@ -14393,6 +17233,57 @@ function buildTodoEntry(todo, bundlePath, documentOrder = 0) {
     };
 }
 
+function getTodoRenderSignature(todo) {
+    const base = {
+        checked: Boolean(todo?.checked),
+        kindIndex: Number.isInteger(todo?.kindIndex) ? todo.kindIndex : -1,
+        text: String(todo?.text || ''),
+        stableId: String(todo?.stableId || ''),
+        structured: Boolean(todo?.isStructured)
+    };
+
+    if (!base.structured) {
+        base.lineNumber = Number.isInteger(todo?.lineNumber) ? todo.lineNumber : 0;
+    }
+
+    return base;
+}
+
+function findTodoItemByIdentity(todoItems, todo = {}) {
+    const items = Array.isArray(todoItems) ? todoItems : [];
+    const stableId = String(todo?.stableId || '').trim();
+    if (stableId) {
+        const stableIdMatch = items.find((item) => String(item?.stableId || '').trim() === stableId);
+        if (stableIdMatch) {
+            return stableIdMatch;
+        }
+    }
+
+    if (Number.isInteger(todo?.kindIndex)) {
+        const kindIndexMatch = items.find((item) => Number.isInteger(item?.kindIndex) && item.kindIndex === todo.kindIndex);
+        if (kindIndexMatch) {
+            return kindIndexMatch;
+        }
+    }
+
+    if (Number.isInteger(todo?.lineNumber)) {
+        const lineMatch = items.find((item) => Number.isInteger(item?.lineNumber) && item.lineNumber === todo.lineNumber);
+        if (lineMatch) {
+            return lineMatch;
+        }
+    }
+
+    const preferredText = stripTodoCompletionTimestamp(todo?.todoText || todo?.text || '');
+    if (preferredText) {
+        const textMatch = items.find((item) => stripTodoCompletionTimestamp(item?.text || '') === preferredText);
+        if (textMatch) {
+            return textMatch;
+        }
+    }
+
+    return items[0] || null;
+}
+
 function sortTodoEntries(entries, sortMode = 'position') {
     const items = [...entries];
     if (sortMode === 'status') {
@@ -14417,14 +17308,18 @@ function sortTodoEntries(entries, sortMode = 'position') {
     return items;
 }
 
-function getCurrentDocumentTodoEntries(content) {
+function getCurrentDocumentTodoEntries(documentJson = null) {
     const activeTab = getActiveTab();
     const bundlePath = activeTab?.path || window.currentPath || null;
-    const normalizedContent = String(content || '');
-    const todos = normalizedContent
-        ? getTodoItemsFromContent(normalizedContent)
-        : (window.editor && typeof window.editor.getTodoItems === 'function'
-            ? window.editor.getTodoItems()
+    const currentDocumentJson = documentJson || activeTab?.documentJson || null;
+    const isCurrentBundle = window.currentPath && bundlePath && path.resolve(window.currentPath) === path.resolve(bundlePath);
+    const todos = (isCurrentBundle && window.editor && typeof window.editor.getTodoItems === 'function')
+        ? window.editor.getTodoItems().map((todo) => ({
+            ...todo,
+            isStructured: true
+        }))
+        : (currentDocumentJson
+            ? getTodoItemsFromDocumentJson(currentDocumentJson)
             : []);
 
     return todos.map((todo, index) => buildTodoEntry({
@@ -14438,8 +17333,7 @@ function getWorkspaceTodoEntries() {
 
     const bundlePaths = getWorkspaceBundlePaths(workspaceRootPath);
     return bundlePaths.flatMap((bundlePath, documentOrder) => {
-        const content = getMarkdownContentForBundlePath(bundlePath);
-        const todos = getTodoItemsFromContent(content);
+        const todos = getTodoItemsForBundlePath(bundlePath);
         return todos.map((todo, index) => buildTodoEntry({
             ...todo,
             kindIndex: Number.isInteger(todo.kindIndex) ? todo.kindIndex : index
@@ -14458,10 +17352,245 @@ function applyTodoPanelFilters(entries) {
     return sortTodoEntries(nextEntries, settings.sort);
 }
 
+function getTimelineTodoItemDisplayText(todo) {
+    return stripTodoCompletionTimestamp(String(todo?.text || todo?.todoText || '').trim()) || '';
+}
+
+function getTimelineTodoDropPlacement(event, element) {
+    if (!event || !element) {
+        return 'after';
+    }
+
+    const rect = element.getBoundingClientRect();
+    if (!rect || rect.height <= 0) {
+        return 'after';
+    }
+
+    const offsetY = Number(event.clientY || 0) - rect.top;
+    return offsetY < rect.height / 2 ? 'before' : 'after';
+}
+
+function cancelTimelineTodoInlineEdit() {
+    if (!timelineTodoEditState) {
+        return;
+    }
+
+    const { item, body, meta, input } = timelineTodoEditState;
+    if (input?.parentNode) {
+        input.parentNode.removeChild(input);
+    }
+    if (meta) {
+        meta.style.display = '';
+    }
+    if (item) {
+        item.classList.remove('editing');
+    }
+    if (body) {
+        body.classList.remove('editing');
+    }
+    timelineTodoEditState = null;
+}
+
+function restoreTimelineTodoInlineEdit() {
+    const state = timelineTodoEditState;
+    if (!state) {
+        return false;
+    }
+
+    const container = document.getElementById('timeline-panel-content');
+    if (!container) {
+        return false;
+    }
+
+    const bundlePath = String(state.todo?.bundlePath || '').trim();
+    const stableId = String(state.todo?.stableId || '').trim();
+    if (!bundlePath || !stableId) {
+        return false;
+    }
+
+    const item = Array.from(container.querySelectorAll('.todo-item')).find((element) => (
+        String(element.dataset?.bundlePath || '') === bundlePath
+        && String(element.dataset?.stableId || '') === stableId
+    )) || null;
+    if (!item) {
+        return false;
+    }
+
+    if (state.item === item && item.querySelector('.todo-item-edit-input')) {
+        return true;
+    }
+
+    const draftText = String(state.draftText ?? state.input?.value ?? state.todo?.text ?? state.todo?.todoText ?? '');
+    const previousTodo = state.todo;
+    cancelTimelineTodoInlineEdit();
+    return beginTimelineTodoInlineEdit(item, previousTodo, {
+        initialValue: draftText
+    });
+}
+
+async function commitTimelineTodoInlineEdit() {
+    const state = timelineTodoEditState;
+    if (!state) {
+        return false;
+    }
+
+    const nextText = String(state.input?.value || '');
+    const originalText = String(state.todo?.text || state.todo?.todoText || '');
+    if (nextText === originalText) {
+        cancelTimelineTodoInlineEdit();
+        return true;
+    }
+
+    const didUpdate = await updateTimelineTodoItemText(state.todo, nextText);
+    if (!didUpdate) {
+        state.input?.focus();
+        state.input?.select?.();
+        return false;
+    }
+
+    cancelTimelineTodoInlineEdit();
+    return true;
+}
+
+function beginTimelineTodoInlineEdit(item, todo, options = {}) {
+    if (!item || !todo) {
+        return false;
+    }
+
+    if (timelineTodoEditState?.item && timelineTodoEditState.item !== item) {
+        cancelTimelineTodoInlineEdit();
+    }
+
+    const body = item.querySelector('.todo-item-body');
+    const meta = body?.querySelector('.todo-item-meta');
+    if (!body || !meta) {
+        return false;
+    }
+
+    const currentText = getTimelineTodoItemDisplayText(todo);
+    const initialValue = String(options.initialValue ?? currentText ?? '');
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'todo-item-edit-input';
+    input.value = initialValue;
+    input.setAttribute('aria-label', '编辑待办文本');
+
+    meta.style.display = 'none';
+    body.appendChild(input);
+    item.classList.add('editing');
+    body.classList.add('editing');
+    timelineTodoEditState = {
+        item,
+        body,
+        meta,
+        input,
+        draftText: initialValue,
+        todo: {
+            ...todo,
+            bundlePath: todo.bundlePath ? path.resolve(todo.bundlePath) : ''
+        }
+    };
+
+    const stopEvent = (event) => {
+        event.stopPropagation();
+    };
+    input.addEventListener('mousedown', stopEvent);
+    input.addEventListener('click', stopEvent);
+    input.addEventListener('dblclick', stopEvent);
+    input.addEventListener('contextmenu', stopEvent);
+    input.addEventListener('input', () => {
+        if (timelineTodoEditState?.input === input) {
+            timelineTodoEditState.draftText = input.value;
+        }
+    });
+    input.addEventListener('keydown', async (event) => {
+        event.stopPropagation();
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            await commitTimelineTodoInlineEdit();
+        } else if (event.key === 'Escape') {
+            event.preventDefault();
+            cancelTimelineTodoInlineEdit();
+        }
+    });
+    input.addEventListener('blur', () => {
+        window.requestAnimationFrame(() => {
+            if (timelineTodoEditState?.input !== input) {
+                return;
+            }
+            if (!input.isConnected) {
+                return;
+            }
+            void commitTimelineTodoInlineEdit();
+        });
+    });
+
+    window.requestAnimationFrame(() => {
+        input.focus();
+        input.select();
+    });
+
+    return true;
+}
+
+function queueTimelineTodoInlineEdit(bundlePath, stableId, todoText = '') {
+    const normalizedBundlePath = bundlePath ? path.resolve(bundlePath) : '';
+    const normalizedStableId = String(stableId || '').trim();
+    if (!normalizedBundlePath || !normalizedStableId) {
+        pendingTimelineTodoInlineEditTarget = null;
+        return false;
+    }
+
+    pendingTimelineTodoInlineEditTarget = {
+        bundlePath: normalizedBundlePath,
+        stableId: normalizedStableId,
+        todoText: String(todoText || '')
+    };
+    return true;
+}
+
+function tryActivatePendingTimelineTodoInlineEdit() {
+    if (!pendingTimelineTodoInlineEditTarget || !timelinePanelOpen || currentRightSidebarTab !== 'timeline') {
+        return false;
+    }
+
+    const container = document.getElementById('timeline-panel-content');
+    if (!container) {
+        return false;
+    }
+
+    const { bundlePath, stableId, todoText } = pendingTimelineTodoInlineEditTarget;
+    const item = Array.from(container.querySelectorAll('.todo-item')).find((element) => (
+        String(element.dataset?.bundlePath || '') === bundlePath
+        && String(element.dataset?.stableId || '') === stableId
+    )) || null;
+    if (!item) {
+        return false;
+    }
+
+    const didBegin = beginTimelineTodoInlineEdit(item, {
+        bundlePath,
+        stableId,
+        text: String(todoText || ''),
+        todoText: String(todoText || '')
+    });
+    if (didBegin) {
+        pendingTimelineTodoInlineEditTarget = null;
+    }
+    return didBegin;
+}
+
 function createTodoItemElement(todo, options = {}) {
     const {
         showDocumentMeta = false,
-        onOpen = null
+        onOpen = null,
+        enableOpenOnClick = true,
+        enableInlineEdit = false,
+        enableContextMenu = false,
+        enableDragDrop = false,
+        onLocate = null,
+        onDelete = null,
+        onEdit = null
     } = options;
 
     const item = document.createElement('div');
@@ -14470,15 +17599,50 @@ function createTodoItemElement(todo, options = {}) {
     if (todo.bundlePath) {
         item.dataset.bundlePath = todo.bundlePath;
     }
+    if (todo.stableId) {
+        item.dataset.stableId = String(todo.stableId || '');
+    }
+    item.draggable = Boolean(enableDragDrop);
 
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.className = 'todo-item-checkbox preview-task-checkbox';
     checkbox.checked = todo.checked;
     checkbox.dataset.taskLine = String(todo.lineNumber);
-    checkbox.addEventListener('click', async (event) => {
+    checkbox.addEventListener('mousedown', (event) => {
         event.stopPropagation();
-        await updateTodoCheckedState(todo, checkbox.checked);
+    });
+    checkbox.addEventListener('click', (event) => {
+        event.stopPropagation();
+    });
+    checkbox.addEventListener('change', async (event) => {
+        event.stopPropagation();
+        const nextChecked = Boolean(checkbox.checked);
+        const previousChecked = Boolean(todo.checked);
+        const updateKey = getTodoCheckedUpdateKey(todo);
+        const updateToken = `${Date.now()}:${Math.random().toString(36).slice(2)}`;
+
+        if (updateKey) {
+            pendingTodoCheckedUpdates.set(updateKey, updateToken);
+        }
+
+        checkbox.disabled = true;
+        item.classList.toggle('done', nextChecked);
+
+        try {
+            const didUpdate = await updateTodoCheckedState(todo, nextChecked);
+            if (!didUpdate && (!updateKey || pendingTodoCheckedUpdates.get(updateKey) === updateToken)) {
+                checkbox.checked = previousChecked;
+                item.classList.toggle('done', previousChecked);
+            }
+        } finally {
+            if (updateKey && pendingTodoCheckedUpdates.get(updateKey) === updateToken) {
+                pendingTodoCheckedUpdates.delete(updateKey);
+            }
+            if (checkbox.isConnected) {
+                checkbox.disabled = false;
+            }
+        }
     });
 
     const body = document.createElement('div');
@@ -14487,19 +17651,146 @@ function createTodoItemElement(todo, options = {}) {
     const meta = document.createElement('div');
     meta.className = 'todo-item-meta';
     meta.innerText = showDocumentMeta
-        ? `${todo.text || '(空的待办)'} · ${todo.documentTitle} · 第 ${todo.lineNumber} 行 · ${todo.checked ? '已完成' : '待办'}`
-        : `${todo.text || '(空的待办)'} · 第 ${todo.lineNumber} 行 · ${todo.checked ? '已完成' : '待办'}`;
+        ? `${todo.text || '(空的待办)'} · ${todo.documentTitle}`
+        : `${todo.text || '(空的待办)'}`;
 
     body.appendChild(meta);
     item.appendChild(checkbox);
     item.appendChild(body);
 
-    item.addEventListener('click', async () => {
-        await jumpToTodoEntry(todo);
-        if (typeof onOpen === 'function') {
-            onOpen(todo);
-        }
-    });
+    if (enableOpenOnClick) {
+        item.addEventListener('click', async () => {
+            await jumpToTodoEntry(todo);
+            if (typeof onOpen === 'function') {
+                onOpen(todo);
+            }
+        });
+    }
+
+    if (enableInlineEdit) {
+        body.addEventListener('dblclick', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const currentTodo = {
+                ...todo,
+                text: getTimelineTodoItemDisplayText(todo)
+            };
+            if (typeof onEdit === 'function') {
+                const didHandle = onEdit(item, currentTodo);
+                if (didHandle) {
+                    return;
+                }
+            }
+            beginTimelineTodoInlineEdit(item, currentTodo);
+        });
+    }
+
+    if (enableContextMenu) {
+        item.addEventListener('contextmenu', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            showTimelineTodoContextMenu(event, todo, item);
+        });
+    }
+
+    if (enableDragDrop) {
+        item.addEventListener('dragstart', (event) => {
+            timelineTodoDragState = {
+                ...todo,
+                bundlePath: todo.bundlePath ? path.resolve(todo.bundlePath) : ''
+            };
+            timelineTodoDropState = null;
+            item.classList.add('dragging');
+            if (event.dataTransfer) {
+                event.dataTransfer.effectAllowed = 'move';
+                event.dataTransfer.dropEffect = 'move';
+                try {
+                    event.dataTransfer.setData('application/x-kangaroo-todo+json', JSON.stringify(timelineTodoDragState));
+                } catch {
+                    // ignore drag data serialization failures
+                }
+                event.dataTransfer.setData('text/plain', timelineTodoDragState.bundlePath || '');
+            }
+        });
+        item.addEventListener('dragover', (event) => {
+            const sourceBundlePath = timelineTodoDragState?.bundlePath ? path.resolve(timelineTodoDragState.bundlePath) : '';
+            const targetBundlePath = todo.bundlePath ? path.resolve(todo.bundlePath) : '';
+            const sourceStableId = String(timelineTodoDragState?.stableId || '').trim();
+            const targetStableId = String(todo.stableId || '').trim();
+            if (!sourceBundlePath || !targetBundlePath || sourceBundlePath !== targetBundlePath || !sourceStableId || sourceStableId === targetStableId) {
+                return;
+            }
+
+            event.preventDefault();
+            event.stopPropagation();
+            const placement = getTimelineTodoDropPlacement(event, item);
+            item.classList.toggle('drop-insert-before', placement === 'before');
+            item.classList.toggle('drop-insert-after', placement === 'after');
+            timelineTodoDropState = {
+                sourceTodo: timelineTodoDragState ? {
+                    ...timelineTodoDragState,
+                    bundlePath: timelineTodoDragState.bundlePath ? path.resolve(timelineTodoDragState.bundlePath) : ''
+                } : null,
+                targetTodo: {
+                    ...todo,
+                    bundlePath: todo.bundlePath ? path.resolve(todo.bundlePath) : ''
+                },
+                placeAfter: placement === 'after',
+                committed: false
+            };
+            if (event.dataTransfer) {
+                event.dataTransfer.dropEffect = 'move';
+            }
+        });
+        item.addEventListener('dragleave', (event) => {
+            if (event.currentTarget.contains(event.relatedTarget)) {
+                return;
+            }
+            item.classList.remove('drop-insert-before', 'drop-insert-after');
+        });
+        item.addEventListener('drop', async (event) => {
+            const sourceBundlePath = timelineTodoDragState?.bundlePath ? path.resolve(timelineTodoDragState.bundlePath) : '';
+            const targetBundlePath = todo.bundlePath ? path.resolve(todo.bundlePath) : '';
+            const sourceStableId = String(timelineTodoDragState?.stableId || '').trim();
+            const targetStableId = String(todo.stableId || '').trim();
+            if (!sourceBundlePath || !targetBundlePath || sourceBundlePath !== targetBundlePath || !sourceStableId || sourceStableId === targetStableId) {
+                return;
+            }
+
+            event.preventDefault();
+            event.stopPropagation();
+            const placement = item.classList.contains('drop-insert-before') ? 'before' : 'after';
+            timelineTodoDropState = {
+                sourceTodo: timelineTodoDragState ? {
+                    ...timelineTodoDragState,
+                    bundlePath: timelineTodoDragState.bundlePath ? path.resolve(timelineTodoDragState.bundlePath) : ''
+                } : null,
+                targetTodo: {
+                    ...todo,
+                    bundlePath: todo.bundlePath ? path.resolve(todo.bundlePath) : ''
+                },
+                placeAfter: placement === 'after',
+                committed: false
+            };
+            clearTimelineTodoDropIndicators();
+            await commitTimelineTodoDragReorder();
+        });
+        item.addEventListener('dragend', () => {
+            const hasPendingReorder = Boolean(
+                timelineTodoDropState
+                && !timelineTodoDropState.committed
+                && timelineTodoDropState.sourceTodo?.bundlePath
+                && timelineTodoDropState.targetTodo?.bundlePath
+            );
+            item.classList.remove('dragging');
+            if (hasPendingReorder) {
+                void commitTimelineTodoDragReorder();
+            }
+            timelineTodoDragState = null;
+            timelineTodoDropState = null;
+            clearTimelineTodoDropIndicators();
+        });
+    }
 
     return item;
 }
@@ -14512,6 +17803,18 @@ async function jumpToTodoEntry(todo) {
         const currentBundlePath = window.currentPath ? path.resolve(window.currentPath) : null;
         if (currentBundlePath !== normalizedTarget) {
             await openBundleFromExternalPath(normalizedTarget, { skipConfirm: false });
+        }
+    }
+
+    if (todo.stableId && window.editor && typeof window.editor.jumpToTaskByStableId === 'function') {
+        const didJump = window.editor.jumpToTaskByStableId(todo.stableId, {
+            lineNumber: todo.lineNumber,
+            preservePreviewScroll: true,
+            preferredText: todo.text || '',
+            preferredKind: 'task'
+        });
+        if (didJump) {
+            return;
         }
     }
 
@@ -14544,13 +17847,11 @@ async function jumpToTimelineTodoEntry(todo) {
     }
 
     const normalizedTarget = todo.bundlePath ? path.resolve(todo.bundlePath) : null;
-    const markdown = normalizedTarget ? getMarkdownContentForBundlePath(normalizedTarget) : getTabMarkdownContent();
-    const todoItems = getTodoItemsFromContent(markdown);
+    const todoItems = normalizedTarget
+        ? getTodoItemsForBundlePath(normalizedTarget)
+        : getCurrentDocumentTodoEntries(getActiveTab()?.documentJson || null);
     const preferredText = stripTodoCompletionTimestamp(todo.todoText || todo.text || '');
-    const matchedTodo = todoItems.find((item) => (
-        (Number.isInteger(todo.lineNumber) && item.lineNumber === todo.lineNumber)
-        || (preferredText && stripTodoCompletionTimestamp(item.text || '') === preferredText)
-    )) || todoItems.find((item) => Number.isInteger(todo.lineNumber) && item.lineNumber >= todo.lineNumber) || todoItems[0];
+    const matchedTodo = findTodoItemByIdentity(todoItems, todo);
     const targetLineNumber = Number.isInteger(matchedTodo?.lineNumber)
         ? matchedTodo.lineNumber
         : (Number.isInteger(todo.lineNumber) ? todo.lineNumber : null);
@@ -14625,26 +17926,6 @@ async function focusTodoLineAfterOpen(lineNumber, preferredText = '') {
     return tryFocus();
 }
 
-function updateTodoMarkdownByKindIndex(content, kindIndex, checked) {
-    const lines = String(content || '').split('\n');
-    let currentTaskIndex = 0;
-
-    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-        const match = lines[lineIndex].match(/^(\s*)([-+*]|\d+\.)\s+\[([ xX])\]\s*(.*)$/);
-        if (!match) continue;
-
-        if (currentTaskIndex === kindIndex) {
-            const visibleText = stripTodoCompletionTimestamp(match[4] || '');
-            lines[lineIndex] = `${match[1]}${match[2]} [${checked ? 'x' : ' '}] ${visibleText}`;
-            return lines.join('\n');
-        }
-
-        currentTaskIndex += 1;
-    }
-
-    return content;
-}
-
 function saveMarkdownToBundlePath(bundlePath, content) {
     if (!bundlePath) return;
     fs.writeFileSync(resolveBundleMarkdownFilePath(bundlePath, { createIfMissing: true }), content, 'utf-8');
@@ -14652,70 +17933,97 @@ function saveMarkdownToBundlePath(bundlePath, content) {
 
 async function updateTodoCheckedState(todo, checked) {
     const targetBundlePath = todo?.bundlePath || window.currentPath || null;
-    if (!targetBundlePath) return;
+    if (!targetBundlePath) return false;
 
     const normalizedTarget = path.resolve(targetBundlePath);
     const currentBundlePath = window.currentPath ? path.resolve(window.currentPath) : null;
     const nextChecked = Boolean(checked);
     const wasChecked = Boolean(todo?.checked);
+    const nextTodo = {
+        ...todo,
+        bundlePath: normalizedTarget,
+        checked: nextChecked
+    };
 
-    if (currentBundlePath === normalizedTarget && window.editor && typeof window.editor.setTaskCheckedByKindIndex === 'function') {
-        const didUpdate = window.editor.setTaskCheckedByKindIndex(todo.kindIndex, nextChecked);
+    if (currentBundlePath === normalizedTarget && window.editor) {
+        let didUpdate = false;
+        const liveTodoItems = typeof window.editor.getTodoItems === 'function'
+            ? window.editor.getTodoItems()
+            : [];
+        const stableId = String(todo?.stableId || '').trim();
+        const stableIdMatchCount = stableId && Array.isArray(liveTodoItems)
+            ? liveTodoItems.filter((item) => String(item?.stableId || '').trim() === stableId).length
+            : 0;
+        if (stableId && stableIdMatchCount === 1 && typeof window.editor.setTaskCheckedByStableId === 'function') {
+            didUpdate = window.editor.setTaskCheckedByStableId(todo.stableId, nextChecked);
+        } else if (typeof window.editor.setTaskCheckedByKindIndex === 'function') {
+            didUpdate = window.editor.setTaskCheckedByKindIndex(todo.kindIndex, nextChecked);
+        }
         if (didUpdate) {
             if (nextChecked !== wasChecked) {
-                upsertTodoCompletedTimelineEvent({
-                    ...todo,
-                    bundlePath: normalizedTarget
-                }, { checked: nextChecked });
+                upsertTodoCompletedTimelineEvent(nextTodo, { checked: nextChecked });
             }
-            return;
+            workspaceTodoRenderVersion += 1;
+            renderTodoList(getActiveEditorSnapshot());
+            return true;
         }
     }
 
     const openTab = getOpenTabByBundlePath(normalizedTarget);
     if (openTab) {
-        const nextContent = updateTodoMarkdownByKindIndex(openTab.content || '', todo.kindIndex, nextChecked);
+        const sourceDocumentJson = openTab.documentJson || getDocumentJsonForBundlePath(normalizedTarget);
+        const nextDocumentJson = setTaskCheckedInDocumentJsonByIdentity(sourceDocumentJson, todo, nextChecked);
+        if (!nextDocumentJson) {
+            return false;
+        }
+        const serializedMarkdown = serializeDocumentJsonToMarkdown(nextDocumentJson);
+        const nextContent = serializedMarkdown || (
+            activeTabId === openTab.id && window.editor && typeof window.editor.getValue === 'function'
+                ? window.editor.getValue()
+                : (openTab.content || getMarkdownContentForBundlePath(normalizedTarget))
+        );
         openTab.content = nextContent;
+        openTab.documentJson = nextDocumentJson;
         openTab.previousContent = nextContent;
         openTab.isDirty = false;
         openTab.previousIsDirty = false;
-        saveMarkdownToBundlePath(normalizedTarget, nextContent);
+        writeBundlePackageToPath(normalizedTarget, nextContent, nextDocumentJson, normalizedTarget, {
+            title: getDefaultBundleTitleFromPath(normalizedTarget)
+        });
         if (nextChecked !== wasChecked && activeTabId !== openTab.id) {
-            upsertTodoCompletedTimelineEvent({
-                ...todo,
-                bundlePath: normalizedTarget
-            }, { checked: nextChecked });
+            upsertTodoCompletedTimelineEvent(nextTodo, { checked: nextChecked });
         }
+        workspaceTodoRenderVersion += 1;
         if (activeTabId === openTab.id && window.editor) {
             window.editor.setValue(nextContent, { emitChange: true });
         } else {
-            renderTodoList(getTabMarkdownContent());
+            renderTodoList({
+                markdown: nextContent,
+                documentJson: nextDocumentJson
+            });
         }
-        return;
+        return true;
     }
 
     const content = getMarkdownContentForBundlePath(normalizedTarget);
-    const nextContent = updateTodoMarkdownByKindIndex(content, todo.kindIndex, nextChecked);
-    saveMarkdownToBundlePath(normalizedTarget, nextContent);
-    if (nextChecked !== wasChecked) {
-        upsertTodoCompletedTimelineEvent({
-            ...todo,
-            bundlePath: normalizedTarget
-        }, { checked: nextChecked });
+    const documentJson = getDocumentJsonForBundlePath(normalizedTarget);
+    const nextDocumentJson = setTaskCheckedInDocumentJsonByIdentity(documentJson, todo, nextChecked);
+    if (!nextDocumentJson) {
+        return false;
     }
-    renderTodoList(getTabMarkdownContent());
+    const nextContent = serializeDocumentJsonToMarkdown(nextDocumentJson) || content;
+    writeBundlePackageToPath(normalizedTarget, nextContent, nextDocumentJson, normalizedTarget, {
+        title: getDefaultBundleTitleFromPath(normalizedTarget)
+    });
+    if (nextChecked !== wasChecked) {
+        upsertTodoCompletedTimelineEvent(nextTodo, { checked: nextChecked });
+    }
+    workspaceTodoRenderVersion += 1;
+    renderTodoList(getActiveEditorSnapshot());
+    return true;
 }
 
-function renderTodoList(content) {
-    const todoContainer = document.getElementById('todo-container');
-    if (!todoContainer) return;
-
-    const settings = loadTodoPanelSettings();
-    const normalizedContent = String(content || '');
-    const renderKey = settings.scope === 'workspace'
-        ? `todo::workspace::${settings.hideCompleted ? '1' : '0'}::${settings.sort || ''}::${workspaceRootPath || ''}::${workspaceTodoRenderVersion}`
-        : `todo::document::${settings.hideCompleted ? '1' : '0'}::${settings.sort || ''}::${normalizedContent}`;
-
+function renderTodoListContainer(todoContainer, todos, settings, renderKey, { workspace = false } = {}) {
     if (todoContainer.dataset.renderKey === renderKey && todoContainer.childElementCount > 0) {
         return;
     }
@@ -14723,21 +18031,17 @@ function renderTodoList(content) {
     todoContainer.innerHTML = '';
     todoContainer.dataset.renderKey = renderKey;
 
-    const todos = settings.scope === 'workspace'
-        ? getWorkspaceTodoEntries()
-        : applyTodoPanelFilters(getCurrentDocumentTodoEntries(normalizedContent));
-
     if (!todos.length) {
         const emptyState = document.createElement('div');
         emptyState.className = 'sidebar-empty';
-        emptyState.innerText = settings.scope === 'workspace'
+        emptyState.innerText = workspace
             ? '当前工作空间还没有符合条件的待办。'
-            : '当前文档还没有待办。按 Cmd+T 就能把当前行变成待办。';
+            : '当前文档还没有待办。按 Cmd+T 就能把当前段落变成待办。';
         todoContainer.appendChild(emptyState);
         return;
     }
 
-    if (settings.scope !== 'workspace') {
+    if (!workspace) {
         for (const todo of todos) {
             todoContainer.appendChild(createTodoItemElement(todo));
         }
@@ -14799,6 +18103,40 @@ function renderTodoList(content) {
 
         todoContainer.appendChild(group);
     }
+}
+
+function renderStructuredDocumentTodoList(documentJson = null) {
+    const todoContainer = document.getElementById('todo-container');
+    if (!todoContainer) return;
+
+    const settings = loadTodoPanelSettings();
+    const currentDocumentJson = documentJson || window.editor?.getDocumentJson?.() || getActiveTab()?.documentJson || null;
+    const todos = applyTodoPanelFilters(getCurrentDocumentTodoEntries(currentDocumentJson));
+    const renderKey = `todo::document::structured::${settings.hideCompleted ? '1' : '0'}::${settings.sort || ''}::${JSON.stringify(todos.map((todo) => getTodoRenderSignature(todo)))}`;
+    renderTodoListContainer(todoContainer, todos, settings, renderKey, { workspace: false });
+}
+
+function renderWorkspaceTodoList() {
+    const todoContainer = document.getElementById('todo-container');
+    if (!todoContainer) return;
+
+    const settings = loadTodoPanelSettings();
+    const todos = getWorkspaceTodoEntries();
+    const renderKey = `todo::workspace::${settings.hideCompleted ? '1' : '0'}::${settings.sort || ''}::${workspaceRootPath || ''}::${workspaceTodoRenderVersion}`;
+    renderTodoListContainer(todoContainer, todos, settings, renderKey, { workspace: true });
+}
+
+function renderTodoList(context = null) {
+    const settings = loadTodoPanelSettings();
+    if (settings.scope === 'workspace') {
+        renderWorkspaceTodoList();
+        return;
+    }
+
+    const currentDocumentJson = context && typeof context === 'object'
+        ? context.documentJson || null
+        : (window.editor?.getDocumentJson?.() || getActiveTab()?.documentJson || null);
+    renderStructuredDocumentTodoList(currentDocumentJson);
 }
 
 function getPomodoroPhaseMeta() {
@@ -14872,291 +18210,242 @@ function renderPomodoroPanel() {
     container.className = 'pomodoro-panel';
 
     const phaseMeta = getPomodoroPhaseMeta();
-    const hero = document.createElement('div');
-    hero.className = 'pomodoro-card pomodoro-hero';
+    const shell = document.createElement('div');
+    shell.className = 'pomodoro-shell';
 
-    const phaseRow = document.createElement('div');
-    phaseRow.className = 'pomodoro-phase-row';
-    const phaseBadge = document.createElement('div');
-    phaseBadge.className = `pomodoro-phase-badge${phaseMeta.badgeClass ? ` ${phaseMeta.badgeClass}` : ''}`;
-    phaseBadge.innerHTML = `<i class="fa-solid fa-stopwatch" aria-hidden="true"></i><span>${phaseMeta.label}</span>`;
-    const sessionCount = document.createElement('div');
-    sessionCount.className = 'pomodoro-session-count';
-    sessionCount.setAttribute('data-pomodoro-today-count', '');
-    sessionCount.textContent = `今日完成 ${getPomodoroTodayCycleCount()} 轮`;
-    phaseRow.appendChild(phaseBadge);
-    phaseRow.appendChild(sessionCount);
+    const isActiveBreak = pomodoroState.phase === 'break' || pomodoroState.phase === 'break-complete';
+    const isLongBreak = isActiveBreak && Number(pomodoroState.phaseDurationMinutes || 0) > pomodoroState.breakMinutes;
+    const activeMode = pomodoroCustomSettingsOpen
+        ? 'custom'
+        : isPomodoroRunningPhase(pomodoroState.phase) || pomodoroState.phase === 'work-paused' || pomodoroState.phase === 'work-complete' || pomodoroState.phase === 'break-complete'
+            ? (isActiveBreak ? (isLongBreak ? 'long-break' : 'short-break') : 'focus')
+            : pomodoroSelectedMode;
+    const modeTabs = document.createElement('div');
+    modeTabs.className = 'pomodoro-mode-tabs';
+    const appendModeTab = ({ id, icon, label, onClick }) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `pomodoro-mode-tab${activeMode === id ? ' active' : ''}`;
+        button.innerHTML = `<i class="${icon}" aria-hidden="true"></i><span>${label}</span>`;
+        button.addEventListener('click', onClick);
+        modeTabs.appendChild(button);
+    };
+    appendModeTab({
+        id: 'focus',
+        icon: 'fa-solid fa-apple-whole',
+        label: '专注',
+        onClick: () => {
+            selectPomodoroMode('focus');
+        }
+    });
+    appendModeTab({
+        id: 'short-break',
+        icon: 'fa-solid fa-mug-saucer',
+        label: '短休息',
+        onClick: () => {
+            selectPomodoroMode('short-break');
+        }
+    });
+    appendModeTab({
+        id: 'long-break',
+        icon: 'fa-solid fa-tree',
+        label: '长休息',
+        onClick: () => {
+            selectPomodoroMode('long-break');
+        }
+    });
+    appendModeTab({
+        id: 'custom',
+        icon: 'fa-solid fa-gear',
+        label: '自定义',
+        onClick: () => {
+            pomodoroSelectedMode = 'focus';
+            pomodoroCustomSettingsOpen = !pomodoroCustomSettingsOpen;
+            if (pomodoroState.phase !== 'idle') {
+                stopPomodoroSession();
+            }
+            renderPomodoroPanel();
+        }
+    });
 
-    const visualWrap = document.createElement('div');
-    visualWrap.className = 'pomodoro-visual-wrap';
+    const stage = document.createElement('div');
+    stage.className = 'pomodoro-stage';
 
-    const clock = document.createElement('div');
-    clock.className = `pomodoro-clock${phaseMeta.badgeClass ? ` ${phaseMeta.badgeClass}` : ''}`;
-    clock.setAttribute('data-pomodoro-clock', '');
-    clock.style.setProperty('--pomodoro-progress', `${Math.round(getPomodoroProgress() * 100)}%`);
-    const clockFace = document.createElement('div');
-    clockFace.className = 'pomodoro-clock-face';
-    const hourHand = document.createElement('div');
-    hourHand.className = 'pomodoro-clock-hand hour';
-    const minuteHand = document.createElement('div');
-    minuteHand.className = 'pomodoro-clock-hand minute';
-    const centerDot = document.createElement('div');
-    centerDot.className = 'pomodoro-clock-center';
-    const progress = getPomodoroProgress();
-    hourHand.style.transform = `translateX(-50%) rotate(${Math.round(progress * 360)}deg)`;
-    minuteHand.style.transform = `translateX(-50%) rotate(${Math.round(progress * 720)}deg)`;
+    const ring = document.createElement('div');
+    const ringClass = activeMode === 'short-break' || activeMode === 'long-break'
+        ? 'break'
+        : phaseMeta.badgeClass;
+    ring.className = `pomodoro-ring${ringClass ? ` ${ringClass}` : ''}`;
+    ring.setAttribute('data-pomodoro-clock', '');
+    ring.style.setProperty('--pomodoro-progress', `${Math.round(getPomodoroProgress() * 100)}%`);
+    const ringContent = document.createElement('div');
+    ringContent.className = 'pomodoro-ring-content';
+    const ringLabel = document.createElement('div');
+    ringLabel.className = 'pomodoro-ring-label';
+    const preview = getPomodoroModePreview(activeMode);
+    ringLabel.textContent = preview.label;
     const countdown = document.createElement('div');
     countdown.className = 'pomodoro-clock-countdown';
     countdown.setAttribute('data-pomodoro-countdown', '');
-    countdown.textContent = getPomodoroDisplayTime();
-    clockFace.appendChild(hourHand);
-    clockFace.appendChild(minuteHand);
-    clockFace.appendChild(centerDot);
-    clockFace.appendChild(countdown);
-    clock.appendChild(clockFace);
-
-    const timerCaption = document.createElement('div');
-    timerCaption.className = 'pomodoro-time-caption';
-    timerCaption.setAttribute('data-pomodoro-caption', '');
-    if (isPomodoroRunningPhase(pomodoroState.phase) && Number.isFinite(pomodoroState.endsAt)) {
-        timerCaption.textContent = `剩余 ${formatPomodoroCountdown(getPomodoroRemainingMs())} · 结束于 ${new Date(pomodoroState.endsAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
-    } else if (pomodoroState.phase === 'work-paused') {
-        timerCaption.textContent = `已暂停 · 剩余 ${formatPomodoroCountdown(getPomodoroRemainingMs())}`;
+    if (pomodoroState.phase === 'idle') {
+        countdown.textContent = `${String(preview.minutes).padStart(2, '0')}:00`;
     } else {
-        timerCaption.textContent = `工作 ${pomodoroState.workMinutes} 分钟 / 休息 ${pomodoroState.breakMinutes} 分钟`;
+        countdown.textContent = getPomodoroDisplayTime();
     }
-
-    visualWrap.appendChild(clock);
-    visualWrap.appendChild(timerCaption);
+    const cyclePill = document.createElement('div');
+    cyclePill.className = 'pomodoro-cycle-pill';
+    cyclePill.setAttribute('data-pomodoro-cycle-pill', '');
+    cyclePill.innerHTML = `<span aria-hidden="true">🍅</span><span>今日第 ${getPomodoroDisplayedCycleCount()} 个番茄钟</span>`;
+    ringContent.appendChild(ringLabel);
+    ringContent.appendChild(countdown);
+    ringContent.appendChild(cyclePill);
+    ring.appendChild(ringContent);
 
     const controls = document.createElement('div');
     controls.className = 'pomodoro-controls';
-    const appendControl = (iconClass, title, handler, options = {}) => {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = `pomodoro-button pomodoro-icon-button${options.primary ? ' primary' : ''}`;
-        button.setAttribute('aria-label', title);
-        const icon = document.createElement('i');
-        icon.className = iconClass;
-        icon.setAttribute('aria-hidden', 'true');
-        button.appendChild(icon);
-        if (options.badge) {
-            const badge = document.createElement('span');
-            badge.className = 'pomodoro-icon-badge';
-            badge.textContent = String(options.badge);
-            button.appendChild(badge);
-        }
-        button.addEventListener('click', handler);
-        controls.appendChild(button);
-    };
-
-    if (pomodoroState.phase === 'idle') {
-        appendControl('fa-solid fa-play', '开始专注', () => {
-            startPomodoroWork();
-        }, { primary: true });
-        appendControl('fa-solid fa-xmark', '清除任务', () => {
-            pomodoroState.selectedTodo = null;
-            pomodoroState.activeTodo = null;
-            persistPomodoroState();
-        });
-    } else if (pomodoroState.phase === 'work' || pomodoroState.phase === 'work-paused') {
-        appendControl(
-            pomodoroState.phase === 'work-paused' ? 'fa-solid fa-play' : 'fa-solid fa-pause',
-            pomodoroState.phase === 'work-paused' ? '继续专注' : '暂停专注',
-            () => {
-                if (pomodoroState.phase === 'work-paused') {
-                    resumePomodoroWork();
-                    return;
-                }
-                pausePomodoroWork();
-            },
-            { primary: true }
-        );
-        appendControl('fa-solid fa-rotate-left', '重置工作时间', () => {
+    const resetButton = document.createElement('button');
+    resetButton.type = 'button';
+    resetButton.className = 'pomodoro-circle-button';
+    resetButton.setAttribute('aria-label', '重置');
+    resetButton.innerHTML = '<i class="fa-solid fa-rotate-left" aria-hidden="true"></i>';
+    resetButton.addEventListener('click', () => {
+        if (pomodoroState.phase === 'work' || pomodoroState.phase === 'work-paused') {
             resetPomodoroWorkTimer();
-        });
-        appendControl('fa-solid fa-mug-hot', '切换到休息', () => {
-            switchPomodoroWorkToBreak();
-        });
-    } else if (pomodoroState.phase === 'work-complete') {
-        appendControl('fa-solid fa-mug-hot', '开始休息', () => {
+            return;
+        }
+        stopPomodoroSession();
+    });
+
+    const mainButton = document.createElement('button');
+    mainButton.type = 'button';
+    const isPauseAction = pomodoroState.phase === 'work';
+    mainButton.className = `pomodoro-main-button${isPauseAction ? ' is-pause' : ''}`;
+    mainButton.setAttribute('aria-label', isPauseAction ? '暂停' : '开始');
+    mainButton.innerHTML = `<span class="pomodoro-main-button-core"><i class="fa-solid ${isPauseAction ? 'fa-pause' : 'fa-play'}" aria-hidden="true"></i></span>`;
+    mainButton.addEventListener('click', () => {
+        if (pomodoroState.phase === 'work') {
+            pausePomodoroWork();
+            return;
+        }
+        if (pomodoroState.phase === 'work-paused') {
+            resumePomodoroWork();
+            return;
+        }
+        if (pomodoroState.phase === 'work-complete') {
             startPomodoroBreak();
-        }, { primary: true });
-        appendControl('fa-regular fa-clock', '推迟 5 分钟', () => {
-            snoozePomodoroReminder(5);
-        }, { badge: 5 });
-        appendControl('fa-regular fa-clock', '推迟 10 分钟', () => {
-            snoozePomodoroReminder(10);
-        }, { badge: 10 });
-    } else if (pomodoroState.phase === 'break') {
-        appendControl('fa-solid fa-play', '开始下一轮', () => {
+            return;
+        }
+        if (pomodoroState.phase === 'break-complete') {
             startPomodoroWork(pomodoroState.activeTodo || pomodoroState.selectedTodo);
-        }, { primary: true });
-        appendControl('fa-solid fa-forward-step', '提前结束休息', () => {
+            return;
+        }
+        startPomodoroSelectedMode();
+    });
+
+    const skipButton = document.createElement('button');
+    skipButton.type = 'button';
+    skipButton.className = 'pomodoro-circle-button';
+    skipButton.setAttribute('aria-label', '跳过');
+    skipButton.innerHTML = '<i class="fa-solid fa-forward-step" aria-hidden="true"></i>';
+    skipButton.addEventListener('click', () => {
+        if (pomodoroState.phase === 'work' || pomodoroState.phase === 'work-paused') {
+            switchPomodoroWorkToBreak();
+            return;
+        }
+        if (pomodoroState.phase === 'break') {
             void completePomodoroPhase('break-complete');
-        });
-    } else if (pomodoroState.phase === 'break-complete') {
-        appendControl('fa-solid fa-play', '开始下一轮', () => {
-            startPomodoroWork(pomodoroState.activeTodo || pomodoroState.selectedTodo);
-        }, { primary: true });
-        appendControl('fa-regular fa-clock', '再休息 5 分钟', () => {
-            startPomodoroBreak(5);
-        }, { badge: 5 });
-        appendControl('fa-regular fa-clock', '再休息 10 分钟', () => {
-            startPomodoroBreak(10);
-        }, { badge: 10 });
+            return;
+        }
+        startPomodoroBreak();
+    });
+    controls.appendChild(resetButton);
+    controls.appendChild(mainButton);
+    controls.appendChild(skipButton);
+
+    const caption = document.createElement('div');
+    caption.className = 'pomodoro-caption';
+    caption.setAttribute('data-pomodoro-caption', '');
+    if (isPomodoroRunningPhase(pomodoroState.phase) && Number.isFinite(pomodoroState.endsAt)) {
+        caption.textContent = `结束于 ${new Date(pomodoroState.endsAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
+    } else if (pomodoroState.phase === 'work-paused') {
+        caption.textContent = '已暂停';
+    } else if (pomodoroState.phase === 'idle') {
+        caption.textContent = pomodoroSelectedMode === 'short-break' || pomodoroSelectedMode === 'long-break'
+            ? `按播放键开始 ${preview.label}`
+            : '按播放键开始专注';
+    } else {
+        caption.textContent = phaseMeta.note;
     }
 
-    hero.appendChild(phaseRow);
-    hero.appendChild(visualWrap);
-    if (!workspaceRootPath) {
-        const emptyTaskPicker = document.createElement('div');
-        emptyTaskPicker.className = 'pomodoro-inline-block';
-        const emptyState = document.createElement('div');
-        emptyState.className = 'pomodoro-empty';
-        emptyState.textContent = '可以直接开始专注；打开工作空间后，也可以把番茄钟关联到某条待办。';
-        emptyTaskPicker.appendChild(emptyState);
-        hero.appendChild(emptyTaskPicker);
-        hero.appendChild(controls);
-        container.appendChild(hero);
-    } else {
-        const tasks = sortTodoEntries(getWorkspaceTodoEntries().filter((entry) => !entry.checked), 'position');
-        if (!tasks.length) {
-            const emptyTaskPicker = document.createElement('div');
-            emptyTaskPicker.className = 'pomodoro-inline-block';
-            const emptyState = document.createElement('div');
-            emptyState.className = 'pomodoro-empty';
-            emptyState.textContent = '当前工作空间没有未完成待办。你可以直接开始专注，也可以先写一条待办再关联。';
-            emptyTaskPicker.appendChild(emptyState);
-            hero.appendChild(emptyTaskPicker);
-        } else {
-            const selectedKey = getPomodoroTaskKey(pomodoroState.selectedTodo || pomodoroState.activeTodo);
-            const selectedTodo = tasks.find((entry) => getPomodoroTaskKey(entry) === selectedKey) || pomodoroState.selectedTodo || pomodoroState.activeTodo;
-            const pickerGrid = document.createElement('div');
-            pickerGrid.className = 'pomodoro-task-picker';
+    stage.appendChild(ring);
+    stage.appendChild(controls);
+    stage.appendChild(caption);
 
-            const pickerButton = document.createElement('button');
-            pickerButton.type = 'button';
-            pickerButton.className = `pomodoro-task-picker-button${pomodoroTaskPickerOpen ? ' active' : ''}`;
-            const pickerLabel = document.createElement('div');
-            pickerLabel.className = 'pomodoro-task-picker-label';
-            pickerLabel.textContent = selectedTodo
-                ? `${stripTodoCompletionTimestamp(selectedTodo.text || '(空的待办)')} · ${selectedTodo.documentTitle}`
-                : '可选：选择一个待办关联番茄钟';
-            const pickerCaret = document.createElement('span');
-            pickerCaret.className = 'pomodoro-task-picker-caret';
-            pickerCaret.textContent = pomodoroTaskPickerOpen ? '▴' : '▾';
-            pickerButton.appendChild(pickerLabel);
-            pickerButton.appendChild(pickerCaret);
-            pickerButton.addEventListener('click', () => {
-                pomodoroTaskPickerOpen = !pomodoroTaskPickerOpen;
-                renderPomodoroPanel();
-            });
-            pickerGrid.appendChild(pickerButton);
+    const createDurationSlider = ({ label, value, min, max, step, onCommit }) => {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'pomodoro-setting';
+        const head = document.createElement('div');
+        head.className = 'pomodoro-setting-head';
+        const labelEl = document.createElement('label');
+        labelEl.textContent = label;
+        const valueEl = document.createElement('span');
+        valueEl.className = 'pomodoro-setting-value';
+        head.appendChild(labelEl);
+        head.appendChild(valueEl);
 
-            const locateButton = document.createElement('button');
-            locateButton.type = 'button';
-            locateButton.className = 'pomodoro-button pomodoro-icon-button';
-            locateButton.setAttribute('aria-label', '定位任务');
-            locateButton.innerHTML = '<i class="fa-solid fa-location-crosshairs" aria-hidden="true"></i>';
-            locateButton.addEventListener('click', async () => {
-                const nextTodo = tasks.find((entry) => getPomodoroTaskKey(entry) === selectedKey) || pomodoroState.selectedTodo;
-                if (nextTodo) {
-                    await jumpToTodoEntry(nextTodo);
-                }
-            });
-            pickerGrid.appendChild(locateButton);
+        const sliderRow = document.createElement('div');
+        sliderRow.className = 'pomodoro-slider-row';
+        const slider = document.createElement('input');
+        slider.className = 'pomodoro-setting-range';
+        slider.type = 'range';
+        slider.min = String(min);
+        slider.max = String(max);
+        slider.step = String(step);
+        const rangeHint = document.createElement('div');
+        rangeHint.className = 'pomodoro-setting-range-hint';
 
-            if (pomodoroTaskPickerOpen) {
-                const dropdown = document.createElement('div');
-                dropdown.className = 'pomodoro-task-dropdown';
-                for (const todo of tasks) {
-                    const taskButton = document.createElement('button');
-                    taskButton.type = 'button';
-                    taskButton.className = `pomodoro-task-option${selectedKey === getPomodoroTaskKey(todo) ? ' active' : ''}`;
-                    const taskTitle = document.createElement('div');
-                    taskTitle.className = 'pomodoro-task-option-title';
-                    taskTitle.textContent = stripTodoCompletionTimestamp(todo.text || '(空的待办)');
-                    const taskMeta = document.createElement('div');
-                    taskMeta.className = 'pomodoro-task-option-meta';
-                    taskMeta.textContent = `${todo.documentTitle}${todo.relativeFolder ? ` · ${todo.relativeFolder}` : ''}`;
-                    taskButton.appendChild(taskTitle);
-                    taskButton.appendChild(taskMeta);
-                    taskButton.addEventListener('click', () => {
-                        selectPomodoroTodo(todo);
-                    });
-                    dropdown.appendChild(taskButton);
-                }
-                pickerGrid.appendChild(dropdown);
-            }
-            hero.appendChild(pickerGrid);
-        }
-        hero.appendChild(controls);
-        container.appendChild(hero);
+        let currentValue = clampPomodoroMinutes(value, min, min, max, step);
 
-        const settingsCard = document.createElement('div');
-        settingsCard.className = 'pomodoro-card';
+        const updateSliderVisual = (nextValue) => {
+            currentValue = clampPomodoroMinutes(nextValue, currentValue, min, max, step);
+            const ratio = max === min ? 0 : (currentValue - min) / (max - min);
+            slider.value = String(currentValue);
+            slider.style.setProperty('--pomodoro-slider-progress', `${Math.round(ratio * 100)}%`);
+            valueEl.textContent = `${currentValue} 分钟`;
+            rangeHint.textContent = `每格 ${step} 分钟 · 范围 ${min}-${max}`;
+        };
+
+        const commitDuration = (nextValue, options = {}) => {
+            const {
+                render = true,
+                persist = true
+            } = options;
+            const clampedValue = clampPomodoroMinutes(nextValue, currentValue, min, max, step);
+            updateSliderVisual(clampedValue);
+            onCommit(clampedValue, { render, persist });
+        };
+
+        slider.addEventListener('input', () => {
+            commitDuration(slider.value, { render: false, persist: false });
+        });
+        slider.addEventListener('change', () => {
+            commitDuration(slider.value, { render: true, persist: true });
+        });
+
+        updateSliderVisual(currentValue);
+        sliderRow.appendChild(slider);
+
+        wrapper.appendChild(head);
+        wrapper.appendChild(sliderRow);
+        wrapper.appendChild(rangeHint);
+        return wrapper;
+    };
+
+    if (pomodoroCustomSettingsOpen) {
+        const customPanel = document.createElement('div');
+        customPanel.className = 'pomodoro-custom-panel';
         const settingsGrid = document.createElement('div');
         settingsGrid.className = 'pomodoro-settings-grid';
-        const createDurationSlider = ({ label, value, min, max, step, onCommit }) => {
-            const wrapper = document.createElement('div');
-            wrapper.className = 'pomodoro-setting';
-            const head = document.createElement('div');
-            head.className = 'pomodoro-setting-head';
-            const labelEl = document.createElement('label');
-            labelEl.textContent = label;
-            const valueEl = document.createElement('span');
-            valueEl.className = 'pomodoro-setting-value';
-            head.appendChild(labelEl);
-            head.appendChild(valueEl);
-
-            const sliderRow = document.createElement('div');
-            sliderRow.className = 'pomodoro-slider-row';
-            const slider = document.createElement('input');
-            slider.className = 'pomodoro-setting-range';
-            slider.type = 'range';
-            slider.min = String(min);
-            slider.max = String(max);
-            slider.step = String(step);
-            const rangeHint = document.createElement('div');
-            rangeHint.className = 'pomodoro-setting-range-hint';
-
-            let currentValue = clampPomodoroMinutes(value, min, min, max, step);
-
-            const updateSliderVisual = (nextValue) => {
-                currentValue = clampPomodoroMinutes(nextValue, currentValue, min, max, step);
-                const ratio = max === min ? 0 : (currentValue - min) / (max - min);
-                slider.value = String(currentValue);
-                slider.style.setProperty('--pomodoro-slider-progress', `${Math.round(ratio * 100)}%`);
-                valueEl.textContent = `${currentValue} 分钟`;
-                rangeHint.textContent = `每格 ${step} 分钟 · 范围 ${min}-${max}`;
-            };
-
-            const commitDuration = (nextValue, options = {}) => {
-                const {
-                    render = true,
-                    persist = true
-                } = options;
-                const clampedValue = clampPomodoroMinutes(nextValue, currentValue, min, max, step);
-                updateSliderVisual(clampedValue);
-                onCommit(clampedValue, { render, persist });
-            };
-
-            slider.addEventListener('input', () => {
-                commitDuration(slider.value, { render: false, persist: false });
-            });
-            slider.addEventListener('change', () => {
-                commitDuration(slider.value, { render: true, persist: true });
-            });
-
-            updateSliderVisual(currentValue);
-            sliderRow.appendChild(slider);
-
-            wrapper.appendChild(head);
-            wrapper.appendChild(sliderRow);
-            wrapper.appendChild(rangeHint);
-            return wrapper;
-        };
         settingsGrid.appendChild(createDurationSlider({
             label: '工作时间',
             value: pomodoroState.workMinutes,
@@ -15177,76 +18466,13 @@ function renderPomodoroPanel() {
                 updatePomodoroDurations(pomodoroState.workMinutes, value, options);
             }
         }));
-        settingsCard.appendChild(settingsGrid);
-        container.appendChild(settingsCard);
+        customPanel.appendChild(settingsGrid);
+        stage.appendChild(customPanel);
     }
-    const stats = getPomodoroStats();
-    const statsCard = document.createElement('div');
-    statsCard.className = 'pomodoro-card';
-    const statsTitle = document.createElement('div');
-    statsTitle.className = 'pomodoro-task-list-title';
-    statsTitle.textContent = '统计';
-    statsCard.appendChild(statsTitle);
 
-    const statsGrid = document.createElement('div');
-    statsGrid.className = 'pomodoro-stats-grid';
-
-    const createPomodoroGlyphs = (count) => {
-        const wrap = document.createElement('div');
-        wrap.className = 'pomodoro-glyphs';
-        const glyph = document.createElement('span');
-        glyph.className = 'pomodoro-glyph';
-        glyph.textContent = '🍅';
-        const suffix = document.createElement('span');
-        suffix.className = 'pomodoro-glyph-more';
-        suffix.textContent = `×${Math.max(0, Number(count) || 0)}`;
-        wrap.appendChild(glyph);
-        wrap.appendChild(suffix);
-        return wrap;
-    };
-
-    const buildStatList = (titleText, entries) => {
-        const section = document.createElement('div');
-        section.className = 'pomodoro-stat-section';
-        const titleEl = document.createElement('div');
-        titleEl.className = 'pomodoro-stat-title';
-        titleEl.textContent = titleText;
-        section.appendChild(titleEl);
-
-        if (!entries.length) {
-            const empty = document.createElement('div');
-            empty.className = 'pomodoro-empty compact';
-            empty.textContent = '还没有记录。';
-            section.appendChild(empty);
-            return section;
-        }
-
-        const list = document.createElement('div');
-        list.className = 'pomodoro-stat-list';
-        for (const entry of entries) {
-            const row = document.createElement('div');
-            row.className = 'pomodoro-stat-row';
-            const label = document.createElement('div');
-            label.className = 'pomodoro-stat-label';
-            label.textContent = entry[0];
-            const value = document.createElement('div');
-            value.className = 'pomodoro-stat-value';
-            value.appendChild(createPomodoroGlyphs(entry[1]));
-            row.appendChild(label);
-            row.appendChild(value);
-            list.appendChild(row);
-        }
-        section.appendChild(list);
-        return section;
-    };
-
-    statsGrid.appendChild(buildStatList('每日统计', stats.daily));
-    statsGrid.appendChild(buildStatList('每周统计', stats.weekly));
-    statsGrid.appendChild(buildStatList('每月统计', stats.monthly));
-    statsGrid.appendChild(buildStatList('每年统计', stats.yearly));
-    statsGrid.appendChild(buildStatList('任务统计', stats.tasks));
-    statsCard.appendChild(statsGrid);
-    container.appendChild(statsCard);
+    shell.appendChild(modeTabs);
+    shell.appendChild(stage);
+    container.appendChild(shell);
 }
 
 function updatePomodoroRuntimeDisplay() {
@@ -15260,25 +18486,30 @@ function updatePomodoroRuntimeDisplay() {
     const clock = container.querySelector('[data-pomodoro-clock]');
     const countdown = container.querySelector('[data-pomodoro-countdown]');
     const caption = container.querySelector('[data-pomodoro-caption]');
-    const todayCount = container.querySelector('[data-pomodoro-today-count]');
+    const cyclePill = container.querySelector('[data-pomodoro-cycle-pill]');
 
     if (clock) {
         clock.style.setProperty('--pomodoro-progress', `${Math.round(getPomodoroProgress() * 100)}%`);
     }
     if (countdown) {
-        countdown.textContent = getPomodoroDisplayTime();
+        countdown.textContent = pomodoroState.phase === 'idle'
+            ? `${String(getPomodoroModePreview(pomodoroCustomSettingsOpen ? 'custom' : pomodoroSelectedMode).minutes).padStart(2, '0')}:00`
+            : getPomodoroDisplayTime();
     }
     if (caption) {
         if (isPomodoroRunningPhase(pomodoroState.phase) && Number.isFinite(pomodoroState.endsAt)) {
             caption.textContent = `剩余 ${formatPomodoroCountdown(getPomodoroRemainingMs())} · 结束于 ${new Date(pomodoroState.endsAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
         } else if (pomodoroState.phase === 'work-paused') {
             caption.textContent = `已暂停 · 剩余 ${formatPomodoroCountdown(getPomodoroRemainingMs())}`;
+        } else if (pomodoroState.phase === 'idle') {
+            const idlePreview = getPomodoroModePreview(pomodoroCustomSettingsOpen ? 'custom' : pomodoroSelectedMode);
+            caption.textContent = `按播放键开始 ${idlePreview.label}`;
         } else {
             caption.textContent = `工作 ${pomodoroState.workMinutes} 分钟 / 休息 ${pomodoroState.breakMinutes} 分钟`;
         }
     }
-    if (todayCount) {
-        todayCount.textContent = `今日完成 ${getPomodoroTodayCycleCount()} 轮`;
+    if (cyclePill) {
+        cyclePill.innerHTML = `<span aria-hidden="true">🍅</span><span>今日第 ${getPomodoroDisplayedCycleCount()} 个番茄钟</span>`;
     }
 }
 
@@ -15321,7 +18552,7 @@ function updateTodoPanelSettings(patch = {}) {
         ...patch
     });
     syncTodoPanelControls();
-    renderTodoList(getTabMarkdownContent());
+    renderTodoList(getActiveEditorSnapshot());
     return nextSettings;
 }
 
@@ -15401,6 +18632,92 @@ function getAttachmentReferences(content) {
     return references;
 }
 
+function collectAttachmentDocumentJsonRefs(documentJson, bundlePath = window.currentPath) {
+    const references = [];
+    const root = documentJson && typeof documentJson === 'object' ? documentJson : null;
+    if (!root) {
+        return references;
+    }
+
+    const normalizedBundlePath = bundlePath ? path.resolve(String(bundlePath)) : '';
+    let kindIndex = 0;
+
+    const visit = (node) => {
+        if (!node || typeof node !== 'object') {
+            return;
+        }
+
+        const typeName = String(node.type || '');
+        let rawRelativePath = '';
+        let label = '';
+        let isDirectory = false;
+
+        if (typeName === 'image') {
+            rawRelativePath = String(node.attrs?.src || '');
+            label = String(node.attrs?.alt || node.attrs?.title || '') || path.basename(rawRelativePath);
+        } else if (typeName === 'kangarooAttachment') {
+            rawRelativePath = String(node.attrs?.href || node.attrs?.src || '');
+            label = String(node.attrs?.label || node.attrs?.title || '') || path.basename(rawRelativePath);
+            isDirectory = Boolean(node.attrs?.isDirectory);
+        } else if (typeName === 'kangarooVideo' || typeName === 'kangarooPdf') {
+            rawRelativePath = String(node.attrs?.href || node.attrs?.src || '');
+            label = String(node.attrs?.label || node.attrs?.title || '') || path.basename(rawRelativePath);
+        }
+
+        if (rawRelativePath) {
+            const normalizedRelativePath = normalizeAttachmentMarkdownHref(rawRelativePath);
+            const fullRelativePath = normalizedRelativePath.startsWith('attachments/')
+                ? normalizedRelativePath
+                : path.join('attachments', normalizedRelativePath);
+            const absolutePath = normalizedBundlePath
+                ? path.resolve(normalizedBundlePath, fullRelativePath)
+                : path.resolve(fullRelativePath);
+            let stat = null;
+            try {
+                stat = fs.existsSync(absolutePath) ? fs.statSync(absolutePath) : null;
+            } catch {
+                stat = null;
+            }
+
+            references.push({
+                label: label || path.basename(fullRelativePath),
+                relativePath: fullRelativePath,
+                absolutePath,
+                lineNumber: kindIndex + 1,
+                kindIndex,
+                exists: Boolean(stat),
+                isDirectory: Boolean(isDirectory || (stat && stat.isDirectory()))
+            });
+            kindIndex += 1;
+        }
+
+        if (Array.isArray(node.content)) {
+            for (const child of node.content) {
+                visit(child);
+            }
+        }
+    };
+
+    visit(root);
+    return references;
+}
+
+function normalizeAttachmentRelativePath(relativePath) {
+    return String(relativePath || '')
+        .replace(/^attachments\//i, '')
+        .replace(/\\/g, '/')
+        .replace(/^\/+/, '');
+}
+
+function getAttachmentTopLevelEntryName(relativePath) {
+    const normalized = normalizeAttachmentRelativePath(relativePath);
+    if (!normalized) {
+        return '';
+    }
+
+    return normalized.split('/')[0] || '';
+}
+
 function getAttachmentTreeChildren(targetPath, depth = 0) {
     if (depth > 4 || !fs.existsSync(targetPath)) {
         return [];
@@ -15437,6 +18754,7 @@ function getAttachmentDirectoryEntries(attachmentsDir) {
     }
 
     return entries
+        .filter((entry) => entry.name !== IMAGE_RESOURCE_DIR_NAME)
         .filter((entry) => !entry.name.startsWith('.'))
         .sort((a, b) => {
             if (a.isDirectory() && !b.isDirectory()) return -1;
@@ -15485,12 +18803,29 @@ function getAttachmentDirectoryEntriesSignature(entries) {
     return parts.join('|');
 }
 
+function suppressAttachmentDropEvents(element) {
+    if (!element) return;
+
+    const suppress = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.dataTransfer) {
+            event.dataTransfer.dropEffect = 'none';
+        }
+    };
+
+    element.addEventListener('dragenter', suppress);
+    element.addEventListener('dragover', suppress);
+    element.addEventListener('drop', suppress);
+}
+
 function renderAttachmentFilesystemTree(entries, container, depth = 0) {
     for (const entry of entries || []) {
         const card = document.createElement('div');
         card.className = `attachment-item attachment-orphan-card${entry.isDirectory ? ' folder' : ''}`;
         card.style.marginLeft = `${depth * 12}px`;
         card.setAttribute('draggable', 'true');
+        suppressAttachmentDropEvents(card);
 
         const row = document.createElement('div');
         row.className = 'attachment-item-row';
@@ -15560,6 +18895,7 @@ function renderAttachmentChildTree(children, container, referenceLineNumber, ref
         item.className = `attachment-child${child.isDirectory ? ' folder' : ''}`;
         item.innerText = `${child.isDirectory ? '▸ ' : ''}${child.name}`;
         item.setAttribute('draggable', 'true');
+        suppressAttachmentDropEvents(item);
         item.addEventListener('click', () => {
             jumpEditorToAnchor('attachment', referenceIndex, {
                 lineNumber: referenceLineNumber,
@@ -15635,17 +18971,143 @@ function hideTimelineDayContextMenu() {
     timelineDayContextTarget = null;
 }
 
+function hideTimelineDiaryContextMenu() {
+    const menu = document.getElementById('timeline-diary-context-menu');
+    if (!menu) return;
+
+    menu.classList.remove('show');
+    timelineDiaryContextTarget = null;
+}
+
+function hideTimelineTodoContextMenu() {
+    const menu = document.getElementById('timeline-todo-context-menu');
+    if (!menu) return;
+
+    menu.classList.remove('show');
+    timelineTodoContextTarget = null;
+}
+
+function clearTimelineTodoDropIndicators() {
+    document.querySelectorAll('.timeline-todo-group.drop-target').forEach((element) => {
+        element.classList.remove('drop-target');
+    });
+    document.querySelectorAll('.todo-item.drop-insert-before, .todo-item.drop-insert-after').forEach((element) => {
+        element.classList.remove('drop-insert-before', 'drop-insert-after');
+    });
+}
+
 function markContextMenuRecentlyOpened() {
     suppressContextMenuHideUntil = Date.now() + 350;
+}
+
+const CONTEXT_MENU_MIN_WIDTHS = {
+    default: 136,
+    attachment: 136,
+    editorLink: 152,
+    previewImage: 148,
+    tab: 156,
+    timeline: 136,
+    workspace: 152,
+    workspaceSubmenu: 168
+};
+
+function positionContextMenu(menu, anchor, options = {}) {
+    if (!menu || !anchor) return;
+
+    const viewportPadding = Number.isFinite(options.viewportPadding) ? options.viewportPadding : 8;
+    const kind = options.kind || menu.dataset?.contextMenuKind || 'default';
+    const fallbackMinWidth = CONTEXT_MENU_MIN_WIDTHS[kind] || CONTEXT_MENU_MIN_WIDTHS.default;
+    const computedStyle = window.getComputedStyle(menu);
+    const computedMinWidth = Number.parseFloat(computedStyle.getPropertyValue('--context-menu-min-width'));
+    const minWidth = Number.isFinite(options.minWidth)
+        ? options.minWidth
+        : (Number.isFinite(computedMinWidth) ? computedMinWidth : fallbackMinWidth);
+    const maxWidth = Number.isFinite(options.maxWidth)
+        ? options.maxWidth
+        : Math.max(minWidth, window.innerWidth - (viewportPadding * 2));
+    const gap = Number.isFinite(options.gap) ? options.gap : 6;
+
+    menu.style.setProperty('--context-menu-min-width', `${minWidth}px`);
+    menu.style.setProperty('--context-menu-max-width', `${maxWidth}px`);
+    menu.style.minWidth = `${minWidth}px`;
+    menu.style.maxWidth = `${maxWidth}px`;
+
+    const menuWidth = Math.min(menu.offsetWidth || minWidth, maxWidth);
+    const menuHeight = menu.offsetHeight || 0;
+
+    let left;
+    let top;
+    const hasRectAnchor = Number.isFinite(anchor.left) && Number.isFinite(anchor.top) && Number.isFinite(anchor.right);
+
+    if (hasRectAnchor) {
+        const preferredPlacement = options.placement || 'right';
+        const preferredLeft = preferredPlacement === 'left'
+            ? anchor.left - menuWidth - gap
+            : anchor.right + gap;
+        const flippedLeft = preferredPlacement === 'left'
+            ? anchor.right + gap
+            : anchor.left - menuWidth - gap;
+        const candidateLeft = (preferredLeft + menuWidth + viewportPadding) > window.innerWidth || preferredLeft < viewportPadding
+            ? flippedLeft
+            : preferredLeft;
+        left = Math.min(candidateLeft, window.innerWidth - menuWidth - viewportPadding);
+        top = Math.min(anchor.top, window.innerHeight - menuHeight - viewportPadding);
+    } else {
+        const anchorX = Number.isFinite(anchor.clientX) ? anchor.clientX : 0;
+        const anchorY = Number.isFinite(anchor.clientY) ? anchor.clientY : 0;
+        left = Math.min(anchorX, window.innerWidth - menuWidth - viewportPadding);
+        top = Math.min(anchorY, window.innerHeight - menuHeight - viewportPadding);
+    }
+
+    menu.style.left = `${Math.max(left, viewportPadding)}px`;
+    menu.style.top = `${Math.max(top, viewportPadding)}px`;
+}
+
+function showTimelineTodoContextMenu(event, todo, itemElement = null) {
+    const menu = document.getElementById('timeline-todo-context-menu');
+    if (!menu) return;
+
+    hideTimelineDayContextMenu();
+    hideTimelineDiaryContextMenu();
+    hideAttachmentContextMenu();
+    hidePreviewImageContextMenu();
+    hideTabContextMenu();
+    hideWorkspaceContextMenu();
+    hideEditorLinkContextMenu();
+    timelineTodoContextTarget = todo ? {
+        ...todo,
+        bundlePath: todo.bundlePath ? path.resolve(todo.bundlePath) : '',
+        text: getTimelineTodoItemDisplayText(todo),
+        element: itemElement || null
+    } : null;
+
+    const editButton = document.getElementById('timeline-todo-menu-edit');
+    const locateButton = document.getElementById('timeline-todo-menu-locate');
+    const deleteButton = document.getElementById('timeline-todo-menu-delete');
+    if (editButton) {
+        editButton.disabled = !timelineTodoContextTarget?.bundlePath;
+    }
+    if (locateButton) {
+        locateButton.disabled = !timelineTodoContextTarget?.bundlePath;
+    }
+    if (deleteButton) {
+        deleteButton.disabled = !timelineTodoContextTarget?.bundlePath;
+    }
+
+    menu.classList.add('show');
+    markContextMenuRecentlyOpened();
+    positionContextMenu(menu, event, { kind: 'timeline', minWidth: 136 });
 }
 
 function showTimelineDayContextMenu(event, dateLike) {
     const menu = document.getElementById('timeline-day-context-menu');
     if (!menu) return;
 
+    hideTimelineDiaryContextMenu();
     timelineDayContextTarget = dateLike ? new Date(dateLike) : null;
     const openDiaryButton = document.getElementById('timeline-day-menu-open-diary');
     const newDiaryButton = document.getElementById('timeline-day-menu-new-diary');
+    const deleteDiaryButton = document.getElementById('timeline-day-menu-delete-diary');
     const diaryBundlePath = timelineDayContextTarget ? findDiaryBundleForDate(timelineDayContextTarget) : '';
     if (openDiaryButton) {
         openDiaryButton.style.display = diaryBundlePath ? '' : 'none';
@@ -15653,15 +19115,38 @@ function showTimelineDayContextMenu(event, dateLike) {
     if (newDiaryButton) {
         newDiaryButton.disabled = !workspaceRootPath;
     }
+    if (deleteDiaryButton) {
+        deleteDiaryButton.style.display = diaryBundlePath ? '' : 'none';
+    }
 
     menu.classList.add('show');
     markContextMenuRecentlyOpened();
-    const menuWidth = menu.offsetWidth || 168;
-    const menuHeight = menu.offsetHeight || 44;
-    const left = Math.min(event.clientX, window.innerWidth - menuWidth - 8);
-    const top = Math.min(event.clientY, window.innerHeight - menuHeight - 8);
-    menu.style.left = `${Math.max(left, 8)}px`;
-    menu.style.top = `${Math.max(top, 8)}px`;
+    positionContextMenu(menu, event, { kind: 'timeline', minWidth: 136 });
+}
+
+function showTimelineDiaryContextMenu(event, diaryEntry) {
+    const menu = document.getElementById('timeline-diary-context-menu');
+    if (!menu) return;
+
+    hideTimelineDayContextMenu();
+    timelineDiaryContextTarget = diaryEntry ? {
+        path: path.resolve(String(diaryEntry.path || '')),
+        dateKey: String(diaryEntry.dateKey || ''),
+        title: String(diaryEntry.title || '')
+    } : null;
+
+    const openDiaryButton = document.getElementById('timeline-diary-menu-open-diary');
+    const deleteDiaryButton = document.getElementById('timeline-diary-menu-delete-diary');
+    if (openDiaryButton) {
+        openDiaryButton.disabled = !timelineDiaryContextTarget?.path;
+    }
+    if (deleteDiaryButton) {
+        deleteDiaryButton.disabled = !timelineDiaryContextTarget?.path;
+    }
+
+    menu.classList.add('show');
+    markContextMenuRecentlyOpened();
+    positionContextMenu(menu, event, { kind: 'timeline', minWidth: 136 });
 }
 
 async function openDiaryBundleForDate(dateLike) {
@@ -15697,12 +19182,7 @@ function showAttachmentContextMenu(event, reference) {
 
     menu.classList.add('show');
     markContextMenuRecentlyOpened();
-    const menuWidth = menu.offsetWidth || 160;
-    const menuHeight = menu.offsetHeight || 90;
-    const left = Math.min(event.clientX, window.innerWidth - menuWidth - 8);
-    const top = Math.min(event.clientY, window.innerHeight - menuHeight - 8);
-    menu.style.left = `${Math.max(left, 8)}px`;
-    menu.style.top = `${Math.max(top, 8)}px`;
+    positionContextMenu(menu, event, { kind: 'attachment', minWidth: 136 });
 }
 
 function buildAttachmentContextReference(reference) {
@@ -15753,25 +19233,6 @@ function isPathInsideCurrentBundleAttachments(targetPath) {
 
 async function syncOpenEditorAfterAttachmentRename(oldAbsolutePath, newAbsolutePath) {
     let didRepairDocument = false;
-    const currentMarkdown = window.editor && typeof window.editor.getValue === 'function'
-        ? window.editor.getValue()
-        : '';
-    const rewrittenMarkdown = window.editor && typeof window.editor.getValue === 'function'
-        ? rewriteAttachmentReferencesAfterRenameInMarkdown(currentMarkdown, oldAbsolutePath, newAbsolutePath)
-        : currentMarkdown;
-
-    if (
-        window.editor
-        && typeof window.editor.setValue === 'function'
-        && rewrittenMarkdown !== currentMarkdown
-    ) {
-        window.editor.setValue(rewrittenMarkdown, {
-            emitChange: true,
-            preserveSelection: true,
-            preserveViewport: true
-        });
-        didRepairDocument = true;
-    }
 
     if (window.editor && typeof window.editor.repairRenderedAttachmentNodesByAbsolutePath === 'function') {
         didRepairDocument = Boolean(window.editor.repairRenderedAttachmentNodesByAbsolutePath(oldAbsolutePath, newAbsolutePath)) || didRepairDocument;
@@ -15779,6 +19240,28 @@ async function syncOpenEditorAfterAttachmentRename(oldAbsolutePath, newAbsoluteP
 
     if (window.editor && typeof window.editor.updateAttachmentReferencesAfterRename === 'function') {
         didRepairDocument = Boolean(window.editor.updateAttachmentReferencesAfterRename(oldAbsolutePath, newAbsolutePath)) || didRepairDocument;
+    }
+
+    if (
+        !didRepairDocument
+        && window.editor
+        && typeof window.editor.getValue === 'function'
+        && typeof window.editor.setValue === 'function'
+    ) {
+        const currentMarkdown = window.editor.getValue();
+        const rewrittenMarkdown = rewriteAttachmentReferencesAfterRenameInMarkdown(
+            currentMarkdown,
+            oldAbsolutePath,
+            newAbsolutePath
+        );
+        if (rewrittenMarkdown !== currentMarkdown) {
+            window.editor.setValue(rewrittenMarkdown, {
+                emitChange: true,
+                preserveSelection: true,
+                preserveViewport: true
+            });
+            didRepairDocument = true;
+        }
     }
 
     if (!didRepairDocument && window.editor && typeof window.editor.refreshDisplayState === 'function') {
@@ -15794,23 +19277,12 @@ async function syncOpenEditorAfterAttachmentRename(oldAbsolutePath, newAbsoluteP
     }
 
     const activeTab = getActiveTab();
-    if (
-        didSyncTabs
-        && activeTab
-        && window.editor
-        && typeof window.editor.getValue === 'function'
-        && typeof window.editor.setValue === 'function'
-    ) {
-        const nextActiveMarkdown = String(activeTab.content || '');
-        if (nextActiveMarkdown !== activeMarkdown) {
-            window.editor.setValue(nextActiveMarkdown, {
-                emitChange: true,
-                preserveSelection: true,
-                preserveViewport: true,
-                forceRebuild: false
-            });
-            didRepairDocument = true;
-        }
+    if (didSyncTabs && activeTab && window.editor) {
+        const { markdown: nextActiveMarkdown, documentJson: nextActiveDocumentJson } = getActiveEditorSnapshot();
+        activeTab.content = nextActiveMarkdown;
+        activeTab.documentJson = nextActiveDocumentJson;
+        activeTab.previousContent = nextActiveMarkdown;
+        didRepairDocument = true;
     }
 
     updateOutline();
@@ -15819,12 +19291,17 @@ async function syncOpenEditorAfterAttachmentRename(oldAbsolutePath, newAbsoluteP
         scheduleWorkspaceTreeRefresh();
     }
 
-    if (window.editor && typeof window.editor.getValue === 'function') {
-        persistActiveTabState(window.editor.getValue());
+    if (window.editor) {
+        persistActiveTabState(getActiveEditorSnapshot().markdown);
     }
 
     if (window.currentPath) {
-        restoreRecoveredEntries(window.editor && typeof window.editor.getValue === 'function' ? window.editor.getValue() : '');
+        restoreRecoveredEntries(
+            window.editor && typeof window.editor.getValue === 'function' ? window.editor.getValue() : '',
+            window.editor && typeof window.editor.getDocumentJson === 'function'
+                ? window.editor.getDocumentJson()
+                : null
+        );
         bundleAttachmentSnapshot = captureBundleAttachmentSnapshot(window.currentPath);
         bundleAttachmentSnapshotRoot = path.resolve(window.currentPath);
     }
@@ -15839,107 +19316,155 @@ async function syncOpenEditorAfterAttachmentRename(oldAbsolutePath, newAbsoluteP
 }
 
 async function renameBundleAttachmentAbsolutePath(absolutePath) {
-    const sourcePath = path.resolve(String(absolutePath || ''));
-    if (!sourcePath) return false;
-    if (!fs.existsSync(sourcePath)) {
-        alert(`重命名失败: 找不到附件 ${sourcePath}`);
-        return false;
-    }
-
-    let stat = null;
-    try {
-        stat = fs.statSync(sourcePath);
-    } catch (error) {
-        alert(`重命名失败: ${error.message}`);
-        return false;
-    }
-
-    const targetPath = await ipcRenderer.invoke('dialog:renameAttachmentPath', {
-        defaultPath: sourcePath,
-        isDirectory: Boolean(stat?.isDirectory?.())
-    });
-
-    if (!targetPath) return false;
-
-    const normalizedTargetPath = path.resolve(String(targetPath));
-    if (normalizedTargetPath === sourcePath) return false;
-
-    if (path.dirname(normalizedTargetPath) !== path.dirname(sourcePath)) {
-        alert('这里只支持重命名附件，不支持移动到别的目录。');
-        return false;
-    }
-
-    if (fs.existsSync(normalizedTargetPath)) {
-        alert(`已存在同名项目：${path.basename(normalizedTargetPath)}`);
-        return false;
-    }
-
-    try {
-        if (window.currentPath && isSameOrNestedPath(sourcePath, path.resolve(window.currentPath))) {
-            createBundleSnapshotSafely(window.currentPath, {
-                reason: 'before-attachment-rename',
-                title: '重命名附件前',
-                markdown: getTabMarkdownContent(),
-                force: true
-            });
+    return runHistoryTransaction('重命名附件', async () => {
+        const sourcePath = path.resolve(String(absolutePath || ''));
+        if (!sourcePath) return false;
+        if (!fs.existsSync(sourcePath)) {
+            alert(`重命名失败: 找不到附件 ${sourcePath}`);
+            return false;
         }
-        suppressBundleAttachmentWatcherUntil = Date.now() + 300;
-        fs.renameSync(sourcePath, normalizedTargetPath);
-        await syncOpenEditorAfterAttachmentRename(sourcePath, normalizedTargetPath);
 
-        return true;
-    } catch (error) {
-        alert(`重命名失败: ${error.message}`);
-        return false;
-    }
+        let stat = null;
+        try {
+            stat = fs.statSync(sourcePath);
+        } catch (error) {
+            alert(`重命名失败: ${error.message}`);
+            return false;
+        }
+
+        const targetPath = await ipcRenderer.invoke('dialog:renameAttachmentPath', {
+            defaultPath: sourcePath,
+            isDirectory: Boolean(stat?.isDirectory?.())
+        });
+
+        if (!targetPath) return false;
+
+        const normalizedTargetPath = path.resolve(String(targetPath));
+        if (normalizedTargetPath === sourcePath) return false;
+
+        if (path.dirname(normalizedTargetPath) !== path.dirname(sourcePath)) {
+            alert('这里只支持重命名附件，不支持移动到别的目录。');
+            return false;
+        }
+
+        if (fs.existsSync(normalizedTargetPath)) {
+            alert(`已存在同名项目：${path.basename(normalizedTargetPath)}`);
+            return false;
+        }
+
+        try {
+            if (window.currentPath && isSameOrNestedPath(sourcePath, path.resolve(window.currentPath))) {
+                createBundleSnapshotSafely(window.currentPath, {
+                    reason: 'before-attachment-rename',
+                    title: '重命名附件前',
+                    markdown: getTabMarkdownContent(),
+                    force: true
+                });
+            }
+            suppressBundleAttachmentWatcherUntil = Date.now() + 300;
+            fs.renameSync(sourcePath, normalizedTargetPath);
+            recordHistoryAttachmentStep({
+                kind: 'attachment-rename',
+                label: '重命名附件',
+                async undo() {
+                    if (!fs.existsSync(normalizedTargetPath) || fs.existsSync(sourcePath)) {
+                        return false;
+                    }
+                    suppressBundleAttachmentWatcherUntil = Date.now() + 300;
+                    fs.renameSync(normalizedTargetPath, sourcePath);
+                    await syncOpenEditorAfterAttachmentRename(normalizedTargetPath, sourcePath);
+                    return true;
+                },
+                async redo() {
+                    if (!fs.existsSync(sourcePath) || fs.existsSync(normalizedTargetPath)) {
+                        return false;
+                    }
+                    suppressBundleAttachmentWatcherUntil = Date.now() + 300;
+                    fs.renameSync(sourcePath, normalizedTargetPath);
+                    await syncOpenEditorAfterAttachmentRename(sourcePath, normalizedTargetPath);
+                    return true;
+                }
+            });
+            await syncOpenEditorAfterAttachmentRename(sourcePath, normalizedTargetPath);
+
+            return true;
+        } catch (error) {
+            alert(`重命名失败: ${error.message}`);
+            return false;
+        }
+    });
 }
 
 async function renameBundleAttachmentAbsolutePathToName(absolutePath, nextName) {
-    const sourcePath = path.resolve(String(absolutePath || ''));
-    const trimmedName = String(nextName || '').trim();
+    return runHistoryTransaction('重命名附件', async () => {
+        const sourcePath = path.resolve(String(absolutePath || ''));
+        const trimmedName = String(nextName || '').trim();
 
-    if (!sourcePath || !trimmedName) {
-        return false;
-    }
-
-    if (!fs.existsSync(sourcePath)) {
-        alert(`重命名失败: 找不到附件 ${sourcePath}`);
-        return false;
-    }
-
-    if (/[\\/]/.test(trimmedName)) {
-        alert('名称不能包含斜杠。');
-        return false;
-    }
-
-    const normalizedTargetPath = path.join(path.dirname(sourcePath), trimmedName);
-    if (normalizedTargetPath === sourcePath) {
-        return true;
-    }
-
-    if (fs.existsSync(normalizedTargetPath)) {
-        alert(`已存在同名项目：${trimmedName}`);
-        return false;
-    }
-
-    try {
-        if (window.currentPath && isSameOrNestedPath(sourcePath, path.resolve(window.currentPath))) {
-            createBundleSnapshotSafely(window.currentPath, {
-                reason: 'before-attachment-rename',
-                title: '重命名附件前',
-                markdown: getTabMarkdownContent(),
-                force: true
-            });
+        if (!sourcePath || !trimmedName) {
+            return false;
         }
-        suppressBundleAttachmentWatcherUntil = Date.now() + 300;
-        fs.renameSync(sourcePath, normalizedTargetPath);
-        await syncOpenEditorAfterAttachmentRename(sourcePath, normalizedTargetPath);
 
-        return true;
-    } catch (error) {
-        alert(`重命名失败: ${error.message}`);
-        return false;
-    }
+        if (!fs.existsSync(sourcePath)) {
+            alert(`重命名失败: 找不到附件 ${sourcePath}`);
+            return false;
+        }
+
+        if (/[\\/]/.test(trimmedName)) {
+            alert('名称不能包含斜杠。');
+            return false;
+        }
+
+        const normalizedTargetPath = path.join(path.dirname(sourcePath), trimmedName);
+        if (normalizedTargetPath === sourcePath) {
+            return true;
+        }
+
+        if (fs.existsSync(normalizedTargetPath)) {
+            alert(`已存在同名项目：${trimmedName}`);
+            return false;
+        }
+
+        try {
+            if (window.currentPath && isSameOrNestedPath(sourcePath, path.resolve(window.currentPath))) {
+                createBundleSnapshotSafely(window.currentPath, {
+                    reason: 'before-attachment-rename',
+                    title: '重命名附件前',
+                    markdown: getTabMarkdownContent(),
+                    force: true
+                });
+            }
+            suppressBundleAttachmentWatcherUntil = Date.now() + 300;
+            fs.renameSync(sourcePath, normalizedTargetPath);
+            recordHistoryAttachmentStep({
+                kind: 'attachment-rename',
+                label: '重命名附件',
+                async undo() {
+                    if (!fs.existsSync(normalizedTargetPath) || fs.existsSync(sourcePath)) {
+                        return false;
+                    }
+                    suppressBundleAttachmentWatcherUntil = Date.now() + 300;
+                    fs.renameSync(normalizedTargetPath, sourcePath);
+                    await syncOpenEditorAfterAttachmentRename(normalizedTargetPath, sourcePath);
+                    return true;
+                },
+                async redo() {
+                    if (!fs.existsSync(sourcePath) || fs.existsSync(normalizedTargetPath)) {
+                        return false;
+                    }
+                    suppressBundleAttachmentWatcherUntil = Date.now() + 300;
+                    fs.renameSync(sourcePath, normalizedTargetPath);
+                    await syncOpenEditorAfterAttachmentRename(sourcePath, normalizedTargetPath);
+                    return true;
+                }
+            });
+            await syncOpenEditorAfterAttachmentRename(sourcePath, normalizedTargetPath);
+
+            return true;
+        } catch (error) {
+            alert(`重命名失败: ${error.message}`);
+            return false;
+        }
+    });
 }
 
 function getAttachmentInlineRenameLabelElement(element) {
@@ -16073,12 +19598,7 @@ function showPreviewImageContextMenu(event, imagePath) {
     }
     menu.classList.add('show');
     markContextMenuRecentlyOpened();
-    const menuWidth = menu.offsetWidth || 180;
-    const menuHeight = menu.offsetHeight || 120;
-    const left = Math.min(event.clientX, window.innerWidth - menuWidth - 8);
-    const top = Math.min(event.clientY, window.innerHeight - menuHeight - 8);
-    menu.style.left = `${Math.max(left, 8)}px`;
-    menu.style.top = `${Math.max(top, 8)}px`;
+    positionContextMenu(menu, event, { kind: 'previewImage', minWidth: 148 });
 }
 
 function showTabContextMenu(event, tabId) {
@@ -16092,12 +19612,7 @@ function showTabContextMenu(event, tabId) {
         pinButton.textContent = tab?.pinned ? '取消固定标签页' : '固定标签页';
     }
     menu.classList.add('show');
-    const menuWidth = menu.offsetWidth || 168;
-    const menuHeight = menu.offsetHeight || 120;
-    const left = Math.min(event.clientX, window.innerWidth - menuWidth - 8);
-    const top = Math.min(event.clientY, window.innerHeight - menuHeight - 8);
-    menu.style.left = `${Math.max(left, 8)}px`;
-    menu.style.top = `${Math.max(top, 8)}px`;
+    positionContextMenu(menu, event, { kind: 'tab', minWidth: 156 });
 }
 
 function toggleEditorTabPinned(tabId = tabContextTargetId || activeTabId) {
@@ -16240,12 +19755,7 @@ function showEditorLinkContextMenu(event, linkInfo) {
 
     menu.classList.add('show');
     markContextMenuRecentlyOpened();
-    const menuWidth = menu.offsetWidth || 190;
-    const menuHeight = menu.offsetHeight || 160;
-    const left = Math.min(event.clientX, window.innerWidth - menuWidth - 8);
-    const top = Math.min(event.clientY, window.innerHeight - menuHeight - 8);
-    menu.style.left = `${Math.max(left, 8)}px`;
-    menu.style.top = `${Math.max(top, 8)}px`;
+    positionContextMenu(menu, event, { kind: 'editorLink', minWidth: 152 });
 }
 
 async function openTabFolder(tabId) {
@@ -16395,7 +19905,7 @@ function refreshAttachmentPanelIfVisible() {
         return;
     }
 
-    renderAttachmentList(getTabMarkdownContent(), true);
+    renderAttachmentList(getActiveEditorSnapshot(), true);
 }
 
 async function trashAttachmentTarget(reference) {
@@ -16424,25 +19934,56 @@ function startAttachmentSystemDrag(absolutePath) {
 async function deleteAttachmentTarget(reference) {
     if (!reference?.absolutePath) return false;
 
-    const entryName = path.basename(reference.absolutePath);
-    const decision = await ipcRenderer.invoke('dialog:confirmDeleteAttachmentEntry', {
-        entryName,
-        isDirectory: Boolean(reference.isDirectory)
+    return runHistoryTransaction('删除附件', async () => {
+        const bundlePath = findContainingTextBundlePath(reference.absolutePath) || window.currentPath;
+        const backupInfo = getBundleEntryBackupInfo(reference.absolutePath, bundlePath);
+        const entryKind = backupInfo?.kind || 'attachments';
+        const entryName = backupInfo?.entryName || path.basename(reference.absolutePath);
+        const decision = await ipcRenderer.invoke('dialog:confirmDeleteAttachmentEntry', {
+            entryName,
+            isDirectory: Boolean(reference.isDirectory)
+        });
+        if (decision !== 'delete') {
+            return false;
+        }
+
+        if (!bundlePath) {
+            return false;
+        }
+
+        const historyEntryId = createHistoryEntryId();
+        const removed = moveEntryToSessionHistoryForBundle(bundlePath, entryKind, entryName, historyEntryId);
+        if (!removed) {
+            return false;
+        }
+
+        recordHistoryAttachmentStep({
+            kind: 'attachment-delete',
+            label: '删除附件',
+            undo() {
+                const restored = restoreEntryFromSessionHistoryForBundle(bundlePath, entryKind, entryName, historyEntryId);
+                if (restored) {
+                    refreshActiveEditorAttachmentDom();
+                    refreshAttachmentPanelIfVisible();
+                }
+                return restored;
+            },
+            redo() {
+                const moved = moveEntryToSessionHistoryForBundle(bundlePath, entryKind, entryName, historyEntryId);
+                if (moved) {
+                    refreshActiveEditorAttachmentDom();
+                    refreshAttachmentPanelIfVisible();
+                }
+                return moved;
+            }
+        });
+
+        refreshAttachmentPanelIfVisible();
+        if (window.editor) {
+            updatePreview({ preserveViewport: true, preserveMode: 'anchor' });
+        }
+        return true;
     });
-    if (decision !== 'delete') {
-        return false;
-    }
-
-    const removed = await trashAttachmentTarget(reference);
-    if (!removed) {
-        return false;
-    }
-
-    refreshAttachmentPanelIfVisible();
-    if (window.editor) {
-        updatePreview({ preserveViewport: true, preserveMode: 'anchor' });
-    }
-    return true;
 }
 
 async function deleteUnreferencedAttachments(entries) {
@@ -16451,43 +19992,76 @@ async function deleteUnreferencedAttachments(entries) {
         return false;
     }
 
-    const decision = await ipcRenderer.invoke('dialog:confirmDeleteUnreferencedAttachments', {
-        count: targets.length
-    });
-    if (decision !== 'delete') {
-        return false;
-    }
-
-    setWorkspaceBusy('正在删除未引用附件…');
-    suspendWorkspaceRefresh();
-    await yieldToUiFrame();
-
-    try {
-        let removedCount = 0;
-        for (const target of targets) {
-            if (!target.absolutePath || !fs.existsSync(target.absolutePath)) {
-                continue;
-            }
-
-            const removed = await trashAttachmentTarget(target);
-            if (removed) {
-                removedCount += 1;
-            }
-        }
-
-        if (!removedCount) {
+    return runHistoryTransaction('删除未引用附件', async () => {
+        const decision = await ipcRenderer.invoke('dialog:confirmDeleteUnreferencedAttachments', {
+            count: targets.length
+        });
+        if (decision !== 'delete') {
             return false;
         }
 
-        refreshAttachmentPanelIfVisible();
-        if (window.editor) {
-            updatePreview({ preserveViewport: true, preserveMode: 'anchor' });
+        setWorkspaceBusy('正在删除未引用附件…');
+        suspendWorkspaceRefresh();
+        await yieldToUiFrame();
+
+        try {
+            let removedCount = 0;
+            for (const target of targets) {
+                if (!target.absolutePath || !fs.existsSync(target.absolutePath)) {
+                    continue;
+                }
+
+                const bundlePath = findContainingTextBundlePath(target.absolutePath) || window.currentPath;
+                if (!bundlePath) {
+                    continue;
+                }
+
+                const backupInfo = getBundleEntryBackupInfo(target.absolutePath, bundlePath);
+                const entryKind = backupInfo?.kind || 'attachments';
+                const entryName = backupInfo?.entryName || path.basename(target.absolutePath);
+                const historyEntryId = createHistoryEntryId();
+                const removed = moveEntryToSessionHistoryForBundle(bundlePath, entryKind, entryName, historyEntryId);
+                if (!removed) {
+                    continue;
+                }
+
+                recordHistoryAttachmentStep({
+                    kind: 'attachment-delete',
+                    label: '删除未引用附件',
+                    undo() {
+                        const restored = restoreEntryFromSessionHistoryForBundle(bundlePath, entryKind, entryName, historyEntryId);
+                        if (restored) {
+                            refreshActiveEditorAttachmentDom();
+                            refreshAttachmentPanelIfVisible();
+                        }
+                        return restored;
+                    },
+                    redo() {
+                        const moved = moveEntryToSessionHistoryForBundle(bundlePath, entryKind, entryName, historyEntryId);
+                        if (moved) {
+                            refreshActiveEditorAttachmentDom();
+                            refreshAttachmentPanelIfVisible();
+                        }
+                        return moved;
+                    }
+                });
+                removedCount += 1;
+            }
+
+            if (!removedCount) {
+                return false;
+            }
+
+            refreshAttachmentPanelIfVisible();
+            if (window.editor) {
+                updatePreview({ preserveViewport: true, preserveMode: 'anchor' });
+            }
+            return true;
+        } finally {
+            resumeWorkspaceRefresh({ immediate: true });
+            clearWorkspaceBusy();
         }
-        return true;
-    } finally {
-        resumeWorkspaceRefresh({ immediate: true });
-        clearWorkspaceBusy();
-    }
+    });
 }
 
 async function openPreviewImageWithSystem(imagePath) {
@@ -16807,14 +20381,47 @@ function finishActivePreviewImageResize() {
     }
 }
 
-function renderAttachmentList(content, force = false) {
+function renderAttachmentList(context, force = false) {
     const attachmentContainer = document.getElementById('attachment-container');
     if (!attachmentContainer) return;
 
-    const normalizedContent = String(content || '');
+    suppressAttachmentDropEvents(attachmentContainer);
+
+    const normalizedContent = typeof context === 'string'
+        ? String(context || '')
+        : String(context?.markdown || '');
+    const documentJson = context && typeof context === 'object'
+        ? context.documentJson || null
+        : null;
+    const contentKey = documentJson ? JSON.stringify(documentJson) : normalizedContent;
     const attachmentsDir = window.currentPath ? path.join(window.currentPath, 'attachments') : '';
     const attachmentEntries = attachmentsDir ? getAttachmentDirectoryEntries(attachmentsDir) : [];
-    const renderKey = `attachment::${window.currentPath || ''}::${normalizedContent}::${attachmentsDir ? getAttachmentDirectoryEntriesSignature(attachmentEntries) : ''}`;
+    const structuredReferences = window.editor && typeof window.editor.getAttachmentReferences === 'function'
+        ? window.editor.getAttachmentReferences()
+        : null;
+    const documentJsonReferences = !structuredReferences && documentJson
+        ? collectAttachmentDocumentJsonRefs(documentJson, window.currentPath)
+        : null;
+    const referenceSignature = structuredReferences
+        ? JSON.stringify(structuredReferences.map((reference) => ({
+            relativePath: String(reference.relativePath || ''),
+            absolutePath: String(reference.absolutePath || ''),
+            exists: Boolean(reference.exists),
+            isDirectory: Boolean(reference.isDirectory),
+            kindIndex: Number.isInteger(reference.kindIndex) ? reference.kindIndex : -1
+        })))
+        : documentJsonReferences
+            ? JSON.stringify(documentJsonReferences.map((reference) => ({
+                relativePath: String(reference.relativePath || ''),
+                absolutePath: String(reference.absolutePath || ''),
+                exists: Boolean(reference.exists),
+                isDirectory: Boolean(reference.isDirectory),
+                kindIndex: Number.isInteger(reference.kindIndex) ? reference.kindIndex : -1
+            })))
+            : documentJson
+            ? JSON.stringify(documentJson)
+        : '';
+    const renderKey = `attachment::${window.currentPath || ''}::${contentKey}::${attachmentsDir ? getAttachmentDirectoryEntriesSignature(attachmentEntries) : ''}::${referenceSignature}`;
     if (!force && attachmentContainer.dataset.renderKey === renderKey && attachmentContainer.childElementCount > 0) {
         return;
     }
@@ -16822,16 +20429,26 @@ function renderAttachmentList(content, force = false) {
     attachmentContainer.innerHTML = '';
     attachmentContainer.dataset.renderKey = renderKey;
 
-    const references = normalizedContent
-        ? getAttachmentReferences(normalizedContent)
-        : (window.editor && typeof window.editor.getAttachmentReferences === 'function'
-            ? window.editor.getAttachmentReferences()
-            : []);
+    const references = structuredReferences && structuredReferences.length
+        ? structuredReferences
+        : (documentJsonReferences && documentJsonReferences.length
+            ? documentJsonReferences
+            : (normalizedContent ? getAttachmentReferences(normalizedContent) : []));
     const missingReferences = references
         .map((reference, index) => ({ reference, index }))
         .filter(({ reference }) => !reference.exists);
     const referencedEntries = references.filter((reference) => reference.exists);
-    const usedTopLevelEntries = getUsedAttachmentEntries(normalizedContent, { preferEditorState: true });
+    const usedTopLevelEntries = structuredReferences && structuredReferences.length
+        ? new Set(structuredReferences.flatMap((reference) => {
+            const topLevelEntry = getAttachmentTopLevelEntryName(reference.relativePath);
+            return topLevelEntry ? [topLevelEntry] : [];
+        }))
+        : (documentJsonReferences && documentJsonReferences.length
+            ? new Set(documentJsonReferences.flatMap((reference) => {
+                const topLevelEntry = getAttachmentTopLevelEntryName(reference.relativePath);
+                return topLevelEntry ? [topLevelEntry] : [];
+            }))
+            : getUsedAttachmentEntries(normalizedContent, { preferEditorState: true }));
     const unreferencedEntries = attachmentEntries.filter((entry) => !usedTopLevelEntries.has(entry.name));
 
     if (!references.length && !unreferencedEntries.length) {
@@ -16893,6 +20510,8 @@ function renderAttachmentList(content, force = false) {
                 <div class="attachment-section-meta">${referencedEntries.length} 个已找到的附件</div>
             </div>
         `;
+        const referencedList = document.createElement('div');
+        referencedList.className = 'attachment-referenced-list';
 
         for (let referenceIndex = 0; referenceIndex < references.length; referenceIndex++) {
             const reference = references[referenceIndex];
@@ -16901,10 +20520,11 @@ function renderAttachmentList(content, force = false) {
             }
 
             const item = document.createElement('div');
-            item.className = 'attachment-item';
+            item.className = 'attachment-item attachment-referenced-item';
+            suppressAttachmentDropEvents(item);
 
             const row = document.createElement('div');
-            row.className = 'attachment-item-row';
+            row.className = 'attachment-item-row attachment-referenced-item-row';
 
             const toggle = document.createElement('div');
             const hasChildren = reference.isDirectory;
@@ -16922,7 +20542,7 @@ function renderAttachmentList(content, force = false) {
                     expandedAttachmentEntries.add(reference.relativePath);
                 }
 
-                renderAttachmentList(content);
+                renderAttachmentList(context);
             });
 
             const body = document.createElement('div');
@@ -16987,9 +20607,10 @@ function renderAttachmentList(content, force = false) {
                 item.appendChild(childrenContainer);
             }
 
-            referencedSection.appendChild(item);
+            referencedList.appendChild(item);
         }
 
+        referencedSection.appendChild(referencedList);
         attachmentContainer.appendChild(referencedSection);
     }
 
@@ -17006,6 +20627,7 @@ function renderAttachmentList(content, force = false) {
         missingReferences.forEach(({ reference, index: referenceIndex }) => {
             const item = document.createElement('div');
             item.className = 'attachment-item missing';
+            suppressAttachmentDropEvents(item);
 
             const row = document.createElement('div');
             row.className = 'attachment-item-row';
@@ -17073,2827 +20695,6 @@ function renderAttachmentList(content, force = false) {
         unreferencedSection.appendChild(tree);
         attachmentContainer.appendChild(unreferencedSection);
     }
-}
-
-function normalizeWorkspaceMusicSearchText(value) {
-    return String(value || '')
-        .toLowerCase()
-        .normalize('NFKC')
-        .replace(/\s+/g, ' ')
-        .trim();
-}
-
-function getWorkspaceMediaStem(filePath) {
-    return path.basename(String(filePath || ''), path.extname(String(filePath || '')));
-}
-
-function getWorkspaceTrackTitle(filePath) {
-    const stem = getWorkspaceMediaStem(filePath);
-    return stem.replace(/^\d+\s*[-._)]*\s*/, '').trim() || stem || '未命名曲目';
-}
-
-function compareWorkspaceMediaNames(a, b) {
-    return String(a || '').localeCompare(String(b || ''), 'zh-Hans-CN', {
-        numeric: true,
-        sensitivity: 'base'
-    });
-}
-
-function pickWorkspaceAlbumArtPath(imagePaths = []) {
-    if (!Array.isArray(imagePaths) || !imagePaths.length) {
-        return null;
-    }
-
-    const priorityKeywords = ['cover', 'folder', 'front', 'artwork', 'album'];
-    const ranked = imagePaths
-        .filter(Boolean)
-        .map((imagePath) => {
-            const stem = getWorkspaceMediaStem(imagePath).toLowerCase();
-            let score = 100;
-            const exactIndex = priorityKeywords.indexOf(stem);
-            if (exactIndex !== -1) {
-                score = exactIndex;
-            } else {
-                const partialIndex = priorityKeywords.findIndex((keyword) => stem.includes(keyword));
-                if (partialIndex !== -1) {
-                    score = 20 + partialIndex;
-                }
-            }
-
-            return { imagePath, score, stem };
-        })
-        .sort((left, right) => left.score - right.score || compareWorkspaceMediaNames(left.stem, right.stem));
-
-    return ranked[0]?.imagePath || null;
-}
-
-function findWorkspaceAlbumArtPathInDirectory(dirPath) {
-    if (!dirPath || !fs.existsSync(dirPath)) {
-        return null;
-    }
-
-    let dirEntries = [];
-    try {
-        dirEntries = fs.readdirSync(dirPath, { withFileTypes: true });
-    } catch {
-        return null;
-    }
-
-    const imagePaths = dirEntries
-        .filter((entry) => entry.isFile() && !entry.name.startsWith('.') && isWorkspaceAlbumArtFilePath(entry.name))
-        .map((entry) => path.join(dirPath, entry.name));
-    return pickWorkspaceAlbumArtPath(imagePaths);
-}
-
-function findWorkspaceAlbumFolderCoverPath(rootPath, albumPath) {
-    const normalizedRootPath = path.resolve(String(rootPath || ''));
-    let currentPath = path.resolve(String(albumPath || ''));
-    if (!normalizedRootPath || !currentPath) {
-        return null;
-    }
-
-    while (currentPath.startsWith(normalizedRootPath)) {
-        const coverPath = findWorkspaceAlbumArtPathInDirectory(currentPath);
-        if (coverPath) {
-            return coverPath;
-        }
-        if (currentPath === normalizedRootPath) {
-            break;
-        }
-        const parentPath = path.dirname(currentPath);
-        if (!parentPath || parentPath === currentPath) {
-            break;
-        }
-        currentPath = parentPath;
-    }
-
-    return null;
-}
-
-function normalizeWorkspaceLyricStem(stem) {
-    return String(stem || '')
-        .toLowerCase()
-        .normalize('NFKC')
-        .replace(/\[[^\]]*\]/g, '')
-        .replace(/^\d+\s*[-._)]*\s*/, '')
-        .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
-}
-
-function findWorkspaceTrackLyricPath(trackPath, lyricPaths = []) {
-    if (!Array.isArray(lyricPaths) || !lyricPaths.length) {
-        return null;
-    }
-
-    const trackStem = getWorkspaceMediaStem(trackPath);
-    const normalizedTrackStem = normalizeWorkspaceLyricStem(trackStem);
-    const exactMatch = lyricPaths.find((lyricPath) => getWorkspaceMediaStem(lyricPath) === trackStem);
-    if (exactMatch) {
-        return exactMatch;
-    }
-
-    const normalizedMatch = lyricPaths.find((lyricPath) => normalizeWorkspaceLyricStem(getWorkspaceMediaStem(lyricPath)) === normalizedTrackStem);
-    if (normalizedMatch) {
-        return normalizedMatch;
-    }
-
-    return lyricPaths.length === 1 ? lyricPaths[0] : null;
-}
-
-function parseWorkspaceLyricTimestamp(tag) {
-    const match = String(tag || '').trim().match(/^(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?$/);
-    if (!match) {
-        return null;
-    }
-
-    const minutes = Number(match[1] || 0);
-    const seconds = Number(match[2] || 0);
-    const fraction = String(match[3] || '');
-    const milliseconds = fraction
-        ? Number(fraction.padEnd(3, '0').slice(0, 3))
-        : 0;
-    return minutes * 60 + seconds + milliseconds / 1000;
-}
-
-function parseWorkspaceLyricsContent(rawContent, lyricPath = '') {
-    const content = String(rawContent || '').replace(/^\uFEFF/, '');
-    const extension = path.extname(String(lyricPath || '')).toLowerCase();
-    const lines = content.split(/\r?\n/);
-
-    if (extension === '.lrc' || lines.some((line) => /\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]/.test(line))) {
-        const timedLines = [];
-        for (const line of lines) {
-            const matches = Array.from(line.matchAll(/\[([^\]]+)\]/g));
-            if (!matches.length) {
-                continue;
-            }
-            const text = line.replace(/\[[^\]]+\]/g, '').trim() || ' ';
-            for (const match of matches) {
-                const timestamp = parseWorkspaceLyricTimestamp(match[1]);
-                if (timestamp === null) {
-                    continue;
-                }
-                timedLines.push({ time: timestamp, text });
-            }
-        }
-
-        if (timedLines.length) {
-            timedLines.sort((left, right) => left.time - right.time);
-            return {
-                type: 'timed',
-                lines: timedLines
-            };
-        }
-    }
-
-    return {
-        type: 'plain',
-        lines: lines
-            .map((line) => line.trimEnd())
-            .filter((line) => line.trim().length > 0)
-            .map((line) => ({ text: line }))
-    };
-}
-
-function loadWorkspaceLyricsData(lyricPath) {
-    if (!lyricPath) {
-        return null;
-    }
-
-    const normalizedPath = path.resolve(lyricPath);
-    if (workspaceLyricsCache.has(normalizedPath)) {
-        return workspaceLyricsCache.get(normalizedPath) || null;
-    }
-
-    try {
-        const content = fs.readFileSync(normalizedPath, 'utf8');
-        const parsed = parseWorkspaceLyricsContent(content, normalizedPath);
-        workspaceLyricsCache.set(normalizedPath, parsed);
-        return parsed;
-    } catch {
-        workspaceLyricsCache.set(normalizedPath, null);
-        return null;
-    }
-}
-
-function detectEmbeddedArtworkMime(buffer) {
-    if (!buffer || buffer.length < 4) {
-        return '';
-    }
-
-    if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-        return 'image/jpeg';
-    }
-    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
-        return 'image/png';
-    }
-    if (buffer.length >= 12 && buffer.slice(0, 4).toString('ascii') === 'RIFF' && buffer.slice(8, 12).toString('ascii') === 'WEBP') {
-        return 'image/webp';
-    }
-    if (buffer.length >= 12 && buffer.slice(4, 12).toString('ascii').includes('ftypavif')) {
-        return 'image/avif';
-    }
-    return '';
-}
-
-function bufferToArtworkDataUrl(buffer, mimeType = '') {
-    if (!buffer || !buffer.length) {
-        return '';
-    }
-    const resolvedMimeType = mimeType || detectEmbeddedArtworkMime(buffer);
-    if (!resolvedMimeType) {
-        return '';
-    }
-    return `data:${resolvedMimeType};base64,${buffer.toString('base64')}`;
-}
-
-function parseFlacEmbeddedArtwork(buffer) {
-    if (!buffer || buffer.length < 8 || buffer.slice(0, 4).toString('ascii') !== 'fLaC') {
-        return '';
-    }
-
-    let offset = 4;
-    while (offset + 4 <= buffer.length) {
-        const header = buffer[offset];
-        const blockType = header & 0x7f;
-        const blockLength = buffer.readUIntBE(offset + 1, 3);
-        const blockStart = offset + 4;
-        const blockEnd = blockStart + blockLength;
-        if (blockEnd > buffer.length) {
-            break;
-        }
-
-        if (blockType === 6 && blockLength > 32) {
-            let cursor = blockStart + 4;
-            if (cursor + 4 > blockEnd) break;
-            const mimeLength = buffer.readUInt32BE(cursor);
-            cursor += 4;
-            if (cursor + mimeLength > blockEnd) break;
-            const mimeType = buffer.slice(cursor, cursor + mimeLength).toString('utf8');
-            cursor += mimeLength;
-            if (cursor + 4 > blockEnd) break;
-            const descriptionLength = buffer.readUInt32BE(cursor);
-            cursor += 4 + descriptionLength;
-            cursor += 16;
-            if (cursor + 4 > blockEnd) break;
-            const pictureLength = buffer.readUInt32BE(cursor);
-            cursor += 4;
-            if (cursor + pictureLength > blockEnd) break;
-            return bufferToArtworkDataUrl(buffer.slice(cursor, cursor + pictureLength), mimeType);
-        }
-
-        offset = blockEnd;
-        if (header & 0x80) {
-            break;
-        }
-    }
-
-    return '';
-}
-
-function readId3SyncSafeInteger(buffer, offset) {
-    if (!buffer || offset < 0 || offset + 4 > buffer.length) {
-        return 0;
-    }
-    return ((buffer[offset] & 0x7f) << 21)
-        | ((buffer[offset + 1] & 0x7f) << 14)
-        | ((buffer[offset + 2] & 0x7f) << 7)
-        | (buffer[offset + 3] & 0x7f);
-}
-
-function parseId3TextTerminatorLength(encodingByte) {
-    return encodingByte === 1 || encodingByte === 2 ? 2 : 1;
-}
-
-function findId3TextTerminator(buffer, startOffset, encodingByte, limitOffset) {
-    const terminatorLength = parseId3TextTerminatorLength(encodingByte);
-    const safeLimitOffset = Math.min(Number(limitOffset || buffer.length), buffer.length);
-    if (terminatorLength === 2) {
-        for (let offset = startOffset; offset + 1 < safeLimitOffset; offset += 1) {
-            if (buffer[offset] === 0x00 && buffer[offset + 1] === 0x00) {
-                return offset;
-            }
-        }
-        return safeLimitOffset;
-    }
-
-    const nullIndex = buffer.indexOf(0x00, startOffset);
-    return nullIndex === -1 || nullIndex > safeLimitOffset ? safeLimitOffset : nullIndex;
-}
-
-function normalizeId3PicMime(rawValue = '') {
-    const normalized = String(rawValue || '').trim().toLowerCase();
-    if (!normalized) {
-        return '';
-    }
-    if (normalized === 'jpg') {
-        return 'image/jpeg';
-    }
-    if (normalized === 'png') {
-        return 'image/png';
-    }
-    if (normalized.startsWith('image/')) {
-        return normalized;
-    }
-    return `image/${normalized}`;
-}
-
-function parseMp3EmbeddedArtwork(buffer) {
-    if (!buffer || buffer.length < 10 || buffer.slice(0, 3).toString('ascii') !== 'ID3') {
-        return '';
-    }
-
-    const majorVersion = Number(buffer[3] || 0);
-    if (majorVersion < 2 || majorVersion > 4) {
-        return '';
-    }
-
-    const tagSize = readId3SyncSafeInteger(buffer, 6);
-    const tagEnd = Math.min(buffer.length, 10 + tagSize);
-    let offset = 10;
-
-    while (offset + 6 <= tagEnd) {
-        if (majorVersion === 2) {
-            const frameId = buffer.slice(offset, offset + 3).toString('ascii');
-            const frameSize = buffer.readUIntBE(offset + 3, 3);
-            if (!frameId.trim() || frameSize <= 0) {
-                break;
-            }
-            const frameStart = offset + 6;
-            const frameEnd = Math.min(frameStart + frameSize, tagEnd);
-            if (frameEnd > buffer.length || frameStart >= frameEnd) {
-                break;
-            }
-
-            if (frameId === 'PIC') {
-                const encodingByte = buffer[frameStart];
-                const imageFormat = normalizeId3PicMime(buffer.slice(frameStart + 1, frameStart + 4).toString('latin1'));
-                const descriptionStart = frameStart + 5;
-                const descriptionEnd = findId3TextTerminator(buffer, descriptionStart, encodingByte, frameEnd);
-                const imageDataStart = Math.min(frameEnd, descriptionEnd + parseId3TextTerminatorLength(encodingByte));
-                if (imageDataStart < frameEnd) {
-                    return bufferToArtworkDataUrl(buffer.slice(imageDataStart, frameEnd), imageFormat);
-                }
-            }
-
-            offset = frameEnd;
-            continue;
-        }
-
-        if (offset + 10 > tagEnd) {
-            break;
-        }
-
-        const frameId = buffer.slice(offset, offset + 4).toString('ascii');
-        const frameSize = majorVersion === 4
-            ? readId3SyncSafeInteger(buffer, offset + 4)
-            : buffer.readUInt32BE(offset + 4);
-        if (!frameId.trim() || frameSize <= 0) {
-            break;
-        }
-
-        const frameStart = offset + 10;
-        const frameEnd = Math.min(frameStart + frameSize, tagEnd);
-        if (frameEnd > buffer.length || frameStart >= frameEnd) {
-            break;
-        }
-
-        if (frameId === 'APIC') {
-            const encodingByte = buffer[frameStart];
-            const mimeStart = frameStart + 1;
-            const mimeEnd = buffer.indexOf(0x00, mimeStart);
-            if (mimeEnd === -1 || mimeEnd >= frameEnd) {
-                return '';
-            }
-
-            const mimeType = normalizeId3PicMime(buffer.slice(mimeStart, mimeEnd).toString('latin1'));
-            const descriptionStart = mimeEnd + 2;
-            const descriptionEnd = findId3TextTerminator(buffer, descriptionStart, encodingByte, frameEnd);
-            const imageDataStart = Math.min(frameEnd, descriptionEnd + parseId3TextTerminatorLength(encodingByte));
-            if (imageDataStart < frameEnd) {
-                return bufferToArtworkDataUrl(buffer.slice(imageDataStart, frameEnd), mimeType);
-            }
-        }
-
-        offset = frameEnd;
-    }
-
-    return '';
-}
-
-function readMp4AtomSize(buffer, offset) {
-    if (offset + 8 > buffer.length) {
-        return 0;
-    }
-
-    const size32 = buffer.readUInt32BE(offset);
-    if (size32 === 1) {
-        if (offset + 16 > buffer.length) {
-            return 0;
-        }
-        return Number(buffer.readBigUInt64BE(offset + 8));
-    }
-    if (size32 === 0) {
-        return buffer.length - offset;
-    }
-    return size32;
-}
-
-function findMp4CovrAtom(buffer, startOffset, endOffset, skipMetaHeader = false) {
-    let offset = skipMetaHeader ? startOffset + 4 : startOffset;
-    while (offset + 8 <= endOffset && offset + 8 <= buffer.length) {
-        const atomSize = readMp4AtomSize(buffer, offset);
-        if (!atomSize || atomSize < 8) {
-            break;
-        }
-
-        const headerSize = buffer.readUInt32BE(offset) === 1 ? 16 : 8;
-        const atomType = buffer.slice(offset + 4, offset + 8).toString('ascii');
-        const atomBodyStart = offset + headerSize;
-        const atomEnd = Math.min(offset + atomSize, endOffset, buffer.length);
-
-        if (atomType === 'covr') {
-            let childOffset = atomBodyStart;
-            while (childOffset + 8 <= atomEnd) {
-                const childSize = readMp4AtomSize(buffer, childOffset);
-                if (!childSize || childSize < 8) {
-                    break;
-                }
-                const childHeaderSize = buffer.readUInt32BE(childOffset) === 1 ? 16 : 8;
-                const childType = buffer.slice(childOffset + 4, childOffset + 8).toString('ascii');
-                const childEnd = Math.min(childOffset + childSize, atomEnd, buffer.length);
-                if (childType === 'data') {
-                    const dataStart = childOffset + childHeaderSize + 8;
-                    if (dataStart < childEnd) {
-                        return bufferToArtworkDataUrl(buffer.slice(dataStart, childEnd));
-                    }
-                }
-                childOffset = childEnd;
-            }
-        }
-
-        if (['moov', 'udta', 'ilst', 'trak', 'mdia', 'minf', 'stbl'].includes(atomType)) {
-            const nested = findMp4CovrAtom(buffer, atomBodyStart, atomEnd, false);
-            if (nested) {
-                return nested;
-            }
-        } else if (atomType === 'meta') {
-            const nested = findMp4CovrAtom(buffer, atomBodyStart, atomEnd, true);
-            if (nested) {
-                return nested;
-            }
-        }
-
-        offset = atomEnd;
-    }
-
-    return '';
-}
-
-function parseMp4EmbeddedArtwork(buffer) {
-    if (!buffer || buffer.length < 12) {
-        return '';
-    }
-    return findMp4CovrAtom(buffer, 0, buffer.length, false);
-}
-
-function loadWorkspaceEmbeddedArtworkDataUrl(audioPath) {
-    if (!audioPath) {
-        return '';
-    }
-
-    const normalizedAudioPath = path.resolve(audioPath);
-    if (workspaceEmbeddedArtworkCache.has(normalizedAudioPath)) {
-        return workspaceEmbeddedArtworkCache.get(normalizedAudioPath) || '';
-    }
-
-    let artworkDataUrl = '';
-    try {
-        const buffer = fs.readFileSync(normalizedAudioPath);
-        const extension = path.extname(normalizedAudioPath).toLowerCase();
-        if (extension === '.flac') {
-            artworkDataUrl = parseFlacEmbeddedArtwork(buffer);
-        } else if (extension === '.mp3') {
-            artworkDataUrl = parseMp3EmbeddedArtwork(buffer);
-        } else if (['.m4a', '.aac', '.mp4', '.m4b'].includes(extension)) {
-            artworkDataUrl = parseMp4EmbeddedArtwork(buffer);
-        }
-    } catch {
-        artworkDataUrl = '';
-    }
-
-    workspaceEmbeddedArtworkCache.set(normalizedAudioPath, artworkDataUrl || null);
-    return artworkDataUrl;
-}
-
-async function loadWorkspaceEmbeddedArtworkDataUrlAsync(audioPath) {
-    if (!audioPath) {
-        return '';
-    }
-
-    const normalizedAudioPath = path.resolve(audioPath);
-    const cached = workspaceEmbeddedArtworkCache.get(normalizedAudioPath);
-    if (typeof cached === 'string' || cached === null) {
-        return cached || '';
-    }
-    if (cached && typeof cached.then === 'function') {
-        return cached;
-    }
-
-    const promise = fs.promises.readFile(normalizedAudioPath)
-        .then((buffer) => {
-            const extension = path.extname(normalizedAudioPath).toLowerCase();
-            if (extension === '.flac') {
-                return parseFlacEmbeddedArtwork(buffer);
-            }
-            if (extension === '.mp3') {
-                return parseMp3EmbeddedArtwork(buffer);
-            }
-            if (['.m4a', '.aac', '.mp4', '.m4b'].includes(extension)) {
-                return parseMp4EmbeddedArtwork(buffer);
-            }
-            return '';
-        })
-        .catch(() => '')
-        .then((artworkDataUrl) => {
-            workspaceEmbeddedArtworkCache.set(normalizedAudioPath, artworkDataUrl || null);
-            return artworkDataUrl;
-        });
-
-    workspaceEmbeddedArtworkCache.set(normalizedAudioPath, promise);
-    return promise;
-}
-
-function getWorkspaceAlbumEntries(bundlePath = selectedWorkspaceMusicBundlePath) {
-    if (!bundlePath || !fs.existsSync(bundlePath)) {
-        return [];
-    }
-
-    const normalizedBundlePath = path.resolve(bundlePath);
-    if (!fs.statSync(normalizedBundlePath).isDirectory()) {
-        return [];
-    }
-
-    const now = Date.now();
-    if (
-        !workspaceAlbumEntriesCacheDirty
-        && workspaceAlbumEntriesCacheRoot === normalizedBundlePath
-        && workspaceAlbumEntriesCache
-        && workspaceAlbumEntriesCache.expiresAt > now
-    ) {
-        return workspaceAlbumEntriesCache.entries;
-    }
-
-    const albums = [];
-    const visit = (dirPath) => {
-        let dirEntries = [];
-        try {
-            dirEntries = fs.readdirSync(dirPath, { withFileTypes: true })
-                .filter((entry) => !entry.name.startsWith('.'))
-                .sort((left, right) => {
-                    if (left.isDirectory() && !right.isDirectory()) return -1;
-                    if (!left.isDirectory() && right.isDirectory()) return 1;
-                    return compareWorkspaceMediaNames(left.name, right.name);
-                });
-        } catch {
-            return;
-        }
-
-        const audioFiles = [];
-        const imageFiles = [];
-        const lyricFiles = [];
-
-        for (const entry of dirEntries) {
-            const absolutePath = path.join(dirPath, entry.name);
-            if (entry.isDirectory()) {
-                visit(absolutePath);
-                continue;
-            }
-            if (!entry.isFile()) {
-                continue;
-            }
-            if (isWorkspaceAudioFilePath(entry.name)) {
-                audioFiles.push(absolutePath);
-                continue;
-            }
-            if (isWorkspaceAlbumArtFilePath(entry.name)) {
-                imageFiles.push(absolutePath);
-                continue;
-            }
-            if (isWorkspaceLyricFilePath(entry.name)) {
-                lyricFiles.push(absolutePath);
-            }
-        }
-
-        if (!audioFiles.length) {
-            return;
-        }
-
-        const sortedAudioFiles = audioFiles.slice().sort(compareWorkspaceMediaNames);
-        const tracks = sortedAudioFiles.map((trackPath, index) => {
-            let stat = null;
-            try {
-                stat = fs.statSync(trackPath);
-            } catch {
-                stat = null;
-            }
-
-            const lyricPath = findWorkspaceTrackLyricPath(trackPath, lyricFiles);
-            return {
-                index: index + 1,
-                path: trackPath,
-                relativePath: path.relative(normalizedBundlePath, trackPath) || path.basename(trackPath),
-                title: getWorkspaceTrackTitle(trackPath),
-                fileName: path.basename(trackPath),
-                size: Number(stat?.size || 0),
-                modifiedAt: Number(stat?.mtimeMs || 0),
-                duration: null,
-                lyricPath
-            };
-        });
-        const directCoverPath = pickWorkspaceAlbumArtPath(imageFiles);
-        const coverPath = directCoverPath || findWorkspaceAlbumFolderCoverPath(normalizedBundlePath, dirPath);
-        const embeddedArtworkTrackPath = coverPath
-            ? ''
-            : (tracks[0]?.path || '');
-
-        const albumTitle = dirPath === normalizedBundlePath
-            ? (path.basename(normalizedBundlePath) || '未命名专辑文件夹')
-            : path.basename(dirPath);
-        const artist = getWorkspaceAlbumArtistName(normalizedBundlePath, dirPath);
-        const trackCount = tracks.length;
-        const albumSize = tracks.reduce((sum, track) => sum + Number(track.size || 0), 0);
-
-        albums.push({
-            path: dirPath,
-            artist,
-            title: albumTitle,
-            relativePath: path.relative(normalizedBundlePath, dirPath) || '.',
-            coverPath,
-            embeddedArtworkTrackPath,
-            trackCount,
-            size: albumSize,
-            tracks
-        });
-    };
-
-    visit(normalizedBundlePath);
-    albums.sort((left, right) => {
-        const artistCompare = compareWorkspaceMediaNames(left.artist, right.artist);
-        return artistCompare || compareWorkspaceMediaNames(left.title, right.title);
-    });
-
-    workspaceAlbumEntriesCache = {
-        entries: albums,
-        expiresAt: now + WORKSPACE_ALBUM_PATHS_CACHE_TTL
-    };
-    workspaceAlbumEntriesCacheRoot = normalizedBundlePath;
-    workspaceAlbumEntriesCacheDirty = false;
-    return albums;
-}
-
-function findWorkspaceAlbumByPath(albums = [], albumPath = activeWorkspaceAlbumPath) {
-    const normalizedAlbumPath = albumPath ? path.resolve(albumPath) : '';
-    if (!normalizedAlbumPath) {
-        return null;
-    }
-    return albums.find((album) => path.resolve(album.path) === normalizedAlbumPath) || null;
-}
-
-function findWorkspaceTrackByPath(albums = [], trackPath = activeWorkspaceTrackPath) {
-    const normalizedTrackPath = trackPath ? path.resolve(trackPath) : '';
-    if (!normalizedTrackPath) {
-        return null;
-    }
-
-    for (const album of albums) {
-        const track = album.tracks.find((entry) => path.resolve(entry.path) === normalizedTrackPath);
-        if (track) {
-            return { album, track };
-        }
-    }
-    return null;
-}
-
-function getWorkspaceMusicSearchScore(album, query) {
-    const normalizedQuery = normalizeWorkspaceMusicSearchText(query);
-    if (!normalizedQuery) {
-        return 1;
-    }
-
-    const haystack = normalizeWorkspaceMusicSearchText([
-        album.artist,
-        album.title,
-        album.relativePath,
-        ...album.tracks.map((track) => track.title),
-        ...album.tracks.map((track) => track.fileName)
-    ].join(' '));
-
-    if (!haystack) {
-        return -1;
-    }
-
-    const directIndex = haystack.indexOf(normalizedQuery);
-    if (directIndex !== -1) {
-        return 1000 - directIndex;
-    }
-
-    let score = 0;
-    let queryIndex = 0;
-    let lastMatchIndex = -2;
-    for (let index = 0; index < haystack.length && queryIndex < normalizedQuery.length; index++) {
-        if (haystack[index] !== normalizedQuery[queryIndex]) {
-            continue;
-        }
-        score += index === lastMatchIndex + 1 ? 8 : 4;
-        lastMatchIndex = index;
-        queryIndex += 1;
-    }
-
-    return queryIndex === normalizedQuery.length ? score - haystack.length * 0.02 : -1;
-}
-
-function getFilteredWorkspaceAlbums(albums = [], query = workspaceMusicSearchQuery) {
-    const normalizedQuery = normalizeWorkspaceMusicSearchText(query);
-    if (!normalizedQuery) {
-        return albums.slice();
-    }
-
-    return albums
-        .map((album) => ({
-            album,
-            score: getWorkspaceMusicSearchScore(album, normalizedQuery)
-        }))
-        .filter((entry) => entry.score >= 0)
-        .sort((left, right) => right.score - left.score || compareWorkspaceMediaNames(left.album.title, right.album.title))
-        .map((entry) => entry.album);
-}
-
-function getWorkspaceAlbumArtistName(rootPath, albumPath) {
-    const normalizedRootPath = path.resolve(String(rootPath || ''));
-    const normalizedAlbumPath = path.resolve(String(albumPath || ''));
-    if (!normalizedRootPath || !normalizedAlbumPath) {
-        return '未分类艺术家';
-    }
-
-    if (normalizedAlbumPath === normalizedRootPath) {
-        return path.basename(normalizedRootPath) || '未分类艺术家';
-    }
-
-    const relativeSegments = path.relative(normalizedRootPath, normalizedAlbumPath)
-        .split(path.sep)
-        .filter(Boolean);
-    if (relativeSegments.length >= 2) {
-        return relativeSegments[0];
-    }
-    if (relativeSegments.length === 1) {
-        return path.basename(normalizedRootPath) || '未分类艺术家';
-    }
-    return '未分类艺术家';
-}
-
-function groupWorkspaceAlbumsByArtist(albums = []) {
-    const grouped = new Map();
-    for (const album of albums) {
-        const artistName = String(album?.artist || '未分类艺术家').trim() || '未分类艺术家';
-        if (!grouped.has(artistName)) {
-            grouped.set(artistName, []);
-        }
-        grouped.get(artistName).push(album);
-    }
-
-    return Array.from(grouped.entries())
-        .sort((left, right) => compareWorkspaceMediaNames(left[0], right[0]))
-        .map(([artist, artistAlbums]) => ({
-            artist,
-            albums: artistAlbums.slice().sort((left, right) => compareWorkspaceMediaNames(left.title, right.title))
-        }));
-}
-
-function getWorkspaceMusicLibraryRenderSignature(filteredAlbums = [], selectedAlbum = null, query = workspaceMusicSearchQuery) {
-    const normalizedQuery = normalizeWorkspaceMusicSearchText(query);
-    const albumKeys = filteredAlbums.map((album) => `${album.artist || ''}::${album.path || ''}`).join('||');
-    return `${normalizedQuery}##${selectedAlbum?.path || ''}##${albumKeys}`;
-}
-
-function getWorkspaceMusicContext() {
-    const selectedSource = getWorkspaceMusicSourceMeta(selectedWorkspaceMusicBundlePath);
-    const albums = selectedSource ? getWorkspaceAlbumEntries(selectedSource.path) : [];
-
-    const audioElement = workspaceAudioControllerElement instanceof HTMLAudioElement
-        ? workspaceAudioControllerElement
-        : document.getElementById('workspace-audio-element');
-    const controllerTrackPath = audioElement?.dataset?.trackPath || '';
-    const controllerAlbumPath = audioElement?.dataset?.albumPath || '';
-    const preferredTrackPath = controllerTrackPath || activeWorkspaceTrackPath || workspaceAudioPlaybackState?.path || '';
-    const preferredAlbumPath = controllerAlbumPath || activeWorkspaceAlbumPath || workspaceAudioPlaybackState?.albumPath || '';
-
-    const selectedTrackInfo = findWorkspaceTrackByPath(albums, preferredTrackPath);
-    const selectedAlbum = selectedTrackInfo?.album
-        || findWorkspaceAlbumByPath(albums, preferredAlbumPath)
-        || albums[0]
-        || null;
-    const selectedTrack = selectedTrackInfo?.track
-        || (selectedAlbum
-            ? selectedAlbum.tracks.find((track) => path.resolve(track.path) === path.resolve(preferredTrackPath || ''))
-                || selectedAlbum.tracks[0]
-            : null)
-        || null;
-
-    if (selectedSource) {
-        selectedWorkspaceMusicBundlePath = selectedSource.path;
-        rememberWorkspaceMusicBundleSelection(workspaceRootPath, selectedSource.path);
-    } else {
-        selectedWorkspaceMusicBundlePath = null;
-    }
-
-    activeWorkspaceAlbumPath = selectedAlbum?.path || null;
-    activeWorkspaceTrackPath = selectedTrack?.path || null;
-
-    return {
-        selectedSource,
-        albums,
-        selectedAlbum,
-        selectedTrack,
-        filteredAlbums: getFilteredWorkspaceAlbums(albums, workspaceMusicSearchQuery)
-    };
-}
-
-function ensureWorkspaceAudioDock() {
-    let dock = document.getElementById('workspace-audio-dock');
-    if (dock) {
-        return dock;
-    }
-
-    dock = document.createElement('div');
-    dock.id = 'workspace-audio-dock';
-    dock.setAttribute('aria-hidden', 'true');
-    document.body.appendChild(dock);
-    return dock;
-}
-
-function clearWorkspaceAudioControllerRuntimeState() {
-    const audioElement = ensureWorkspaceAudioController();
-    try {
-        audioElement.pause();
-    } catch {
-        // ignore pause failures
-    }
-    audioElement.removeAttribute('src');
-    audioElement.dataset.trackPath = '';
-    audioElement.dataset.albumPath = '';
-    audioElement.load();
-    workspaceAudioPlaybackState = null;
-}
-
-function rememberWorkspaceAudioPlaybackState() {
-    const audioElement = workspaceAudioControllerElement instanceof HTMLAudioElement
-        ? workspaceAudioControllerElement
-        : document.getElementById('workspace-audio-element');
-    if (!(audioElement instanceof HTMLAudioElement)) {
-        return;
-    }
-
-    workspaceAudioPlaybackState = {
-        path: audioElement.dataset.trackPath || activeWorkspaceTrackPath || '',
-        albumPath: audioElement.dataset.albumPath || activeWorkspaceAlbumPath || '',
-        currentTime: Number(audioElement.currentTime || 0),
-        wasPlaying: !audioElement.paused && !audioElement.ended,
-        volume: Number(audioElement.volume ?? 1),
-        muted: Boolean(audioElement.muted),
-        playbackRate: Number(audioElement.playbackRate || 1),
-        duration: Number(audioElement.duration || 0)
-    };
-    schedulePersistWorkspaceMusicPlaybackState();
-}
-
-function getWorkspaceTrackLyrics(track) {
-    if (!track?.lyricPath) {
-        return null;
-    }
-    return loadWorkspaceLyricsData(track.lyricPath);
-}
-
-function updateWorkspaceTrackDuration(trackPath, durationSeconds) {
-    const normalizedTrackPath = trackPath ? path.resolve(trackPath) : '';
-    if (!normalizedTrackPath || !Number.isFinite(durationSeconds) || durationSeconds <= 0 || !workspaceAlbumEntriesCache?.entries) {
-        return;
-    }
-
-    for (const album of workspaceAlbumEntriesCache.entries) {
-        const track = album.tracks.find((entry) => path.resolve(entry.path) === normalizedTrackPath);
-        if (track) {
-            track.duration = durationSeconds;
-            return;
-        }
-    }
-}
-
-function getWorkspaceMusicTrackIndex(album, trackPath) {
-    if (!album?.tracks?.length || !trackPath) {
-        return -1;
-    }
-    const normalizedTrackPath = path.resolve(trackPath);
-    return album.tracks.findIndex((track) => path.resolve(track.path) === normalizedTrackPath);
-}
-
-function getWorkspaceMusicArtworkUrl(filePath) {
-    return filePath ? url.pathToFileURL(path.resolve(filePath)).href : '';
-}
-
-function getWorkspaceAlbumCoverSource(album) {
-    if (!album) {
-        return '';
-    }
-
-    if (album.coverPath) {
-        return getWorkspaceMusicArtworkUrl(album.coverPath);
-    }
-
-    const embeddedArtworkTrackPath = String(album.embeddedArtworkTrackPath || '');
-    if (!embeddedArtworkTrackPath) {
-        return '';
-    }
-
-    const cached = workspaceEmbeddedArtworkCache.get(path.resolve(embeddedArtworkTrackPath));
-    return typeof cached === 'string' ? cached : '';
-}
-
-function ensureWorkspaceAlbumCoverLoaded(album, onReady = null) {
-    if (!album || album.coverPath || !album.embeddedArtworkTrackPath) {
-        return;
-    }
-
-    const embeddedArtworkTrackPath = path.resolve(album.embeddedArtworkTrackPath);
-    const cached = workspaceEmbeddedArtworkCache.get(embeddedArtworkTrackPath);
-    if (typeof cached === 'string' || cached === null) {
-        if (typeof onReady === 'function' && typeof cached === 'string' && cached) {
-            onReady(cached);
-        }
-        return;
-    }
-
-    loadWorkspaceEmbeddedArtworkDataUrlAsync(embeddedArtworkTrackPath).then((dataUrl) => {
-        if (typeof onReady === 'function' && dataUrl) {
-            onReady(dataUrl);
-        }
-    });
-}
-
-function resetWorkspaceAudioController() {
-    clearWorkspaceAudioControllerRuntimeState();
-    rememberWorkspaceMusicPlaybackState(workspaceRootPath, null);
-}
-
-function ensureWorkspaceAudioController() {
-    if (workspaceAudioControllerElement instanceof HTMLAudioElement) {
-        return workspaceAudioControllerElement;
-    }
-
-    const existingElement = document.getElementById('workspace-audio-element');
-    if (existingElement instanceof HTMLAudioElement) {
-        workspaceAudioControllerElement = existingElement;
-    } else {
-        const audioElement = document.createElement('audio');
-        audioElement.id = 'workspace-audio-element';
-        audioElement.preload = 'metadata';
-        workspaceAudioControllerElement = audioElement;
-    }
-
-    bindWorkspaceAudioPlaybackState(workspaceAudioControllerElement);
-    if (!workspaceAudioControllerElement.parentElement) {
-        ensureWorkspaceAudioDock().appendChild(workspaceAudioControllerElement);
-    }
-    return workspaceAudioControllerElement;
-}
-
-function hydrateWorkspaceAudioControllerFromSavedState() {
-    const sourceMeta = getWorkspaceMusicSourceMeta(selectedWorkspaceMusicBundlePath);
-    if (
-        !workspaceAudioPlaybackState?.path
-        || !sourceMeta?.path
-        || !fs.existsSync(workspaceAudioPlaybackState.path)
-    ) {
-        return false;
-    }
-
-    const audioElement = ensureWorkspaceAudioController();
-    const normalizedTrackPath = path.resolve(workspaceAudioPlaybackState.path);
-    const normalizedAlbumPath = workspaceAudioPlaybackState.albumPath ? path.resolve(workspaceAudioPlaybackState.albumPath) : '';
-    const normalizedSourcePath = path.resolve(sourceMeta.path);
-    if (
-        normalizedTrackPath !== normalizedSourcePath
-        && !normalizedTrackPath.startsWith(`${normalizedSourcePath}${path.sep}`)
-    ) {
-        return false;
-    }
-
-    if (path.resolve(String(audioElement.dataset.trackPath || '')) !== normalizedTrackPath) {
-        audioElement.dataset.trackPath = normalizedTrackPath;
-        audioElement.dataset.albumPath = normalizedAlbumPath;
-        audioElement.src = getWorkspaceMusicArtworkUrl(normalizedTrackPath);
-        audioElement.load();
-    }
-
-    audioElement.volume = clamp(Number(workspaceAudioPlaybackState.volume ?? 1), 0, 1);
-    audioElement.muted = Boolean(workspaceAudioPlaybackState.muted);
-    audioElement.playbackRate = Number(workspaceAudioPlaybackState.playbackRate || 1) || 1;
-
-    const applyTime = () => {
-        if (!workspaceAudioPlaybackState?.path || path.resolve(workspaceAudioPlaybackState.path) !== normalizedTrackPath) {
-            return;
-        }
-        audioElement.volume = clamp(Number(workspaceAudioPlaybackState.volume ?? 1), 0, 1);
-        audioElement.muted = Boolean(workspaceAudioPlaybackState.muted);
-        audioElement.playbackRate = Number(workspaceAudioPlaybackState.playbackRate || 1) || 1;
-        const nextTime = Number(workspaceAudioPlaybackState.currentTime || 0);
-        if (Number.isFinite(nextTime) && nextTime > 0) {
-            try {
-                audioElement.currentTime = nextTime;
-            } catch {
-                // ignore seek failures
-            }
-        }
-    };
-
-    audioElement.addEventListener('loadedmetadata', applyTime, { once: true });
-    window.requestAnimationFrame(applyTime);
-    return true;
-}
-
-function applyWorkspaceMusicFullscreenState() {
-    const shouldEnable = Boolean(
-        workspaceMusicFullscreen
-        && timelinePanelOpen
-        && currentSidebarTab === 'music'
-        && currentRightSidebarTab === 'music'
-    );
-    document.body.classList.toggle('music-focus-mode', shouldEnable);
-    const fullscreenButton = document.getElementById('music-header-fullscreen-button');
-    if (fullscreenButton) {
-        fullscreenButton.classList.toggle('active', shouldEnable);
-        fullscreenButton.title = shouldEnable ? '退出音乐全屏' : '音乐界面全屏';
-        fullscreenButton.setAttribute('aria-label', fullscreenButton.title);
-        fullscreenButton.innerHTML = shouldEnable
-            ? '<i class="fa-solid fa-compress" aria-hidden="true"></i>'
-            : '<i class="fa-solid fa-expand" aria-hidden="true"></i>';
-    }
-}
-
-function toggleWorkspaceMusicFullscreen(force = null) {
-    workspaceMusicFullscreen = typeof force === 'boolean' ? force : !workspaceMusicFullscreen;
-    applyWorkspaceMusicFullscreenState();
-}
-
-function getWorkspaceAudioElementCurrentTrackInfo() {
-    const context = getWorkspaceMusicContext();
-    const selectedAlbum = context.selectedAlbum;
-    const selectedTrack = context.selectedTrack;
-    return {
-        context,
-        selectedAlbum,
-        selectedTrack
-    };
-}
-
-function playWorkspaceMusicTrack(trackPath, options = {}) {
-    const {
-        autoplay = true,
-        resetPosition = true
-    } = options;
-
-    const context = getWorkspaceMusicContext();
-    const trackInfo = findWorkspaceTrackByPath(context.albums, trackPath);
-    if (!trackInfo?.track) {
-        return false;
-    }
-
-    const { album, track } = trackInfo;
-    const audioElement = ensureWorkspaceAudioController();
-    const normalizedTrackPath = path.resolve(track.path);
-    const previousVolume = Number(workspaceAudioPlaybackState?.volume ?? audioElement.volume ?? 1);
-    const previousMuted = Boolean(workspaceAudioPlaybackState?.muted ?? audioElement.muted);
-    const previousRate = Number(workspaceAudioPlaybackState?.playbackRate || audioElement.playbackRate || 1);
-    const trackChanged = path.resolve(String(audioElement.dataset.trackPath || '')) !== normalizedTrackPath;
-
-    activeWorkspaceAlbumPath = album.path;
-    activeWorkspaceTrackPath = track.path;
-    audioElement.dataset.albumPath = album.path;
-    audioElement.dataset.trackPath = track.path;
-    audioElement.volume = clamp(previousVolume, 0, 1);
-    audioElement.muted = previousMuted;
-    audioElement.playbackRate = previousRate > 0 ? previousRate : 1;
-
-    if (trackChanged) {
-        audioElement.src = getWorkspaceMusicArtworkUrl(track.path);
-        audioElement.load();
-    } else if (resetPosition) {
-        try {
-            audioElement.currentTime = 0;
-        } catch {
-            // ignore seek failures
-        }
-    }
-
-    workspaceAudioPlaybackState = {
-        path: track.path,
-        albumPath: album.path,
-        currentTime: resetPosition || trackChanged ? 0 : Number(audioElement.currentTime || 0),
-        wasPlaying: autoplay,
-        volume: Number(audioElement.volume ?? 1),
-        muted: Boolean(audioElement.muted),
-        playbackRate: Number(audioElement.playbackRate || 1),
-        duration: Number(audioElement.duration || 0)
-    };
-
-    if (autoplay) {
-        void audioElement.play().catch(() => {});
-    } else {
-        updateWorkspaceMusicPanelUi({ forceCollections: true });
-    }
-    rememberWorkspaceAudioPlaybackState();
-
-    return true;
-}
-
-function playWorkspaceAlbum(albumPath, options = {}) {
-    const {
-        autoplay = true,
-        preferredTrackPath = null
-    } = options;
-
-    const context = getWorkspaceMusicContext();
-    const album = findWorkspaceAlbumByPath(context.albums, albumPath);
-    if (!album?.tracks?.length) {
-        return false;
-    }
-
-    const nextTrack = album.tracks.find((track) => path.resolve(track.path) === path.resolve(String(preferredTrackPath || '')))
-        || album.tracks[0];
-    activeWorkspaceAlbumPath = album.path;
-    return playWorkspaceMusicTrack(nextTrack.path, {
-        autoplay,
-        resetPosition: true
-    });
-}
-
-function playAdjacentWorkspaceTrack(direction = 1, options = {}) {
-    const { wrap = true, autoplay = true } = options;
-    const context = getWorkspaceMusicContext();
-    const album = context.selectedAlbum;
-    const track = context.selectedTrack;
-    if (!album?.tracks?.length) {
-        return false;
-    }
-
-    const currentIndex = getWorkspaceMusicTrackIndex(album, track?.path);
-    const baseIndex = currentIndex >= 0 ? currentIndex : 0;
-    let nextIndex = baseIndex + (direction >= 0 ? 1 : -1);
-
-    if (wrap) {
-        nextIndex = (nextIndex + album.tracks.length) % album.tracks.length;
-    } else if (nextIndex < 0 || nextIndex >= album.tracks.length) {
-        return false;
-    }
-
-    const nextTrack = album.tracks[nextIndex];
-    return playWorkspaceMusicTrack(nextTrack.path, {
-        autoplay,
-        resetPosition: true
-    });
-}
-
-function updateWorkspaceMusicProgressUi() {
-    if (!workspaceMusicUiRefs) {
-        return;
-    }
-
-    const audioElement = ensureWorkspaceAudioController();
-    const currentTime = Number(audioElement.currentTime || 0);
-    const duration = Number(audioElement.duration || workspaceAudioPlaybackState?.duration || 0);
-    const progress = duration > 0 ? Math.min(Math.max((currentTime / duration) * 100, 0), 100) : 0;
-
-    if (workspaceMusicUiRefs.progressSlider) {
-        if (!workspaceMusicUiRefs.isScrubbingProgress) {
-            workspaceMusicUiRefs.progressSlider.value = String(progress);
-            workspaceMusicUiRefs.progressSlider.style.setProperty('--workspace-music-progress', `${progress}%`);
-        }
-    }
-    if (workspaceMusicUiRefs.currentTimeLabel) {
-        workspaceMusicUiRefs.currentTimeLabel.textContent = formatMediaDuration(currentTime);
-    }
-    if (workspaceMusicUiRefs.durationLabel) {
-        workspaceMusicUiRefs.durationLabel.textContent = formatMediaDuration(duration);
-    }
-    if (workspaceMusicUiRefs.volumeSlider) {
-        const volume = audioElement.muted ? 0 : Math.round((Number(audioElement.volume ?? 1) || 0) * 100);
-        if (!workspaceMusicUiRefs.isAdjustingVolume) {
-            workspaceMusicUiRefs.volumeSlider.value = String(volume);
-            workspaceMusicUiRefs.volumeSlider.style.setProperty('--workspace-music-volume', `${volume}%`);
-        }
-    }
-}
-
-function updateWorkspaceMusicLyricsHighlight() {
-    if (!workspaceMusicUiRefs?.liveLyricsLines?.length) {
-        return;
-    }
-
-    const audioElement = ensureWorkspaceAudioController();
-    const currentTime = Number(audioElement.currentTime || 0);
-    const lyricData = workspaceMusicUiRefs.lyricData;
-    let activeIndex = -1;
-
-    if (lyricData?.type === 'timed') {
-        for (let index = lyricData.lines.length - 1; index >= 0; index--) {
-            if (currentTime + 0.08 >= Number(lyricData.lines[index].time || 0)) {
-                activeIndex = index;
-                break;
-            }
-        }
-        if (activeIndex === -1 && lyricData.lines.length) {
-            activeIndex = 0;
-        }
-    } else if (lyricData?.lines?.length) {
-        activeIndex = 0;
-    }
-
-    const getLyricWindow = () => {
-        if (!lyricData?.lines?.length) {
-            return {
-                key: 'empty',
-                lines: [
-                    { text: '', role: 'prev', empty: true },
-                    { text: '这首歌没有歌词', role: 'current', empty: false },
-                    { text: '', role: 'next', empty: true }
-                ]
-            };
-        }
-
-        const safeIndex = Math.max(activeIndex, 0);
-        const previous = lyricData.lines[safeIndex - 1]?.text || '';
-        const current = lyricData.lines[safeIndex]?.text || lyricData.lines[0]?.text || '';
-        const next = lyricData.lines[safeIndex + 1]?.text || '';
-        return {
-            key: `${safeIndex}:${previous}:${current}:${next}`,
-            lines: [
-                { text: previous, role: 'prev', empty: !previous },
-                { text: current, role: 'current', empty: !current },
-                { text: next, role: 'next', empty: !next }
-            ]
-        };
-    };
-
-    const lyricWindow = getLyricWindow();
-    if (workspaceMusicUiRefs.activeLyricWindowKey === lyricWindow.key) {
-        return;
-    }
-
-    workspaceMusicUiRefs.activeLyricIndex = activeIndex;
-    workspaceMusicUiRefs.activeLyricWindowKey = lyricWindow.key;
-    workspaceMusicUiRefs.liveLyricsLines.forEach((lineElement, index) => {
-        const entry = lyricWindow.lines[index] || { text: '', role: 'current', empty: true };
-        lineElement.textContent = entry.text || '\u00A0';
-        lineElement.className = `workspace-music-live-line ${entry.role}${entry.empty ? ' empty' : ''}`;
-    });
-}
-
-function updateWorkspaceMusicPlaybackButton() {
-    if (!workspaceMusicUiRefs?.playButton) {
-        return;
-    }
-
-    const audioElement = ensureWorkspaceAudioController();
-    const isPlaying = !audioElement.paused && !audioElement.ended;
-    workspaceMusicUiRefs.playButton.innerHTML = isPlaying
-        ? '<i class="fa-solid fa-pause" aria-hidden="true"></i>'
-        : '<i class="fa-solid fa-play" aria-hidden="true"></i>';
-    workspaceMusicUiRefs.playButton.title = isPlaying ? '暂停' : '播放';
-    workspaceMusicUiRefs.playButton.setAttribute('aria-label', workspaceMusicUiRefs.playButton.title);
-
-    workspaceMusicUiRefs.turntable?.classList.toggle('playing', isPlaying);
-    workspaceMusicUiRefs.disc?.classList.toggle('spinning', isPlaying);
-    workspaceMusicUiRefs.arm?.classList.toggle('playing', isPlaying);
-}
-
-function renderWorkspaceMusicTracklist(selectedAlbum, selectedTrack) {
-    if (!workspaceMusicUiRefs?.tracklistBody) {
-        return;
-    }
-
-    const body = workspaceMusicUiRefs.tracklistBody;
-    body.innerHTML = '';
-
-    if (!selectedAlbum?.tracks?.length) {
-        const emptyState = document.createElement('div');
-        emptyState.className = 'sidebar-empty';
-        emptyState.textContent = '这个专辑里还没有可播放的歌曲。';
-        body.appendChild(emptyState);
-        return;
-    }
-
-    for (const track of selectedAlbum.tracks) {
-        const item = document.createElement('button');
-        item.type = 'button';
-        item.className = `workspace-music-track-item${track.path === selectedTrack?.path ? ' active' : ''}`;
-
-        const index = document.createElement('span');
-        index.className = 'workspace-music-track-index';
-        index.textContent = String(track.index).padStart(2, '0');
-        item.appendChild(index);
-
-        const name = document.createElement('span');
-        name.className = 'workspace-music-track-name';
-        name.textContent = track.title;
-        item.appendChild(name);
-
-        const duration = document.createElement('span');
-        duration.className = 'workspace-music-track-duration';
-        duration.textContent = Number.isFinite(track.duration) && track.duration > 0
-            ? formatMediaDuration(track.duration)
-            : formatFileSize(track.size);
-        item.appendChild(duration);
-
-        item.addEventListener('click', () => {
-            playWorkspaceMusicTrack(track.path, {
-                autoplay: true,
-                resetPosition: true
-            });
-        });
-        body.appendChild(item);
-    }
-}
-
-function renderWorkspaceMusicLyrics(selectedTrack) {
-    if (!workspaceMusicUiRefs?.liveLyrics) {
-        return;
-    }
-
-    const body = workspaceMusicUiRefs.liveLyrics;
-    body.innerHTML = '';
-    workspaceMusicUiRefs.liveLyricsLines = [];
-    workspaceMusicUiRefs.lyricData = getWorkspaceTrackLyrics(selectedTrack);
-    workspaceMusicUiRefs.activeLyricIndex = -1;
-    workspaceMusicUiRefs.activeLyricWindowKey = '';
-
-    for (const role of ['prev', 'current', 'next']) {
-        const lineElement = document.createElement('div');
-        lineElement.className = `workspace-music-live-line ${role} empty`;
-        lineElement.textContent = '\u00A0';
-        body.appendChild(lineElement);
-        workspaceMusicUiRefs.liveLyricsLines.push(lineElement);
-    }
-
-    if (!selectedTrack) {
-        workspaceMusicUiRefs.activeLyricWindowKey = '';
-        if (workspaceMusicUiRefs.liveLyricsLines[1]) {
-            workspaceMusicUiRefs.liveLyricsLines[1].textContent = '先从下面选择一个专辑开始播放';
-            workspaceMusicUiRefs.liveLyricsLines[1].className = 'workspace-music-live-line current';
-        }
-        return;
-    }
-    updateWorkspaceMusicLyricsHighlight();
-}
-
-function renderWorkspaceMusicLibraryGrid(filteredAlbums, selectedAlbum) {
-    if (!workspaceMusicUiRefs?.libraryGrid || !workspaceMusicUiRefs?.librarySubtitle) {
-        return;
-    }
-
-    const grid = workspaceMusicUiRefs.libraryGrid;
-    const scrollContainer = document.getElementById('music-player-container');
-    const previousScrollTop = Math.max(0, Number(scrollContainer?.scrollTop || workspaceMusicLibraryScrollTop || 0));
-    grid.innerHTML = '';
-    const albumCount = filteredAlbums.length;
-    const hasQuery = normalizeWorkspaceMusicSearchText(workspaceMusicSearchQuery).length > 0;
-    const selectedSource = getWorkspaceMusicSourceMeta(selectedWorkspaceMusicBundlePath);
-    workspaceMusicUiRefs.renderedLibrarySignature = getWorkspaceMusicLibraryRenderSignature(filteredAlbums, selectedAlbum, workspaceMusicSearchQuery);
-    workspaceMusicUiRefs.librarySubtitle.textContent = hasQuery
-        ? `筛到 ${albumCount} 张专辑，点击封面即可播放。`
-        : (selectedSource
-            ? `共 ${albumCount} 张专辑，按艺术家与文件夹归类。`
-            : '先指定一个专辑文件夹，再按文件夹浏览专辑。');
-
-    if (!filteredAlbums.length) {
-        const emptyState = document.createElement('div');
-        emptyState.className = 'sidebar-empty';
-        emptyState.textContent = hasQuery
-            ? '没有匹配到专辑，试试换个关键词。'
-            : (selectedSource ? '这个文件夹里还没有找到专辑文件夹。' : '先在右上角选择一个专辑来源文件夹。');
-        grid.appendChild(emptyState);
-        window.requestAnimationFrame(() => {
-            if (!(scrollContainer instanceof HTMLElement) || !grid.isConnected) {
-                return;
-            }
-            const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
-            scrollContainer.scrollTop = Math.min(previousScrollTop, maxScrollTop);
-            workspaceMusicLibraryScrollTop = scrollContainer.scrollTop;
-        });
-        return;
-    }
-
-    for (const group of groupWorkspaceAlbumsByArtist(filteredAlbums)) {
-        const groupHead = document.createElement('div');
-        groupHead.className = 'workspace-music-artist-head';
-
-        const groupTitle = document.createElement('div');
-        groupTitle.className = 'workspace-music-artist-title';
-        groupTitle.textContent = group.artist;
-        groupHead.appendChild(groupTitle);
-
-        const groupMeta = document.createElement('div');
-        groupMeta.className = 'workspace-music-artist-meta';
-        groupMeta.textContent = `${group.albums.length} 张专辑`;
-        groupHead.appendChild(groupMeta);
-        grid.appendChild(groupHead);
-
-        for (const album of group.albums) {
-            const card = document.createElement('button');
-            card.type = 'button';
-            card.className = `workspace-music-album-card${album.path === selectedAlbum?.path ? ' active' : ''}`;
-
-            const cover = document.createElement('div');
-            cover.className = 'workspace-music-album-cover';
-            const coverSource = getWorkspaceAlbumCoverSource(album);
-            if (coverSource) {
-                const image = document.createElement('img');
-                image.src = coverSource;
-                image.alt = album.title;
-                cover.appendChild(image);
-            } else {
-                const fallback = document.createElement('div');
-                fallback.className = 'workspace-music-album-cover-fallback';
-                fallback.innerHTML = '<i class="fa-solid fa-compact-disc" aria-hidden="true"></i>';
-                cover.appendChild(fallback);
-                ensureWorkspaceAlbumCoverLoaded(album, (dataUrl) => {
-                    if (!dataUrl || !cover.isConnected) {
-                        return;
-                    }
-                    cover.innerHTML = '';
-                    const image = document.createElement('img');
-                    image.src = dataUrl;
-                    image.alt = album.title;
-                    cover.appendChild(image);
-                });
-            }
-            card.appendChild(cover);
-
-            const title = document.createElement('div');
-            title.className = 'workspace-music-album-title';
-            title.textContent = album.title;
-            card.appendChild(title);
-
-            const meta = document.createElement('div');
-            meta.className = 'workspace-music-album-meta';
-            meta.textContent = `${album.trackCount} 首 · ${album.relativePath}`;
-            card.appendChild(meta);
-
-            card.addEventListener('click', () => {
-                playWorkspaceAlbum(album.path, {
-                    autoplay: true
-                });
-            });
-            grid.appendChild(card);
-        }
-    }
-
-    window.requestAnimationFrame(() => {
-        if (!(scrollContainer instanceof HTMLElement) || !grid.isConnected) {
-            return;
-        }
-        const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
-        scrollContainer.scrollTop = Math.min(previousScrollTop, maxScrollTop);
-        workspaceMusicLibraryScrollTop = scrollContainer.scrollTop;
-    });
-}
-
-function updateWorkspaceMusicPanelUi(options = {}) {
-    const { forceCollections = false, libraryOnly = false } = options;
-    if (!workspaceMusicUiRefs) {
-        return;
-    }
-
-    const context = getWorkspaceMusicContext();
-    const { selectedSource, selectedAlbum, selectedTrack, filteredAlbums } = context;
-    const audioElement = ensureWorkspaceAudioController();
-    const currentTrackPath = audioElement.dataset.trackPath || '';
-    const currentAlbumPath = audioElement.dataset.albumPath || '';
-
-    if (workspaceMusicUiRefs.playerTitle) {
-        workspaceMusicUiRefs.playerTitle.textContent = selectedTrack?.title || '未开始播放';
-    }
-    if (workspaceMusicUiRefs.playerSubtitle) {
-        workspaceMusicUiRefs.playerSubtitle.textContent = selectedAlbum
-            ? `${selectedAlbum.title} · ${selectedTrack ? `${selectedTrack.index}/${selectedAlbum.trackCount}` : `${selectedAlbum.trackCount} 首`} · ${selectedSource?.title || '未指定文件夹'}`
-            : (selectedSource ? '先从下面选择专辑开始播放。' : '先为音乐播放器指定一个文件夹。');
-    }
-    if (workspaceMusicUiRefs.libraryTitle) {
-        workspaceMusicUiRefs.libraryTitle.textContent = selectedSource?.title || '专辑文件夹';
-    }
-
-    if (workspaceMusicUiRefs.trackMeta) {
-        workspaceMusicUiRefs.trackMeta.textContent = selectedTrack
-            ? `${selectedAlbum?.title || '未命名专辑'} · 第 ${selectedTrack.index} 首，共 ${selectedAlbum?.trackCount || 0} 首`
-            : '播放器会在这里显示当前曲目与专辑信息。';
-    }
-
-    if (workspaceMusicUiRefs.discImage) {
-        const coverSource = getWorkspaceAlbumCoverSource(selectedAlbum);
-        if (coverSource) {
-            workspaceMusicUiRefs.discImage.src = coverSource;
-            workspaceMusicUiRefs.discImage.hidden = false;
-            workspaceMusicUiRefs.discFallback.hidden = true;
-        } else {
-            workspaceMusicUiRefs.discImage.hidden = true;
-            workspaceMusicUiRefs.discImage.removeAttribute('src');
-            workspaceMusicUiRefs.discFallback.hidden = false;
-            ensureWorkspaceAlbumCoverLoaded(selectedAlbum, (dataUrl) => {
-                if (!dataUrl || !workspaceMusicUiRefs?.discImage?.isConnected) {
-                    return;
-                }
-                const latestContext = getWorkspaceMusicContext();
-                if (latestContext.selectedAlbum?.path !== selectedAlbum?.path) {
-                    return;
-                }
-                workspaceMusicUiRefs.discImage.src = dataUrl;
-                workspaceMusicUiRefs.discImage.hidden = false;
-                workspaceMusicUiRefs.discFallback.hidden = true;
-                renderWorkspaceMusicLibraryGrid(latestContext.filteredAlbums, latestContext.selectedAlbum);
-            });
-        }
-    }
-
-    if (workspaceMusicUiRefs.revealButton) {
-        workspaceMusicUiRefs.revealButton.disabled = !selectedTrack?.path;
-    }
-    if (workspaceMusicUiRefs.openButton) {
-        workspaceMusicUiRefs.openButton.disabled = !selectedTrack?.path;
-    }
-    if (workspaceMusicUiRefs.rateButton) {
-        workspaceMusicUiRefs.rateButton.textContent = `${Number(audioElement.playbackRate || 1).toFixed(audioElement.playbackRate % 1 ? 2 : 1)}x`;
-    }
-    if (workspaceMusicUiRefs.sourceButton) {
-        workspaceMusicUiRefs.sourceButton.title = selectedSource ? `更换专辑文件夹：${selectedSource.relativePath}` : '选择专辑文件夹';
-        workspaceMusicUiRefs.sourceButton.setAttribute('aria-label', workspaceMusicUiRefs.sourceButton.title);
-    }
-
-    updateWorkspaceMusicPlaybackButton();
-    updateWorkspaceMusicProgressUi();
-
-    if (!libraryOnly && (forceCollections || workspaceMusicUiRefs.renderedAlbumPath !== currentAlbumPath || workspaceMusicUiRefs.renderedTrackPath !== currentTrackPath)) {
-        workspaceMusicUiRefs.renderedAlbumPath = currentAlbumPath;
-        workspaceMusicUiRefs.renderedTrackPath = currentTrackPath;
-        renderWorkspaceMusicTracklist(selectedAlbum, selectedTrack);
-        renderWorkspaceMusicLyrics(selectedTrack);
-    }
-
-    const nextLibrarySignature = getWorkspaceMusicLibraryRenderSignature(filteredAlbums, selectedAlbum, workspaceMusicSearchQuery);
-    if (forceCollections || workspaceMusicUiRefs.renderedLibrarySignature !== nextLibrarySignature) {
-        renderWorkspaceMusicLibraryGrid(filteredAlbums, selectedAlbum);
-    }
-    updateWorkspaceMusicLyricsHighlight();
-    applyWorkspaceMusicFullscreenState();
-}
-
-function bindWorkspaceAudioPlaybackState(audioElement) {
-    if (!(audioElement instanceof HTMLAudioElement) || audioElement.dataset.workspaceAudioBound === 'true') {
-        return;
-    }
-
-    audioElement.dataset.workspaceAudioBound = 'true';
-    const syncUi = (options = {}) => {
-        rememberWorkspaceAudioPlaybackState();
-        updateWorkspaceTrackDuration(audioElement.dataset.trackPath || '', Number(audioElement.duration || 0));
-        updateWorkspaceMusicPanelUi(options);
-    };
-
-    audioElement.addEventListener('play', () => syncUi({ forceCollections: false }));
-    audioElement.addEventListener('pause', () => syncUi({ forceCollections: false }));
-    audioElement.addEventListener('volumechange', () => syncUi({ forceCollections: false }));
-    audioElement.addEventListener('ratechange', () => syncUi({ forceCollections: false }));
-    audioElement.addEventListener('loadedmetadata', () => syncUi({ forceCollections: true }));
-    audioElement.addEventListener('durationchange', () => syncUi({ forceCollections: true }));
-    audioElement.addEventListener('timeupdate', () => {
-        rememberWorkspaceAudioPlaybackState();
-        updateWorkspaceMusicProgressUi();
-        updateWorkspaceMusicLyricsHighlight();
-    });
-    audioElement.addEventListener('ended', () => {
-        const didAdvance = playAdjacentWorkspaceTrack(1, {
-            autoplay: true,
-            wrap: false
-        });
-        if (!didAdvance) {
-            rememberWorkspaceAudioPlaybackState();
-            updateWorkspaceMusicPanelUi({ forceCollections: false });
-        }
-    });
-}
-
-function ensureWorkspaceMusicPanel(options = {}) {
-    const container = document.getElementById('music-player-container');
-    const { force = false } = options;
-    if (force || workspaceMusicPanelDirty || !container || !container.firstElementChild) {
-        renderWorkspaceMusicPanel();
-        return;
-    }
-
-    updateWorkspaceMusicPanelUi({ forceCollections: true });
-}
-
-function renderWorkspaceMusicPanel() {
-    const container = document.getElementById('music-player-container');
-    if (!container) {
-        return;
-    }
-
-    ensureWorkspaceAudioController();
-    container.innerHTML = '';
-    workspaceMusicPanelDirty = false;
-    workspaceMusicUiRefs = null;
-
-    if (!workspaceRootPath) {
-        const emptyState = document.createElement('div');
-        emptyState.className = 'sidebar-empty';
-        emptyState.textContent = '还没有打开工作空间。先打开一个工作空间，然后为音乐播放器指定专辑文件夹。';
-        container.appendChild(emptyState);
-        return;
-    }
-
-    const context = getWorkspaceMusicContext();
-    const panel = document.createElement('div');
-    panel.className = 'workspace-music-panel';
-
-    const playerCard = document.createElement('div');
-    playerCard.className = 'workspace-music-player-card';
-
-    const playerHead = document.createElement('div');
-    playerHead.className = 'workspace-music-player-head';
-
-    const playerMeta = document.createElement('div');
-    playerMeta.className = 'workspace-music-player-meta';
-    const playerTitle = document.createElement('div');
-    playerTitle.className = 'workspace-music-player-title';
-    const playerSubtitle = document.createElement('div');
-    playerSubtitle.className = 'workspace-music-player-subtitle';
-    playerMeta.appendChild(playerTitle);
-    playerMeta.appendChild(playerSubtitle);
-    playerHead.appendChild(playerMeta);
-
-    const headActions = document.createElement('div');
-    headActions.className = 'workspace-music-head-actions';
-
-    const refreshButton = document.createElement('button');
-    refreshButton.type = 'button';
-    refreshButton.className = 'workspace-music-action';
-    refreshButton.title = '刷新专辑库';
-    refreshButton.innerHTML = '<i class="fa-solid fa-rotate" aria-hidden="true"></i>';
-    refreshButton.addEventListener('click', () => {
-        workspaceAlbumEntriesCache = null;
-        workspaceAlbumEntriesCacheRoot = null;
-        workspaceAlbumEntriesCacheDirty = true;
-        workspaceLyricsCache = new Map();
-        workspaceEmbeddedArtworkCache = new Map();
-        renderWorkspaceMusicPanel();
-    });
-
-    const revealButton = document.createElement('button');
-    revealButton.type = 'button';
-    revealButton.className = 'workspace-music-action';
-    revealButton.title = '打开当前歌曲所在目录';
-    revealButton.innerHTML = '<i class="fa-regular fa-folder-open" aria-hidden="true"></i>';
-    revealButton.addEventListener('click', async () => {
-        const currentContext = getWorkspaceMusicContext();
-        if (!currentContext.selectedTrack?.path) {
-            return;
-        }
-        const result = await ipcRenderer.invoke('shell:revealLinkTarget', {
-            type: 'path',
-            value: currentContext.selectedTrack.path
-        });
-        if (!result || !result.ok) {
-            alert(`打开所在目录失败: ${(result && result.error) || currentContext.selectedTrack.path}`);
-        }
-    });
-
-    const openButton = document.createElement('button');
-    openButton.type = 'button';
-    openButton.className = 'workspace-music-action';
-    openButton.title = '用系统默认应用打开歌曲';
-    openButton.innerHTML = '<i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i>';
-    openButton.addEventListener('click', async () => {
-        const currentContext = getWorkspaceMusicContext();
-        if (!currentContext.selectedTrack?.path) {
-            return;
-        }
-        await openAttachmentTarget({ absolutePath: currentContext.selectedTrack.path });
-    });
-
-    headActions.appendChild(refreshButton);
-    headActions.appendChild(revealButton);
-    headActions.appendChild(openButton);
-    playerHead.appendChild(headActions);
-    playerCard.appendChild(playerHead);
-
-    const playerBody = document.createElement('div');
-    playerBody.className = 'workspace-music-player-body';
-
-    const deck = document.createElement('div');
-    deck.className = 'workspace-music-deck';
-    const turntable = document.createElement('div');
-    turntable.className = 'workspace-music-turntable';
-    const discWrap = document.createElement('div');
-    discWrap.className = 'workspace-music-disc-wrap';
-    const disc = document.createElement('div');
-    disc.className = 'workspace-music-disc';
-    const discLabel = document.createElement('div');
-    discLabel.className = 'workspace-music-disc-label';
-    const discImage = document.createElement('img');
-    discImage.alt = '专辑封面';
-    discImage.hidden = true;
-    const discFallback = document.createElement('div');
-    discFallback.className = 'workspace-music-disc-label-fallback';
-    discFallback.innerHTML = '<i class="fa-solid fa-music" aria-hidden="true"></i>';
-    discLabel.appendChild(discImage);
-    discLabel.appendChild(discFallback);
-    disc.appendChild(discLabel);
-    discWrap.appendChild(disc);
-    turntable.appendChild(discWrap);
-    const arm = document.createElement('div');
-    arm.className = 'workspace-music-arm';
-    turntable.appendChild(arm);
-    deck.appendChild(turntable);
-
-    const side = document.createElement('div');
-    side.className = 'workspace-music-side';
-    const controls = document.createElement('div');
-    controls.className = 'workspace-music-controls';
-    const trackTitle = document.createElement('div');
-    trackTitle.className = 'workspace-music-track-title';
-    const trackMeta = document.createElement('div');
-    trackMeta.className = 'workspace-music-track-meta';
-    controls.appendChild(trackTitle);
-    controls.appendChild(trackMeta);
-
-    const liveLyrics = document.createElement('div');
-    liveLyrics.className = 'workspace-music-live-lyrics';
-    controls.appendChild(liveLyrics);
-
-    const progressRow = document.createElement('div');
-    progressRow.className = 'workspace-music-progress-row';
-    const progressSlider = document.createElement('input');
-    progressSlider.type = 'range';
-    progressSlider.className = 'workspace-music-slider';
-    progressSlider.min = '0';
-    progressSlider.max = '100';
-    progressSlider.step = '0.1';
-    progressSlider.value = '0';
-    const commitProgressSliderValue = () => {
-        const audioElement = ensureWorkspaceAudioController();
-        const duration = Number(audioElement.duration || 0);
-        if (!Number.isFinite(duration) || duration <= 0) {
-            return;
-        }
-        try {
-            audioElement.currentTime = (Number(progressSlider.value || 0) / 100) * duration;
-        } catch {
-            // ignore seek failures
-        }
-    };
-    progressSlider.addEventListener('pointerdown', () => {
-        if (workspaceMusicUiRefs) {
-            workspaceMusicUiRefs.isScrubbingProgress = true;
-        }
-    });
-    progressSlider.addEventListener('input', () => {
-        progressSlider.style.setProperty('--workspace-music-progress', `${progressSlider.value}%`);
-        commitProgressSliderValue();
-    });
-    progressSlider.addEventListener('change', commitProgressSliderValue);
-    progressSlider.addEventListener('pointerup', () => {
-        if (workspaceMusicUiRefs) {
-            workspaceMusicUiRefs.isScrubbingProgress = false;
-        }
-        updateWorkspaceMusicProgressUi();
-    });
-    progressSlider.addEventListener('blur', () => {
-        if (workspaceMusicUiRefs) {
-            workspaceMusicUiRefs.isScrubbingProgress = false;
-        }
-    });
-    progressRow.appendChild(progressSlider);
-    controls.appendChild(progressRow);
-
-    const timeRow = document.createElement('div');
-    timeRow.className = 'workspace-music-time-row';
-    const currentTimeLabel = document.createElement('span');
-    currentTimeLabel.textContent = '--:--';
-    const durationLabel = document.createElement('span');
-    durationLabel.textContent = '--:--';
-    timeRow.appendChild(currentTimeLabel);
-    timeRow.appendChild(durationLabel);
-    controls.appendChild(timeRow);
-
-    const transport = document.createElement('div');
-    transport.className = 'workspace-music-transport';
-
-    const prevButton = document.createElement('button');
-    prevButton.type = 'button';
-    prevButton.className = 'workspace-music-action';
-    prevButton.title = '上一首';
-    prevButton.innerHTML = '<i class="fa-solid fa-backward-step" aria-hidden="true"></i>';
-    prevButton.addEventListener('click', () => {
-        const audioElement = ensureWorkspaceAudioController();
-        if (Number(audioElement.currentTime || 0) > 3) {
-            try {
-                audioElement.currentTime = 0;
-            } catch {
-                // ignore seek failures
-            }
-            updateWorkspaceMusicProgressUi();
-            return;
-        }
-        playAdjacentWorkspaceTrack(-1, {
-            autoplay: true,
-            wrap: true
-        });
-    });
-
-    const playButton = document.createElement('button');
-    playButton.type = 'button';
-    playButton.className = 'workspace-music-action play';
-    playButton.title = '播放';
-    playButton.innerHTML = '<i class="fa-solid fa-play" aria-hidden="true"></i>';
-    playButton.addEventListener('click', () => {
-        const audioElement = ensureWorkspaceAudioController();
-        const currentContext = getWorkspaceMusicContext();
-        if (!audioElement.src && currentContext.selectedTrack?.path) {
-            playWorkspaceMusicTrack(currentContext.selectedTrack.path, {
-                autoplay: true,
-                resetPosition: false
-            });
-            return;
-        }
-        if (audioElement.paused) {
-            void audioElement.play().catch(() => {});
-        } else {
-            audioElement.pause();
-        }
-    });
-
-    const nextButton = document.createElement('button');
-    nextButton.type = 'button';
-    nextButton.className = 'workspace-music-action';
-    nextButton.title = '下一首';
-    nextButton.innerHTML = '<i class="fa-solid fa-forward-step" aria-hidden="true"></i>';
-    nextButton.addEventListener('click', () => {
-        playAdjacentWorkspaceTrack(1, {
-            autoplay: true,
-            wrap: true
-        });
-    });
-
-    const rateButton = document.createElement('button');
-    rateButton.type = 'button';
-    rateButton.className = 'workspace-music-action';
-    rateButton.title = '切换播放速度';
-    rateButton.textContent = '1.0x';
-    rateButton.addEventListener('click', () => {
-        const audioElement = ensureWorkspaceAudioController();
-        const rates = [1, 1.25, 1.5, 2];
-        const currentRate = Number(audioElement.playbackRate || 1);
-        const currentIndex = rates.findIndex((rate) => Math.abs(rate - currentRate) < 0.01);
-        const nextRate = rates[(currentIndex + 1 + rates.length) % rates.length];
-        audioElement.playbackRate = nextRate;
-        rememberWorkspaceAudioPlaybackState();
-        updateWorkspaceMusicPanelUi({ forceCollections: false });
-    });
-
-    transport.appendChild(prevButton);
-    transport.appendChild(playButton);
-    transport.appendChild(nextButton);
-    transport.appendChild(rateButton);
-    controls.appendChild(transport);
-
-    const volumeRow = document.createElement('div');
-    volumeRow.className = 'workspace-music-volume-row';
-    const volumeIcon = document.createElement('span');
-    volumeIcon.innerHTML = '<i class="fa-solid fa-volume-high" aria-hidden="true"></i>';
-    const volumeSlider = document.createElement('input');
-    volumeSlider.type = 'range';
-    volumeSlider.className = 'workspace-music-slider';
-    volumeSlider.min = '0';
-    volumeSlider.max = '100';
-    volumeSlider.step = '1';
-    volumeSlider.value = '100';
-    const commitVolumeSliderValue = () => {
-        const audioElement = ensureWorkspaceAudioController();
-        const volume = clamp(Number(volumeSlider.value || 0) / 100, 0, 1);
-        audioElement.muted = volume <= 0;
-        audioElement.volume = volume;
-        rememberWorkspaceAudioPlaybackState();
-        updateWorkspaceMusicPanelUi({ forceCollections: false });
-    };
-    volumeSlider.addEventListener('pointerdown', () => {
-        if (workspaceMusicUiRefs) {
-            workspaceMusicUiRefs.isAdjustingVolume = true;
-        }
-    });
-    volumeSlider.addEventListener('input', () => {
-        volumeSlider.style.setProperty('--workspace-music-volume', `${volumeSlider.value}%`);
-        commitVolumeSliderValue();
-    });
-    volumeSlider.addEventListener('change', commitVolumeSliderValue);
-    volumeSlider.addEventListener('pointerup', () => {
-        if (workspaceMusicUiRefs) {
-            workspaceMusicUiRefs.isAdjustingVolume = false;
-        }
-        updateWorkspaceMusicProgressUi();
-    });
-    volumeSlider.addEventListener('blur', () => {
-        if (workspaceMusicUiRefs) {
-            workspaceMusicUiRefs.isAdjustingVolume = false;
-        }
-    });
-    volumeRow.appendChild(volumeIcon);
-    volumeRow.appendChild(volumeSlider);
-    controls.appendChild(volumeRow);
-    deck.appendChild(controls);
-
-    const tracklist = document.createElement('div');
-    tracklist.className = 'workspace-music-tracklist';
-    tracklist.innerHTML = `
-        <div class="workspace-music-section-head">
-            <div>
-                <div class="workspace-music-section-title">专辑曲目</div>
-                <div class="workspace-music-section-subtitle">点击任意曲目即可切歌</div>
-            </div>
-        </div>
-    `;
-    const tracklistBody = document.createElement('div');
-    tracklistBody.className = 'workspace-music-tracklist-body';
-    tracklist.appendChild(tracklistBody);
-    side.appendChild(tracklist);
-
-    playerBody.appendChild(deck);
-    playerBody.appendChild(side);
-    playerCard.appendChild(playerBody);
-    panel.appendChild(playerCard);
-
-    const libraryCard = document.createElement('div');
-    libraryCard.className = 'workspace-music-library-card';
-    const libraryHead = document.createElement('div');
-    libraryHead.className = 'workspace-music-library-head';
-    const libraryMeta = document.createElement('div');
-    libraryMeta.className = 'workspace-music-library-meta';
-    const libraryTitle = document.createElement('div');
-    libraryTitle.className = 'workspace-music-library-title';
-    const librarySubtitle = document.createElement('div');
-    librarySubtitle.className = 'workspace-music-library-subtitle';
-    libraryMeta.appendChild(libraryTitle);
-    libraryMeta.appendChild(librarySubtitle);
-    libraryHead.appendChild(libraryMeta);
-
-    const libraryActions = document.createElement('div');
-    libraryActions.className = 'workspace-music-head-actions';
-    const pickFolderButton = document.createElement('button');
-    pickFolderButton.type = 'button';
-    pickFolderButton.className = 'workspace-music-action';
-    pickFolderButton.title = '在系统文件选择器中选择专辑文件夹';
-    pickFolderButton.innerHTML = '<i class="fa-regular fa-folder-open" aria-hidden="true"></i>';
-    pickFolderButton.addEventListener('click', async () => {
-        if (!workspaceRootPath) {
-            return;
-        }
-        const selectedPath = await ipcRenderer.invoke('dialog:openFolder', {
-            defaultPath: workspaceRootPath,
-            title: '选择要搜索专辑的文件夹',
-            buttonLabel: '选择文件夹'
-        });
-        if (!selectedPath) {
-            return;
-        }
-
-        const normalizedSelectedPath = path.resolve(selectedPath);
-        const normalizedWorkspaceRoot = path.resolve(workspaceRootPath);
-        if (
-            normalizedSelectedPath !== normalizedWorkspaceRoot
-            && !normalizedSelectedPath.startsWith(`${normalizedWorkspaceRoot}${path.sep}`)
-        ) {
-            alert('请选择当前工作空间中的文件夹。');
-            return;
-        }
-
-        selectedWorkspaceMusicBundlePath = normalizedSelectedPath;
-        rememberWorkspaceMusicBundleSelection(workspaceRootPath, normalizedSelectedPath);
-        workspaceMusicSearchQuery = '';
-        activeWorkspaceAlbumPath = null;
-        activeWorkspaceTrackPath = null;
-        workspaceAlbumEntriesCache = null;
-        workspaceAlbumEntriesCacheRoot = null;
-        workspaceAlbumEntriesCacheDirty = true;
-        workspaceLyricsCache = new Map();
-        workspaceEmbeddedArtworkCache = new Map();
-        resetWorkspaceAudioController();
-        renderWorkspaceMusicPanel();
-    });
-    libraryActions.appendChild(pickFolderButton);
-    libraryHead.appendChild(libraryActions);
-    libraryCard.appendChild(libraryHead);
-
-    const toolbar = document.createElement('div');
-    toolbar.className = 'workspace-music-library-toolbar';
-    const search = document.createElement('label');
-    search.className = 'workspace-music-search';
-    const searchIcon = document.createElement('i');
-    searchIcon.className = 'fa-solid fa-magnifying-glass';
-    searchIcon.setAttribute('aria-hidden', 'true');
-    const searchInput = document.createElement('input');
-    searchInput.type = 'search';
-    searchInput.placeholder = '模糊搜索专辑、文件夹或曲目…';
-    searchInput.value = workspaceMusicSearchQuery;
-    searchInput.addEventListener('input', () => {
-        workspaceMusicSearchQuery = searchInput.value || '';
-        renderWorkspaceMusicLibraryGrid(getFilteredWorkspaceAlbums(getWorkspaceMusicContext().albums, workspaceMusicSearchQuery), getWorkspaceMusicContext().selectedAlbum);
-    });
-    search.appendChild(searchIcon);
-    search.appendChild(searchInput);
-    toolbar.appendChild(search);
-    libraryCard.appendChild(toolbar);
-
-    const libraryGrid = document.createElement('div');
-    libraryGrid.className = 'workspace-music-library-grid';
-    libraryCard.appendChild(libraryGrid);
-    panel.appendChild(libraryCard);
-    container.appendChild(panel);
-    container.addEventListener('scroll', () => {
-        workspaceMusicLibraryScrollTop = Number(container.scrollTop || 0);
-    }, { passive: true });
-
-    workspaceMusicUiRefs = {
-        playerTitle,
-        playerSubtitle,
-        trackMeta,
-        libraryTitle,
-        librarySubtitle,
-        revealButton,
-        openButton,
-        rateButton,
-        sourceButton: pickFolderButton,
-        turntable,
-        disc,
-        arm,
-        discImage,
-        discFallback,
-        playButton,
-        progressSlider,
-        currentTimeLabel,
-        durationLabel,
-        volumeSlider,
-        liveLyrics,
-        liveLyricsLines: [],
-        tracklistBody,
-        libraryGrid,
-        searchInput,
-        lyricData: null,
-        activeLyricIndex: -1,
-        activeLyricWindowKey: '',
-        isScrubbingProgress: false,
-        isAdjustingVolume: false,
-        renderedAlbumPath: '',
-        renderedTrackPath: '',
-        renderedLibrarySignature: ''
-    };
-
-    updateWorkspaceMusicPanelUi({ forceCollections: true });
-}
-
-function getWorkspaceVideoEntries(bundlePath = selectedWorkspaceVideoBundlePath) {
-    if (!bundlePath || !fs.existsSync(bundlePath)) {
-        return [];
-    }
-
-    const normalizedBundlePath = path.resolve(bundlePath);
-    const attachmentsDir = path.join(normalizedBundlePath, 'attachments');
-    if (!fs.existsSync(attachmentsDir)) {
-        return [];
-    }
-
-    const now = Date.now();
-    if (
-        !workspaceVideoEntriesCacheDirty
-        && workspaceVideoEntriesCacheRoot === normalizedBundlePath
-        && workspaceVideoEntriesCache
-        && workspaceVideoEntriesCache.expiresAt > now
-    ) {
-        return workspaceVideoEntriesCache.entries;
-    }
-
-    const entries = [];
-    const visit = (dirPath) => {
-        let dirEntries = [];
-        try {
-            dirEntries = fs.readdirSync(dirPath, { withFileTypes: true })
-                .filter((entry) => !entry.name.startsWith('.'))
-                .sort((a, b) => {
-                    if (a.isDirectory() && !b.isDirectory()) return -1;
-                    if (!a.isDirectory() && b.isDirectory()) return 1;
-                    return a.name.localeCompare(b.name, 'zh-Hans-CN');
-                });
-        } catch {
-            return;
-        }
-
-        for (const entry of dirEntries) {
-            const absolutePath = path.join(dirPath, entry.name);
-            if (entry.isDirectory()) {
-                visit(absolutePath);
-                continue;
-            }
-
-            if (!entry.isFile() || !isWorkspaceVideoFilePath(entry.name)) {
-                continue;
-            }
-
-            let stat = null;
-            try {
-                stat = fs.statSync(absolutePath);
-            } catch {
-                stat = null;
-            }
-
-            entries.push({
-                name: entry.name,
-                path: absolutePath,
-                relativePath: path.relative(normalizedBundlePath, absolutePath) || entry.name,
-                size: Number(stat?.size || 0),
-                modifiedAt: Number(stat?.mtimeMs || 0)
-            });
-        }
-    };
-
-    visit(attachmentsDir);
-    workspaceVideoEntriesCache = {
-        entries,
-        expiresAt: now + WORKSPACE_VIDEO_PATHS_CACHE_TTL
-    };
-    workspaceVideoEntriesCacheRoot = normalizedBundlePath;
-    workspaceVideoEntriesCacheDirty = false;
-    return entries;
-}
-
-function rememberWorkspaceVideoPlaybackState(options = {}) {
-    const { preservePlayingIntent = false } = options;
-    const videoElement = document.getElementById('workspace-video-element');
-    if (!(videoElement instanceof HTMLVideoElement)) {
-        return;
-    }
-
-    const nextState = {
-        path: videoElement.dataset.videoPath || activeWorkspaceVideoPath || '',
-        currentTime: Number(videoElement.currentTime || 0),
-        wasPlaying: !videoElement.paused && !videoElement.ended,
-        volume: Number(videoElement.volume ?? 1),
-        muted: Boolean(videoElement.muted),
-        playbackRate: Number(videoElement.playbackRate || 1)
-    };
-
-    if (preservePlayingIntent && workspaceVideoPlaybackState?.path === nextState.path) {
-        nextState.wasPlaying = Boolean(workspaceVideoPlaybackState.wasPlaying || nextState.wasPlaying);
-    }
-
-    workspaceVideoPlaybackState = nextState;
-}
-
-function isWorkspaceVideoPanelActive() {
-    return timelinePanelOpen && currentSidebarTab === 'player' && currentRightSidebarTab === 'player';
-}
-
-function ensureWorkspaceVideoDock() {
-    let dock = document.getElementById('workspace-video-dock');
-    if (dock) {
-        return dock;
-    }
-
-    dock = document.createElement('div');
-    dock.id = 'workspace-video-dock';
-    dock.setAttribute('aria-hidden', 'true');
-    document.body.appendChild(dock);
-    return dock;
-}
-
-function ensureWorkspaceVideoController() {
-    if (workspaceVideoControllerElement instanceof HTMLVideoElement) {
-        return workspaceVideoControllerElement;
-    }
-
-    const existingElement = document.getElementById('workspace-video-element');
-    if (existingElement instanceof HTMLVideoElement) {
-        workspaceVideoControllerElement = existingElement;
-    } else {
-        const videoElement = document.createElement('video');
-        videoElement.id = 'workspace-video-element';
-        videoElement.className = 'workspace-video-element';
-        videoElement.controls = true;
-        videoElement.preload = 'metadata';
-        videoElement.setAttribute('playsinline', 'true');
-        workspaceVideoControllerElement = videoElement;
-    }
-
-    bindWorkspaceVideoPlaybackState(workspaceVideoControllerElement);
-    if (!workspaceVideoControllerElement.parentElement) {
-        ensureWorkspaceVideoDock().appendChild(workspaceVideoControllerElement);
-    }
-    return workspaceVideoControllerElement;
-}
-
-function parkWorkspaceVideoElement() {
-    const videoElement = workspaceVideoControllerElement instanceof HTMLVideoElement
-        ? workspaceVideoControllerElement
-        : document.getElementById('workspace-video-element');
-    if (!(videoElement instanceof HTMLVideoElement)) {
-        return null;
-    }
-
-    const dock = ensureWorkspaceVideoDock();
-    if (videoElement.parentElement !== dock) {
-        dock.appendChild(videoElement);
-    }
-    workspaceVideoControllerElement = videoElement;
-    return videoElement;
-}
-
-function mountWorkspaceVideoElement(stageElement, videoPath) {
-    if (!(stageElement instanceof HTMLElement) || !videoPath) {
-        return null;
-    }
-
-    const videoElement = ensureWorkspaceVideoController();
-    const normalizedVideoPath = path.resolve(videoPath);
-    if (path.resolve(String(videoElement.dataset.videoPath || '')) !== normalizedVideoPath) {
-        videoElement.dataset.videoPath = normalizedVideoPath;
-        videoElement.src = url.pathToFileURL(normalizedVideoPath).href;
-        videoElement.load();
-    }
-
-    if (videoElement.parentElement !== stageElement) {
-        stageElement.appendChild(videoElement);
-    }
-
-    applyWorkspaceVideoPlaybackStateToElement(videoElement, normalizedVideoPath, { resumePlayback: true });
-    return videoElement;
-}
-
-function applyWorkspaceVideoPlaybackStateToElement(videoElement, videoPath, options = {}) {
-    if (!(videoElement instanceof HTMLVideoElement)) {
-        return;
-    }
-
-    const { resumePlayback = true } = options;
-    const normalizedVideoPath = String(videoPath || videoElement.dataset.videoPath || '').trim();
-    const savedState = workspaceVideoPlaybackState?.path === normalizedVideoPath
-        ? {
-            path: workspaceVideoPlaybackState.path,
-            currentTime: Number(workspaceVideoPlaybackState.currentTime || 0),
-            wasPlaying: Boolean(workspaceVideoPlaybackState.wasPlaying),
-            volume: Number(workspaceVideoPlaybackState.volume ?? 1),
-            muted: Boolean(workspaceVideoPlaybackState.muted),
-            playbackRate: Number(workspaceVideoPlaybackState.playbackRate || 1)
-        }
-        : null;
-    if (!normalizedVideoPath || !savedState) {
-        return;
-    }
-
-    let restoreAttempts = 0;
-    let loadTriggered = false;
-    const maxRestoreAttempts = 16;
-    let restoreFinished = false;
-    let retryTimerId = null;
-    const clearRetryTimer = () => {
-        if (retryTimerId) {
-            window.clearTimeout(retryTimerId);
-            retryTimerId = null;
-        }
-    };
-    const finishRestore = () => {
-        restoreFinished = true;
-        clearRetryTimer();
-    };
-    const scheduleRetry = (delay = 140) => {
-        if (restoreFinished || restoreAttempts >= maxRestoreAttempts) {
-            finishRestore();
-            return;
-        }
-        clearRetryTimer();
-        retryTimerId = window.setTimeout(applyState, delay);
-    };
-
-    const applyState = () => {
-        if (restoreFinished || !videoElement.isConnected) {
-            finishRestore();
-            return;
-        }
-        if (workspaceVideoPlaybackState?.path !== normalizedVideoPath) {
-            finishRestore();
-            return;
-        }
-
-        restoreAttempts += 1;
-        if (videoElement.readyState < 1) {
-            if (!loadTriggered) {
-                loadTriggered = true;
-                try {
-                    videoElement.load();
-                } catch {
-                    // ignore explicit load failures
-                }
-            }
-            scheduleRetry();
-            return;
-        }
-
-        const targetTime = Number.isFinite(savedState.currentTime) && savedState.currentTime > 0
-            ? savedState.currentTime
-            : 0;
-        let desiredTime = targetTime;
-        if (targetTime > 0) {
-            try {
-                const duration = Number(videoElement.duration);
-                desiredTime = Number.isFinite(duration) && duration > 0
-                    ? Math.min(targetTime, Math.max(duration - 0.25, 0))
-                    : targetTime;
-                if (!Number.isFinite(videoElement.currentTime) || Math.abs(videoElement.currentTime - desiredTime) > 0.35) {
-                    videoElement.currentTime = desiredTime;
-                }
-            } catch {
-                // ignore seek failures
-            }
-        }
-
-        if (Number.isFinite(savedState.volume)) {
-            videoElement.volume = savedState.volume;
-        }
-        videoElement.muted = Boolean(savedState.muted);
-        if (Number.isFinite(savedState.playbackRate) && savedState.playbackRate > 0) {
-            videoElement.playbackRate = savedState.playbackRate;
-        }
-
-        if (resumePlayback && savedState.wasPlaying) {
-            void videoElement.play().catch(() => {});
-        }
-
-        const currentTime = Number(videoElement.currentTime || 0);
-        const timeRestored = targetTime <= 0 || Math.abs(currentTime - desiredTime) <= 0.35;
-        const playStateRestored = !resumePlayback || !savedState.wasPlaying || !videoElement.paused;
-        if (timeRestored && playStateRestored) {
-            finishRestore();
-            return;
-        }
-
-        scheduleRetry(savedState.wasPlaying ? 120 : 160);
-    };
-
-    videoElement.addEventListener('loadedmetadata', applyState, { once: true });
-    videoElement.addEventListener('loadeddata', applyState, { once: true });
-    videoElement.addEventListener('canplay', applyState, { once: true });
-    videoElement.addEventListener('durationchange', applyState, { once: true });
-    videoElement.addEventListener('seeked', applyState, { once: true });
-    videoElement.addEventListener('playing', applyState, { once: true });
-    window.requestAnimationFrame(applyState);
-}
-
-function bindWorkspaceVideoPlaybackState(videoElement) {
-    if (!(videoElement instanceof HTMLVideoElement)) {
-        return;
-    }
-    if (videoElement.dataset.workspaceVideoBound === 'true') {
-        return;
-    }
-    videoElement.dataset.workspaceVideoBound = 'true';
-
-    const syncState = (options = {}) => {
-        rememberWorkspaceVideoPlaybackState(options);
-    };
-
-    videoElement.addEventListener('play', () => {
-        workspaceVideoIgnorePauseUntil = 0;
-        syncState();
-    });
-    videoElement.addEventListener('timeupdate', () => syncState());
-    videoElement.addEventListener('volumechange', () => syncState());
-    videoElement.addEventListener('ratechange', () => syncState());
-    videoElement.addEventListener('pause', () => {
-        const currentVideoPath = videoElement.dataset.videoPath || activeWorkspaceVideoPath || '';
-        if (
-            workspaceVideoPlaybackState?.path === currentVideoPath
-            && workspaceVideoPlaybackState?.wasPlaying
-            && (!isWorkspaceVideoPanelActive() || Date.now() < workspaceVideoIgnorePauseUntil)
-        ) {
-            return;
-        }
-        syncState();
-    });
-    videoElement.addEventListener('ended', () => syncState());
-    applyWorkspaceVideoPlaybackStateToElement(videoElement, videoElement.dataset.videoPath || '', { resumePlayback: true });
-}
-
-function applyWorkspaceVideoThumbnail(imageElement, placeholderElement, dataUrl) {
-    if (!(imageElement instanceof HTMLImageElement)) return;
-    if (!dataUrl) {
-        imageElement.hidden = true;
-        imageElement.removeAttribute('src');
-        if (placeholderElement) {
-            placeholderElement.hidden = false;
-        }
-        return;
-    }
-
-    imageElement.src = dataUrl;
-    imageElement.hidden = false;
-    if (placeholderElement) {
-        placeholderElement.hidden = true;
-    }
-}
-
-function loadWorkspaceVideoThumbnail(videoPath, imageElement, placeholderElement) {
-    if (!videoPath || !(imageElement instanceof HTMLImageElement)) {
-        return;
-    }
-
-    const cached = workspaceVideoThumbnailCache.get(videoPath);
-    if (typeof cached === 'string') {
-        applyWorkspaceVideoThumbnail(imageElement, placeholderElement, cached);
-        return;
-    }
-    if (cached === null) {
-        applyWorkspaceVideoThumbnail(imageElement, placeholderElement, '');
-        return;
-    }
-    if (cached && typeof cached.then === 'function') {
-        cached.then((dataUrl) => {
-            if (imageElement.isConnected) {
-                applyWorkspaceVideoThumbnail(imageElement, placeholderElement, dataUrl);
-            }
-        });
-        return;
-    }
-
-    const promise = new Promise((resolve) => {
-        const thumbnailVideo = document.createElement('video');
-        let settled = false;
-        let hasStartedSeek = false;
-        const finish = (value) => {
-            if (settled) return;
-            settled = true;
-            window.clearTimeout(timeoutId);
-            thumbnailVideo.pause();
-            thumbnailVideo.removeAttribute('src');
-            thumbnailVideo.load();
-            resolve(value || '');
-        };
-        const timeoutId = window.setTimeout(() => finish(''), 4000);
-        const drawFrame = () => {
-            try {
-                const frameWidth = Number(thumbnailVideo.videoWidth) || 0;
-                const frameHeight = Number(thumbnailVideo.videoHeight) || 0;
-                if (!frameWidth || !frameHeight) {
-                    finish('');
-                    return;
-                }
-
-                const canvas = document.createElement('canvas');
-                canvas.width = frameWidth;
-                canvas.height = frameHeight;
-                const context = canvas.getContext('2d');
-                if (!context) {
-                    finish('');
-                    return;
-                }
-                context.drawImage(thumbnailVideo, 0, 0, frameWidth, frameHeight);
-                finish(canvas.toDataURL('image/jpeg', 0.82));
-            } catch {
-                finish('');
-            }
-        };
-
-        thumbnailVideo.preload = 'metadata';
-        thumbnailVideo.muted = true;
-        thumbnailVideo.playsInline = true;
-        thumbnailVideo.src = url.pathToFileURL(videoPath).href;
-        thumbnailVideo.addEventListener('error', () => finish(''), { once: true });
-        thumbnailVideo.addEventListener('loadedmetadata', () => {
-            const duration = Number(thumbnailVideo.duration);
-            const targetTime = Number.isFinite(duration) && duration > 0.6
-                ? Math.min(Math.max(duration * 0.08, 0.2), Math.max(duration - 0.2, 0.2))
-                : 0;
-            if (targetTime <= 0) {
-                drawFrame();
-                return;
-            }
-
-            hasStartedSeek = true;
-            try {
-                thumbnailVideo.currentTime = targetTime;
-            } catch {
-                drawFrame();
-            }
-        }, { once: true });
-        thumbnailVideo.addEventListener('seeked', () => {
-            drawFrame();
-        }, { once: true });
-        thumbnailVideo.addEventListener('loadeddata', () => {
-            if (!hasStartedSeek) {
-                drawFrame();
-            }
-        }, { once: true });
-    }).then((dataUrl) => {
-        workspaceVideoThumbnailCache.set(videoPath, dataUrl || null);
-        return dataUrl;
-    });
-
-    workspaceVideoThumbnailCache.set(videoPath, promise);
-    promise.then((dataUrl) => {
-        if (imageElement.isConnected) {
-            applyWorkspaceVideoThumbnail(imageElement, placeholderElement, dataUrl);
-        }
-    });
-}
-
-function ensureWorkspaceVideoPanel(options = {}) {
-    const container = document.getElementById('video-player-container');
-    const { force = false } = options;
-    if (force || workspaceVideoPanelDirty || !container || !container.firstElementChild) {
-        renderWorkspaceVideoPanel(options);
-        return;
-    }
-
-    const stage = container.querySelector('.workspace-video-stage');
-    const preferredVideoPath = activeWorkspaceVideoPath || workspaceVideoPlaybackState?.path || '';
-    if (stage && preferredVideoPath) {
-        mountWorkspaceVideoElement(stage, preferredVideoPath);
-    } else {
-        const existingVideoElement = document.getElementById('workspace-video-element');
-        applyWorkspaceVideoPlaybackStateToElement(existingVideoElement, existingVideoElement?.dataset?.videoPath || '', { resumePlayback: true });
-    }
-}
-
-function renderWorkspaceVideoPanel(options = {}) {
-    const {
-        preferredBundlePath = selectedWorkspaceVideoBundlePath,
-        preferredPath = activeWorkspaceVideoPath,
-        preservePlayback = true
-    } = options;
-    const container = document.getElementById('video-player-container');
-    if (!container) return;
-
-    if (preservePlayback) {
-        rememberWorkspaceVideoPlaybackState({ preservePlayingIntent: true });
-    }
-
-    parkWorkspaceVideoElement();
-    container.innerHTML = '';
-    workspaceVideoPanelDirty = false;
-
-    if (!workspaceRootPath) {
-        selectedWorkspaceVideoBundlePath = null;
-        activeWorkspaceVideoPath = null;
-        const emptyState = document.createElement('div');
-        emptyState.className = 'sidebar-empty';
-        emptyState.innerText = '还没有打开工作空间。使用 File -> 打开文件夹 后，你就可以在这里指定文档并播放其中的视频。';
-        container.appendChild(emptyState);
-        return;
-    }
-
-    const bundleCandidates = getWorkspaceVideoBundleCandidates(workspaceRootPath);
-    if (!bundleCandidates.length) {
-        selectedWorkspaceVideoBundlePath = null;
-        activeWorkspaceVideoPath = null;
-        const emptyState = document.createElement('div');
-        emptyState.className = 'sidebar-empty';
-        emptyState.innerText = '当前工作空间里还没有可用文档。先在工作空间中创建或打开一个 Kangaroo 文档。';
-        container.appendChild(emptyState);
-        return;
-    }
-
-    const selectedBundlePath = resolveWorkspaceVideoBundlePath(preferredBundlePath);
-    selectedWorkspaceVideoBundlePath = selectedBundlePath;
-    rememberWorkspaceVideoBundleSelection(workspaceRootPath, selectedBundlePath);
-    const selectedBundle = selectedBundlePath
-        ? (bundleCandidates.find((entry) => path.resolve(entry.path) === path.resolve(String(selectedBundlePath || ''))) || null)
-        : null;
-    const entries = selectedBundle ? getWorkspaceVideoEntries(selectedBundle.path) : [];
-    if (!entries.length) {
-        activeWorkspaceVideoPath = null;
-    }
-
-    const selectedEntry = entries.find((entry) => path.resolve(entry.path) === path.resolve(String(preferredPath || '')))
-        || entries.find((entry) => path.resolve(entry.path) === path.resolve(String(workspaceVideoPlaybackState?.path || '')))
-        || entries[0]
-        || null;
-    activeWorkspaceVideoPath = selectedEntry?.path || null;
-    const listSubtitleText = selectedBundle
-        ? `${selectedBundle.title} · 已找到 ${entries.length} 个视频，点击封面即可切换播放。`
-        : '点击右上角按钮，在系统文件选择器里选择一个文档。';
-
-    const panel = document.createElement('div');
-    panel.className = 'workspace-video-panel';
-
-    const playerCard = document.createElement('div');
-    playerCard.className = 'workspace-video-player-card';
-
-    const playerHead = document.createElement('div');
-    playerHead.className = 'workspace-video-player-head';
-
-    const playerMeta = document.createElement('div');
-    playerMeta.className = 'workspace-video-player-meta';
-    playerMeta.innerHTML = `
-        <div class="workspace-video-player-title">${escapeHtml(selectedEntry?.name || '未选择视频')}</div>
-        <div class="workspace-video-player-subtitle">${escapeHtml(selectedEntry?.relativePath || (selectedBundle ? '这个文档里还没有可播放的视频。' : '先在上方前往目录指定文档，再回来播放视频。'))}</div>
-    `;
-
-    const actionRow = document.createElement('div');
-    actionRow.className = 'workspace-video-head-actions';
-
-    const refreshButton = document.createElement('button');
-    refreshButton.className = 'workspace-video-action';
-    refreshButton.type = 'button';
-    refreshButton.title = '刷新视频列表';
-    refreshButton.innerHTML = '<i class="fa-solid fa-rotate" aria-hidden="true"></i>';
-    refreshButton.addEventListener('click', () => {
-        workspaceVideoEntriesCache = null;
-        workspaceVideoEntriesCacheRoot = null;
-        workspaceVideoEntriesCacheDirty = true;
-        workspaceVideoThumbnailCache = new Map();
-        renderWorkspaceVideoPanel({
-            preferredBundlePath: selectedBundle?.path || null,
-            preferredPath: activeWorkspaceVideoPath,
-            preservePlayback: true
-        });
-    });
-
-    const revealButton = document.createElement('button');
-    revealButton.className = 'workspace-video-action';
-    revealButton.type = 'button';
-    revealButton.title = '打开所在目录';
-    revealButton.innerHTML = '<i class="fa-regular fa-folder-open" aria-hidden="true"></i>';
-    revealButton.disabled = !selectedEntry?.path;
-    revealButton.addEventListener('click', async () => {
-        if (!selectedEntry?.path) return;
-        const result = await ipcRenderer.invoke('shell:revealLinkTarget', {
-            type: 'path',
-            value: selectedEntry.path
-        });
-        if (!result || !result.ok) {
-            alert(`打开所在目录失败: ${(result && result.error) || selectedEntry.path}`);
-        }
-    });
-
-    const openButton = document.createElement('button');
-    openButton.className = 'workspace-video-action';
-    openButton.type = 'button';
-    openButton.title = '用系统默认应用打开';
-    openButton.innerHTML = '<i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i>';
-    openButton.disabled = !selectedEntry?.path;
-    openButton.addEventListener('click', async () => {
-        if (!selectedEntry?.path) return;
-        await openAttachmentTarget({ absolutePath: selectedEntry.path });
-    });
-
-    actionRow.appendChild(refreshButton);
-    actionRow.appendChild(revealButton);
-    actionRow.appendChild(openButton);
-    playerHead.appendChild(playerMeta);
-    playerHead.appendChild(actionRow);
-    playerCard.appendChild(playerHead);
-
-    const stage = document.createElement('div');
-    stage.className = 'workspace-video-stage';
-    let videoElement = null;
-    if (selectedEntry?.path) {
-        videoElement = mountWorkspaceVideoElement(stage, selectedEntry.path);
-    } else {
-        const placeholder = document.createElement('div');
-        placeholder.className = 'workspace-video-placeholder';
-        placeholder.innerText = '这个文档还没有可播放的视频。你可以点击右上角按钮切换到其他文档。';
-        stage.appendChild(placeholder);
-    }
-    playerCard.appendChild(stage);
-    panel.appendChild(playerCard);
-
-    const listCard = document.createElement('div');
-    listCard.className = 'workspace-video-list-card';
-    listCard.innerHTML = `
-        <div class="workspace-video-list-head">
-            <div class="workspace-video-list-meta">
-                <div class="workspace-video-list-title">文档视频</div>
-                <div class="workspace-video-list-subtitle">${escapeHtml(listSubtitleText)}</div>
-            </div>
-            <div class="workspace-video-head-actions">
-                <button id="workspace-video-pick-bundle-button" class="workspace-video-action" type="button" title="在系统文件选择器中选择文档">
-                    <i class="fa-regular fa-folder-open" aria-hidden="true"></i>
-                </button>
-            </div>
-        </div>
-    `;
-    const pickBundleButton = listCard.querySelector('#workspace-video-pick-bundle-button');
-    pickBundleButton?.addEventListener('click', async () => {
-        if (!workspaceRootPath) return;
-        const selectedPath = await ipcRenderer.invoke('dialog:openBundle', {
-            defaultPath: workspaceRootPath,
-            title: '选择要搜索视频的文档',
-            buttonLabel: '选择文档'
-        });
-        if (!selectedPath) {
-            return;
-        }
-
-        const normalizedSelectedPath = path.resolve(selectedPath);
-        const normalizedWorkspaceRoot = path.resolve(workspaceRootPath);
-        if (
-            normalizedSelectedPath !== normalizedWorkspaceRoot
-            && !normalizedSelectedPath.startsWith(`${normalizedWorkspaceRoot}${path.sep}`)
-        ) {
-            alert('请选择当前工作空间中的文档。');
-            return;
-        }
-
-        selectedWorkspaceVideoBundlePath = normalizedSelectedPath;
-        rememberWorkspaceVideoBundleSelection(workspaceRootPath, normalizedSelectedPath);
-        activeWorkspaceVideoPath = null;
-        workspaceVideoPlaybackState = null;
-        workspaceVideoPanelDirty = true;
-        renderWorkspaceVideoPanel({
-            preferredBundlePath: normalizedSelectedPath,
-            preferredPath: null,
-            preservePlayback: false
-        });
-    });
-
-    const list = document.createElement('div');
-    list.className = 'workspace-video-list';
-    if (!selectedBundle) {
-        const emptyState = document.createElement('div');
-        emptyState.className = 'sidebar-empty';
-        emptyState.innerText = '点击右上角按钮，在系统文件选择器里选择一个文档，然后这里会显示该文档里的视频。';
-        list.appendChild(emptyState);
-    }
-    for (const entry of entries) {
-        const item = document.createElement('div');
-        const isActive = path.resolve(entry.path) === path.resolve(selectedEntry.path);
-        item.className = `workspace-video-item${isActive ? ' active' : ''}`;
-        const thumb = document.createElement('div');
-        thumb.className = 'workspace-video-item-thumb';
-        const thumbImage = document.createElement('img');
-        thumbImage.alt = entry.name;
-        thumbImage.hidden = true;
-        const thumbPlaceholder = document.createElement('div');
-        thumbPlaceholder.className = 'workspace-video-item-thumb-placeholder';
-        thumbPlaceholder.innerHTML = '<i class="fa-solid fa-film" aria-hidden="true"></i>';
-        thumb.appendChild(thumbImage);
-        thumb.appendChild(thumbPlaceholder);
-        item.appendChild(thumb);
-
-        const title = document.createElement('div');
-        title.className = 'workspace-video-item-title';
-        title.innerText = entry.name;
-        item.appendChild(title);
-
-        const meta = document.createElement('div');
-        meta.className = 'workspace-video-item-meta';
-        meta.innerText = [formatFileSize(entry.size), formatVideoTimestamp(entry.modifiedAt)].filter(Boolean).join(' · ');
-        item.appendChild(meta);
-
-        const itemPath = document.createElement('div');
-        itemPath.className = 'workspace-video-item-path';
-        itemPath.innerText = entry.relativePath;
-        item.appendChild(itemPath);
-
-        loadWorkspaceVideoThumbnail(entry.path, thumbImage, thumbPlaceholder);
-        item.addEventListener('click', () => {
-            if (path.resolve(entry.path) === path.resolve(activeWorkspaceVideoPath || '')) {
-                return;
-            }
-            rememberWorkspaceVideoPlaybackState({ preservePlayingIntent: false });
-            workspaceVideoPlaybackState = {
-                path: entry.path,
-                currentTime: 0,
-                wasPlaying: false,
-                volume: Number(workspaceVideoPlaybackState?.volume ?? 1),
-                muted: Boolean(workspaceVideoPlaybackState?.muted),
-                playbackRate: Number(workspaceVideoPlaybackState?.playbackRate || 1)
-            };
-            renderWorkspaceVideoPanel({
-                preferredBundlePath: selectedBundle?.path || null,
-                preferredPath: entry.path,
-                preservePlayback: false
-            });
-        });
-        list.appendChild(item);
-    }
-
-    listCard.appendChild(list);
-    panel.appendChild(listCard);
-    container.appendChild(panel);
 }
 
 function getSearchMatches(content, query) {
@@ -20004,16 +20805,246 @@ function getWorkspaceBundlePaths(rootPath) {
 function getBundleMarkdownForSearch(bundlePath) {
     const normalizedPath = path.resolve(bundlePath);
     const openTab = findTabByPath(normalizedPath);
+    if (openTab?.documentJson) {
+        return { markdown: openTab.content || '', documentJson: cloneSerializableValue(openTab.documentJson) };
+    }
+
     if (openTab) {
-        return openTab.content || '';
+        return { markdown: openTab.content || '', documentJson: null };
     }
 
     try {
         const markdownPath = resolveBundleMarkdownFilePath(normalizedPath);
-        return markdownPath ? fs.readFileSync(markdownPath, 'utf8') : '';
+        const manifestPath = getBundleManifestPath(normalizedPath);
+        const documentJsonPath = getBundleDocumentJsonPath(normalizedPath);
+        const hasPrivateStructure = fs.existsSync(manifestPath) && fs.existsSync(documentJsonPath);
+        return {
+            markdown: markdownPath ? fs.readFileSync(markdownPath, 'utf8') : '',
+            documentJson: hasPrivateStructure ? readJsonFileIfExists(documentJsonPath) : null
+        };
     } catch {
-        return '';
+        return { markdown: '', documentJson: null };
     }
+}
+
+function getDocumentJsonSearchMatches(documentJson, normalizedQuery, options = {}) {
+    const root = documentJson && typeof documentJson === 'object' ? documentJson : null;
+    if (!root) {
+        return [];
+    }
+
+    const {
+        bundlePath = null,
+        meta = '',
+        limit = 200
+    } = options;
+
+    const matches = [];
+    const seenKeys = new Set();
+    let headingIndex = 0;
+    let taskIndex = 0;
+    let attachmentIndex = 0;
+    let textblockIndex = 0;
+
+    const pushMatch = (match) => {
+        const key = `${match.kind || ''}::${match.kindIndex ?? -1}::${match.lineNumber ?? -1}::${match.text || ''}`;
+        if (seenKeys.has(key)) {
+            return;
+        }
+        seenKeys.add(key);
+        matches.push(match);
+    };
+
+    const addTextMatch = (text, kind, kindLabel, kindIndex, lineNumber, extra = {}) => {
+        const normalizedText = String(text || '').toLowerCase();
+        const matchIndex = normalizedText.indexOf(normalizedQuery);
+        if (matchIndex === -1) {
+            return;
+        }
+
+        pushMatch({
+            lineNumber: Number.isInteger(lineNumber) ? lineNumber : (kindIndex + 1),
+            text: String(text || '').trim() || '(空行)',
+            snippet: String(text || '').trim() || '(空行)',
+            matchIndex,
+            jumpTarget: {
+                preferredText: String(extra.preferredText || text || '').trim(),
+                preferredKind: extra.preferredKind || kind || ''
+            },
+            kind,
+            kindLabel,
+            kindIndex,
+            bundlePath,
+            meta,
+            ...extra
+        });
+    };
+
+    const walk = (node) => {
+        if (!node || typeof node !== 'object' || matches.length >= limit) {
+            return;
+        }
+
+        const type = String(node.type || '');
+        const textContent = normalizeSearchTargetText(getDocumentJsonTextContent(node));
+        const lineNumber = textblockIndex + 1;
+
+        if (type === 'heading') {
+            addTextMatch(
+                textContent,
+                'heading',
+                '标题',
+                headingIndex,
+                headingIndex + 1,
+                { preferredText: textContent, preferredKind: 'heading' }
+            );
+            headingIndex += 1;
+            textblockIndex += 1;
+            return;
+        } else if (type === 'taskItem') {
+            const firstTextblock = findFirstTextblockJsonNode(node) || node;
+            const taskHeadingLevel = clampNumber(Number(node.attrs?.headingLevel || 0), 0, 6);
+            const taskText = normalizeSearchTargetText(getDocumentJsonTextContent(firstTextblock));
+            addTextMatch(
+                taskText,
+                taskHeadingLevel > 0 ? 'heading' : 'task',
+                taskHeadingLevel > 0 ? '标题' : '待办',
+                taskIndex,
+                taskIndex + 1,
+                {
+                    preferredText: taskText,
+                    preferredKind: taskHeadingLevel > 0 ? 'heading' : 'task'
+                }
+            );
+            taskIndex += 1;
+            textblockIndex += 1;
+            return;
+        } else if (type === 'kangarooAttachment' || type === 'kangarooVideo' || type === 'kangarooPdf') {
+            const href = String(node.attrs?.href || '');
+            const label = String(node.attrs?.label || path.basename(href) || '').trim();
+            const searchableText = `${label} ${normalizeSearchTargetText(href)}`.trim();
+            addTextMatch(
+                searchableText,
+                'attachment',
+                '附件',
+                attachmentIndex,
+                attachmentIndex + 1,
+                {
+                    preferredText: label || path.basename(href) || '',
+                    preferredKind: 'attachment',
+                    meta: normalizeSearchTargetText(href)
+                }
+            );
+            attachmentIndex += 1;
+            return;
+        } else if (node.isTextblock) {
+            addTextMatch(
+                textContent,
+                'text',
+                '正文',
+                textblockIndex,
+                lineNumber,
+                { preferredText: textContent, preferredKind: '' }
+            );
+            textblockIndex += 1;
+        }
+
+        if (Array.isArray(node.content)) {
+            for (const child of node.content) {
+                walk(child);
+                if (matches.length >= limit) {
+                    return;
+                }
+            }
+        }
+
+        if (Array.isArray(node.marks) && typeof node.text === 'string') {
+            for (const mark of node.marks) {
+                const href = String(mark?.attrs?.href || '');
+                if (!/attachments\//i.test(href)) continue;
+
+                const label = String(node.text || path.basename(href) || '').trim();
+                const searchableText = `${label} ${normalizeSearchTargetText(href)}`.trim();
+                const normalizedText = searchableText.toLowerCase();
+                const matchIndex = normalizedText.indexOf(normalizedQuery);
+                if (matchIndex === -1) continue;
+
+                pushMatch({
+                    lineNumber: lineNumber,
+                    text: label || path.basename(href) || '(空行)',
+                    snippet: searchableText,
+                    matchIndex,
+                    jumpTarget: {
+                        preferredText: label || path.basename(href) || '',
+                        preferredKind: 'attachment'
+                    },
+                    kind: 'attachment',
+                    kindLabel: '附件',
+                    kindIndex: attachmentIndex,
+                    bundlePath,
+                    meta: normalizeSearchTargetText(href)
+                });
+                attachmentIndex += 1;
+                break;
+            }
+        }
+    };
+
+    walk(root);
+    return matches;
+}
+
+function getBundleSearchMatches(bundlePath, normalizedQuery, limit = 200) {
+    if (!bundlePath || !normalizedQuery) {
+        return [];
+    }
+
+    const normalizedPath = path.resolve(bundlePath);
+    const currentBundlePath = window.currentPath ? path.resolve(window.currentPath) : null;
+    if (currentBundlePath === normalizedPath && window.editor && typeof window.editor.getSearchMatches === 'function') {
+        return window.editor.getSearchMatches(normalizedQuery, limit).map((match) => ({
+            ...match,
+            bundlePath: normalizedPath,
+            meta: match.meta || getRelativeWorkspaceFolder(normalizedPath) || path.basename(normalizedPath),
+            kindLabel: match.kindLabel || getSearchKindLabel(match.kind || '')
+        }));
+    }
+
+    const openTab = getOpenTabByBundlePath(normalizedPath);
+    if (openTab?.documentJson && window.editor && typeof window.editor.getSearchMatches === 'function') {
+        const matches = getDocumentJsonSearchMatches(openTab.documentJson, normalizedQuery, {
+            bundlePath: normalizedPath,
+            meta: getRelativeWorkspaceFolder(normalizedPath) || path.basename(normalizedPath),
+            limit
+        });
+        if (matches.length) {
+            return matches;
+        }
+    }
+
+    const { markdown, documentJson } = getBundleMarkdownForSearch(normalizedPath);
+    const relativeBundlePath = getRelativeWorkspaceFolder(normalizedPath) || path.basename(normalizedPath);
+
+    if (documentJson) {
+        const structuredMatches = getDocumentJsonSearchMatches(documentJson, normalizedQuery, {
+            bundlePath: normalizedPath,
+            meta: relativeBundlePath,
+            limit
+        });
+        if (structuredMatches.length) {
+            return structuredMatches;
+        }
+    }
+
+    if (!markdown) {
+        return [];
+    }
+
+    return getMarkdownSearchMatches(markdown, normalizedQuery, {
+        bundlePath: normalizedPath,
+        meta: relativeBundlePath,
+        limit
+    });
 }
 
 function getWorkspaceSearchMatches(query, limit = 80) {
@@ -20028,24 +21059,8 @@ function getWorkspaceSearchMatches(query, limit = 80) {
 
     const matches = [];
     for (const bundlePath of getWorkspaceBundlePaths(workspaceRootPath)) {
-        const content = getBundleMarkdownForSearch(bundlePath);
-        if (!content) continue;
-
-        const relativeBundlePath = path.relative(workspaceRootPath, bundlePath) || path.basename(bundlePath);
-        const bundleMatches = path.resolve(bundlePath) === path.resolve(getActiveTab()?.path || '')
-            && window.editor
-            && typeof window.editor.getSearchMatches === 'function'
-            ? window.editor.getSearchMatches(normalizedQuery, limit - matches.length).map((match) => ({
-                ...match,
-                bundlePath,
-                meta: relativeBundlePath,
-                kindLabel: match.kindLabel || getSearchKindLabel(match.kind || '')
-            }))
-            : getMarkdownSearchMatches(content, normalizedQuery, {
-                bundlePath,
-                meta: relativeBundlePath,
-                limit: limit - matches.length
-            });
+        const bundleMatches = getBundleSearchMatches(bundlePath, normalizedQuery, limit - matches.length);
+        if (!bundleMatches.length) continue;
 
         matches.push(...bundleMatches);
         if (matches.length >= limit) {
@@ -20252,24 +21267,34 @@ function renderToolbarSearchResults(query = currentSearchQuery) {
 }
 
 
-function cleanUnusedImages(markdown) {
-    const assetsDir = path.join(window.currentPath, 'assets');
-    if (!fs.existsSync(assetsDir)) return;
+function cleanUnusedImages(markdown, documentJson = null, bundlePath = window.currentPath) {
+    const imageDirs = getImageResourceDirCandidates(bundlePath).filter((dir) => fs.existsSync(dir));
+    if (!imageDirs.length) return;
 
-    const used = getUsedImageEntries(markdown);
+    const structuredDocument = documentJson || window.editor?.getDocumentJson?.() || null;
+    const used = structuredDocument
+        ? getUsedImageEntriesFromDocumentJson(structuredDocument)
+        : getUsedImageEntries(markdown);
 
-    for (const entryName of fs.readdirSync(assetsDir)) {
-        if (used.has(entryName)) continue;
+    for (const imageDir of imageDirs) {
+        const isAttachmentImagesDir = path.resolve(imageDir) === path.resolve(getImageResourceDirPath(bundlePath));
+        for (const entryName of fs.readdirSync(imageDir)) {
+            if (used.has(entryName)) continue;
 
-        const entryPath = path.join(assetsDir, entryName);
-        const stat = fs.statSync(entryPath);
+            const entryPath = path.join(imageDir, entryName);
+            const stat = fs.statSync(entryPath);
 
-        if (stat.isDirectory()) {
-            continue;
-        }
+            if (stat.isDirectory()) {
+                continue;
+            }
 
-        if (moveEntryToRecovery('assets', entryName)) {
-            console.log("移入恢复区的图片资源:", entryName);
+            const recovered = isAttachmentImagesDir
+                ? moveEntryToRecoveryForBundle(bundlePath, 'attachments', path.join(IMAGE_RESOURCE_DIR_NAME, entryName))
+                : moveEntryToRecoveryForBundle(bundlePath, path.basename(imageDir), entryName);
+
+            if (recovered) {
+                console.log("移入恢复区的图片资源:", entryName);
+            }
         }
     }
 }
@@ -20284,11 +21309,7 @@ function getUsedAttachmentEntries(markdown, options = {}) {
         && typeof window.editor.getAttachmentReferences === 'function'
     ) {
         for (const ref of window.editor.getAttachmentReferences()) {
-            const normalized = String(ref.relativePath || '')
-                .replace(/^attachments\//i, '')
-                .replace(/\\/g, '/')
-                .replace(/^\/+/, '');
-            const topLevelEntry = normalized.split('/')[0];
+            const topLevelEntry = getAttachmentTopLevelEntryName(ref.relativePath);
 
             if (topLevelEntry) {
                 used.add(topLevelEntry);
@@ -20296,29 +21317,71 @@ function getUsedAttachmentEntries(markdown, options = {}) {
         }
     }
 
-    for (const ref of collectAttachmentMarkdownRefs(markdown)) {
-        const normalized = ref.relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
-        const topLevelEntry = normalized.split('/')[0];
+    if (String(markdown || '').trim()) {
+        for (const ref of collectAttachmentMarkdownRefs(markdown)) {
+            const topLevelEntry = getAttachmentTopLevelEntryName(ref.relativePath);
 
-        if (topLevelEntry) {
-            used.add(topLevelEntry);
+            if (topLevelEntry) {
+                used.add(topLevelEntry);
+            }
         }
     }
 
     return used;
 }
 
-async function cleanUnusedAttachments(markdown) {
-    const attachmentsDir = path.join(window.currentPath, 'attachments');
+function getUsedAttachmentEntriesFromDocumentJson(documentJson) {
+    const used = new Set();
+    const root = documentJson && typeof documentJson === 'object' ? documentJson : null;
+    if (!root) {
+        return used;
+    }
+
+    const visit = (node) => {
+        if (!node || typeof node !== 'object') {
+            return;
+        }
+
+        if (node.type === 'image') {
+            const topLevelEntry = getAttachmentTopLevelEntryName(node.attrs?.src || '');
+            if (topLevelEntry) {
+                used.add(topLevelEntry);
+            }
+        } else if (node.type === 'kangarooAttachment' || node.type === 'kangarooVideo' || node.type === 'kangarooPdf') {
+            const topLevelEntry = getAttachmentTopLevelEntryName(node.attrs?.href || node.attrs?.src || '');
+            if (topLevelEntry) {
+                used.add(topLevelEntry);
+            }
+        }
+
+        if (Array.isArray(node.content)) {
+            for (const child of node.content) {
+                visit(child);
+            }
+        }
+    };
+
+    visit(root);
+    return used;
+}
+
+async function cleanUnusedAttachments(markdown, documentJson = null, bundlePath = window.currentPath) {
+    const attachmentsDir = path.join(bundlePath || '', 'attachments');
     if (!fs.existsSync(attachmentsDir)) return true;
 
-    const used = getUsedAttachmentEntries(markdown, { preferEditorState: true });
+    const structuredDocument = documentJson || window.editor?.getDocumentJson?.() || null;
+    const used = structuredDocument
+        ? getUsedAttachmentEntriesFromDocumentJson(structuredDocument)
+        : getUsedAttachmentEntries(markdown, { preferEditorState: true });
 
     for (const entryName of used) {
         preservedUnusedAttachmentEntries.delete(entryName);
     }
 
     for (const entryName of fs.readdirSync(attachmentsDir)) {
+        if (entryName === IMAGE_RESOURCE_DIR_NAME) {
+            continue;
+        }
         if (used.has(entryName)) continue;
         if (preservedUnusedAttachmentEntries.has(entryName)) continue;
 
@@ -20328,14 +21391,14 @@ async function cleanUnusedAttachments(markdown) {
         const stat = fs.statSync(entryPath);
         const isDirectory = stat.isDirectory();
 
-        backupEntryToRecovery('attachments', entryName);
+        backupEntryToRecoveryForBundle(bundlePath, 'attachments', entryName);
         const trashResult = await ipcRenderer.invoke('shell:trashPath', {
             type: 'path',
             value: entryPath
         });
 
         if (!trashResult || !trashResult.ok) {
-            moveEntryToRecovery('attachments', entryName);
+            moveEntryToRecoveryForBundle(bundlePath, 'attachments', entryName);
         }
 
         preservedUnusedAttachmentEntries.delete(entryName);
@@ -20343,6 +21406,21 @@ async function cleanUnusedAttachments(markdown) {
     }
 
     return true;
+}
+
+async function cleanupUnusedResourcesForTab(tab) {
+    if (!tab || !tab.path) {
+        return true;
+    }
+
+    const markdown = typeof tab.content === 'string' ? tab.content : '';
+    const documentJson = cloneSerializableValue(tab.documentJson) || null;
+    preservedUnusedAttachmentEntries = new Set(tab.preservedEntries || []);
+
+    cleanUnusedImages(markdown, documentJson, tab.path);
+    const canContinueSave = await cleanUnusedAttachments(markdown, documentJson, tab.path);
+    tab.preservedEntries = Array.from(preservedUnusedAttachmentEntries);
+    return canContinueSave;
 }
 
 
@@ -20489,7 +21567,12 @@ function handleEditorContentChanged() {
     }
 
     const markdown = window.editor?.getValue ? window.editor.getValue() : '';
-    const restoredEntries = restoreRecoveredEntries(markdown);
+    const restoredEntries = restoreRecoveredEntries(
+        markdown,
+        window.editor && typeof window.editor.getDocumentJson === 'function'
+            ? window.editor.getDocumentJson()
+            : null
+    );
     if (restoredEntries && window.editor && typeof window.editor.refreshDisplayState === 'function') {
         window.editor.refreshDisplayState();
     }
@@ -20509,8 +21592,11 @@ function handleEditorContentChanged() {
     if (loadTodoPanelSettings().scope === 'workspace') {
         workspaceTodoRenderVersion += 1;
     }
+    if (timelinePanelOpen && currentRightSidebarTab === 'timeline') {
+        scheduleTimelinePanelRender();
+    }
     if (currentRightSidebarTab === 'todo' || currentRightSidebarTab === 'attachment' || currentRightSidebarTab === 'outline') {
-        renderActiveRightSidebarPanel(markdown);
+        renderActiveRightSidebarPanel(getActiveEditorSnapshot());
     }
     scheduleToolbarStateRefresh();
     scheduleEditorRender();
@@ -20521,11 +21607,11 @@ function scheduleEditorRender() {
 
     editorRenderFrame = window.requestAnimationFrame(() => {
         editorRenderFrame = null;
-        const liveMarkdown = window.editor?.getValue ? window.editor.getValue() : '';
+        const liveSnapshot = getActiveEditorSnapshot();
         if (isPreviewActive()) {
             updatePreview({ preserveViewport: true, preserveMode: 'anchor' });
         }
-        renderActiveRightSidebarPanel(liveMarkdown);
+        renderActiveRightSidebarPanel(liveSnapshot);
 
         if (isPreviewActive() && typeof pendingPreviewVisibleLine === 'number') {
             ensurePreviewLineVisible(pendingPreviewVisibleLine);
@@ -20536,12 +21622,30 @@ function scheduleEditorRender() {
     });
 }
 
-function renderOutlineList(content) {
+function renderOutlineList(context = null) {
     const outlineContainer = document.getElementById('outline-container');
     if (!outlineContainer) return;
 
-    const normalizedContent = String(content || '');
-    const renderKey = `outline::${normalizedContent}`;
+    const normalizedContent = typeof context === 'string'
+        ? String(context || '')
+        : String(context?.markdown || '');
+    const documentJson = context && typeof context === 'object'
+        ? context.documentJson || null
+        : null;
+    const structuredEntries = window.editor && typeof window.editor.getOutlineEntries === 'function'
+        ? window.editor.getOutlineEntries()
+        : null;
+    const renderKey = structuredEntries
+        ? `outline::${JSON.stringify(structuredEntries.map((entry) => ({
+            kindIndex: Number.isInteger(entry.kindIndex) ? entry.kindIndex : -1,
+            level: Number(entry.level || 0),
+            lineNumber: Number(entry.lineNumber || 0),
+            text: String(entry.text || ''),
+            stableId: String(entry.stableId || '')
+        })))}`
+        : documentJson
+            ? `outline::documentJson::${JSON.stringify(documentJson)}`
+        : `outline::${normalizedContent}`;
     if (outlineContainer.dataset.renderKey === renderKey && outlineContainer.childElementCount > 0) {
         return;
     }
@@ -20549,13 +21653,29 @@ function renderOutlineList(content) {
     outlineContainer.innerHTML = '';
     outlineContainer.dataset.renderKey = renderKey;
 
-    const headingRegex = /^(?:(?:[-+*]|\d+\.)\s+\[[ xX]\]\s+)?(#{1,6})\s+(.+)$/gm;
-    let match;
+    const entries = structuredEntries || (() => {
+        const parsedEntries = [];
+        const headingRegex = /^(?:(?:[-+*]|\d+\.)\s+\[[ xX]\]\s+)?(#{1,6})\s+(.+)$/gm;
+        let match;
 
-    while ((match = headingRegex.exec(content)) !== null) {
-        const level = match[1].length;
-        const title = match[2];
-        const lineNumber = getLineNumberAtOffset(content, match.index);
+        while ((match = headingRegex.exec(normalizedContent)) !== null) {
+            parsedEntries.push({
+                kind: 'heading',
+                kindIndex: parsedEntries.length,
+                level: match[1].length,
+                lineNumber: getLineNumberAtOffset(normalizedContent, match.index),
+                text: match[2].trim(),
+                stableId: null
+            });
+        }
+
+        return parsedEntries;
+    })();
+
+    for (const entry of entries) {
+        const level = clampNumber(Number(entry.level || 0), 1, 6);
+        const title = String(entry.text || '').trim();
+        const lineNumber = Number.isInteger(entry.lineNumber) ? entry.lineNumber : 1;
 
         const item = document.createElement('div');
         item.className = `outline-item level-${level}`;
@@ -20580,29 +21700,14 @@ function renderOutlineList(content) {
     }
 }
 
-function renderActiveRightSidebarPanel(content = null) {
+function renderActiveRightSidebarPanel(context = null) {
     if (!timelinePanelOpen) return;
 
     if (currentRightSidebarTab === 'timeline' && !isFeatureEnabled('timeline')) {
         return;
     }
-    if (currentRightSidebarTab === 'music') {
-        if (!isFeatureEnabled('music')) return;
-        ensureWorkspaceMusicPanel();
-        return;
-    }
-
-    if (currentRightSidebarTab === 'player') {
-        if (!isFeatureEnabled('player')) return;
-        ensureWorkspaceVideoPanel();
-        return;
-    }
-
     if (currentRightSidebarTab === 'todo') {
-        const currentContent = typeof content === 'string'
-            ? content
-            : getTabMarkdownContent();
-        renderTodoList(currentContent);
+        renderTodoList(context);
         return;
     }
 
@@ -20613,15 +21718,20 @@ function renderActiveRightSidebarPanel(content = null) {
     }
 
     if (!window.editor) return;
-    const currentContent = typeof content === 'string' ? content : window.editor.getValue();
+    const currentContent = typeof context === 'string'
+        ? context
+        : (context?.markdown || window.editor.getValue());
+    const currentDocumentJson = context && typeof context === 'object'
+        ? context.documentJson || null
+        : (typeof window.editor.getDocumentJson === 'function' ? window.editor.getDocumentJson() : null);
 
     if (currentRightSidebarTab === 'outline') {
-        renderOutlineList(currentContent);
+        renderOutlineList({ markdown: currentContent, documentJson: currentDocumentJson });
         return;
     }
 
     if (currentRightSidebarTab === 'attachment') {
-        renderAttachmentList(currentContent);
+        renderAttachmentList({ markdown: currentContent, documentJson: currentDocumentJson });
     }
 }
 
@@ -20854,6 +21964,18 @@ function jumpEditorToLine(lineNumber, options = {}) {
 function jumpEditorToAnchor(kind, kindIndex, options = {}) {
     if (!window.editor) return;
 
+    if (kind === 'attachment' && typeof window.editor.selectBlockByKindIndex === 'function') {
+        window.editor.selectBlockByKindIndex(kind, kindIndex, options);
+        highlightEditorLine(options.lineNumber || 1);
+        return;
+    }
+
+    if (typeof window.editor.focusBlockByKindIndex === 'function') {
+        window.editor.focusBlockByKindIndex(kind, kindIndex, options);
+        highlightEditorLine(options.lineNumber || 1);
+        return;
+    }
+
     if (typeof window.editor.jumpToAnchor === 'function') {
         window.editor.jumpToAnchor(kind, kindIndex, options);
         highlightEditorLine(options.lineNumber || 1);
@@ -21022,12 +22144,6 @@ document.getElementById('todo-toggle-button')?.addEventListener('click', () => {
 document.getElementById('attachment-toggle-button')?.addEventListener('click', () => {
     toggleRightSidebarTab('attachment');
 });
-document.getElementById('music-toggle-button')?.addEventListener('click', () => {
-    toggleRightSidebarTab('music');
-});
-document.getElementById('video-toggle-button')?.addEventListener('click', () => {
-    toggleRightSidebarTab('player');
-});
 document.getElementById('pomodoro-toggle-button')?.addEventListener('click', () => {
     toggleRightSidebarTab('pomodoro');
 });
@@ -21063,6 +22179,48 @@ document.getElementById('timeline-day-menu-new-diary').addEventListener('click',
     hideTimelineDayContextMenu();
     await createDiaryBundleForDate(targetDate);
 });
+document.getElementById('timeline-day-menu-delete-diary').addEventListener('click', async () => {
+    const targetDate = timelineDayContextTarget ? new Date(timelineDayContextTarget) : new Date();
+    hideTimelineDayContextMenu();
+    await deleteDiaryBundlesForDate(targetDate);
+});
+document.getElementById('timeline-diary-menu-open-diary').addEventListener('click', async () => {
+    const target = timelineDiaryContextTarget;
+    hideTimelineDiaryContextMenu();
+    if (!target?.path) return;
+    await openWorkspaceBundle(target.path);
+});
+document.getElementById('timeline-diary-menu-delete-diary').addEventListener('click', async () => {
+    const target = timelineDiaryContextTarget;
+    hideTimelineDiaryContextMenu();
+    if (!target?.path) return;
+    await deleteDiaryBundlePath(target.path);
+});
+document.getElementById('timeline-todo-menu-edit').addEventListener('click', async () => {
+    const target = timelineTodoContextTarget;
+    hideTimelineTodoContextMenu();
+    if (!target) return;
+    const todoItem = target.element?.closest?.('.todo-item') || null;
+    if (todoItem) {
+        beginTimelineTodoInlineEdit(todoItem, target);
+    }
+});
+document.getElementById('timeline-todo-menu-locate').addEventListener('click', async () => {
+    const target = timelineTodoContextTarget;
+    hideTimelineTodoContextMenu();
+    if (!target) return;
+    await jumpToTimelineTodoEntry(target);
+});
+document.getElementById('timeline-todo-menu-delete').addEventListener('click', async () => {
+    const target = timelineTodoContextTarget;
+    hideTimelineTodoContextMenu();
+    if (!target) return;
+    const label = getTimelineTodoItemDisplayText(target) || '这条待办';
+    if (!confirm(`要删除“${label}”吗？`)) {
+        return;
+    }
+    await deleteTimelineTodoItem(target);
+});
 document.getElementById('workspace-menu-open-bundle').addEventListener('click', async () => {
     const target = workspaceContextTarget;
     hideWorkspaceContextMenu();
@@ -21089,12 +22247,7 @@ document.getElementById('workspace-menu-sort').addEventListener('click', (event)
 
     const triggerRect = trigger.getBoundingClientRect();
     submenu.classList.add('show');
-    const submenuWidth = submenu.offsetWidth || 176;
-    const submenuHeight = submenu.offsetHeight || 180;
-    const left = Math.min(triggerRect.right + 6, window.innerWidth - submenuWidth - 8);
-    const top = Math.min(triggerRect.top, window.innerHeight - submenuHeight - 8);
-    submenu.style.left = `${Math.max(left, 8)}px`;
-    submenu.style.top = `${Math.max(top, 8)}px`;
+    positionContextMenu(submenu, triggerRect, { kind: 'workspaceSubmenu', minWidth: 168, placement: 'right' });
 });
 document.getElementById('workspace-menu-sort-name-asc').addEventListener('click', () => {
     const target = workspaceContextTarget;
@@ -21165,6 +22318,63 @@ document.addEventListener('keydown', async (event) => {
 
     const key = event.key.toLowerCase();
     const editorRoot = document.getElementById('editor-container');
+
+    if (DEBUG_TEST_SHORTCUTS_ENABLED && event.shiftKey) {
+        if (key === 'x') {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            if (window.editor && typeof window.editor.focus === 'function') {
+                window.editor.focus();
+            }
+            if (window.editor && typeof window.editor.insertText === 'function') {
+                window.editor.insertText('x');
+            } else {
+                insertText('x');
+            }
+            console.log('[debug] inserted test text');
+            return;
+        }
+
+        if (key === 'p') {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            await handleClipboardPaste();
+            console.log('[debug] clipboard paste handled');
+            return;
+        }
+
+        if (key === 'u') {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            await undoActiveTabState();
+            console.log('[debug] undo handled');
+            return;
+        }
+
+        if (key === 'r') {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            await redoActiveTabState();
+            console.log('[debug] redo handled');
+            return;
+        }
+
+        if (key === 'f') {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            if (window.editor && typeof window.editor.focus === 'function') {
+                window.editor.focus();
+            }
+            console.log('[debug] editor focus requested');
+            return;
+        }
+    }
+
     if (key === 'w' && !event.shiftKey) {
         event.preventDefault();
         event.stopPropagation();
@@ -21372,17 +22582,20 @@ document.getElementById('todo-hide-completed-toggle')?.addEventListener('click',
     const settings = loadTodoPanelSettings();
     updateTodoPanelSettings({ hideCompleted: !settings.hideCompleted });
 });
-document.getElementById('music-header-fullscreen-button')?.addEventListener('click', () => {
-    toggleWorkspaceMusicFullscreen();
-});
 document.getElementById('bottom-sidebar-toggle-button')?.addEventListener('click', () => {
     toggleSidebarVisibility();
 });
 document.getElementById('bottom-toolbar-toggle-button')?.addEventListener('click', () => {
     toggleToolbarVisibility();
 });
+document.getElementById('bottom-settings-button')?.addEventListener('click', () => {
+    openSettingsModal();
+});
 document.querySelectorAll('.settings-tab').forEach((button) => {
     button.addEventListener('click', () => setSettingsTab(button.dataset.tab));
+});
+document.getElementById('settings-inline-media-position')?.addEventListener('change', () => {
+    syncInlineMediaPositionControls();
 });
 document.getElementById('settings-cancel-btn').addEventListener('click', () => closeSettingsModal());
 document.getElementById('settings-save-btn').addEventListener('click', () => handleSaveSettings());
@@ -21394,23 +22607,6 @@ document.getElementById('settings-modal').addEventListener('click', (event) => {
 });
 window.addEventListener('beforeunload', () => {
     persistPinnedEditorTabPathsFromOpenTabs();
-    rememberWorkspaceAudioPlaybackState();
-    if (persistWorkspaceMusicPlaybackTimer) {
-        window.clearTimeout(persistWorkspaceMusicPlaybackTimer);
-        persistWorkspaceMusicPlaybackTimer = null;
-    }
-    if (workspaceRootPath && workspaceAudioPlaybackState?.path && selectedWorkspaceMusicBundlePath) {
-        rememberWorkspaceMusicPlaybackState(workspaceRootPath, {
-            sourcePath: selectedWorkspaceMusicBundlePath,
-            albumPath: activeWorkspaceAlbumPath || workspaceAudioPlaybackState.albumPath || '',
-            trackPath: workspaceAudioPlaybackState.path,
-            currentTime: workspaceAudioPlaybackState.currentTime || 0,
-            wasPlaying: workspaceAudioPlaybackState.wasPlaying,
-            volume: workspaceAudioPlaybackState.volume,
-            muted: workspaceAudioPlaybackState.muted,
-            playbackRate: workspaceAudioPlaybackState.playbackRate
-        });
-    }
 });
 ipcRenderer.on('bundle:openExternal', (_, folderPath) => {
     void openBundleFromExternalPath(folderPath);
@@ -21419,10 +22615,10 @@ ipcRenderer.on('bundle:openExternal', (_, folderPath) => {
 ipcRenderer.on('menu:action', async (_, action) => {
     switch (action) {
     case 'undo':
-        undoActiveTabState();
+        void undoActiveTabState();
         break;
     case 'redo':
-        redoActiveTabState();
+        void redoActiveTabState();
         break;
     case 'new':
         await handleNewBundle();
@@ -21485,6 +22681,14 @@ document.addEventListener('click', () => {
 });
 document.addEventListener('click', () => {
     if (Date.now() < suppressContextMenuHideUntil) return;
+    hideTimelineDiaryContextMenu();
+});
+document.addEventListener('click', () => {
+    if (Date.now() < suppressContextMenuHideUntil) return;
+    hideTimelineTodoContextMenu();
+});
+document.addEventListener('click', () => {
+    if (Date.now() < suppressContextMenuHideUntil) return;
     hideWorkspaceContextMenu();
 });
 document.addEventListener('click', () => {
@@ -21499,6 +22703,8 @@ document.getElementById('workspace-context-menu').addEventListener('click', (eve
 document.getElementById('workspace-sort-submenu').addEventListener('click', (event) => event.stopPropagation());
 document.getElementById('heading-toolbar-submenu').addEventListener('click', (event) => event.stopPropagation());
 document.getElementById('timeline-day-context-menu')?.addEventListener('click', (event) => event.stopPropagation());
+document.getElementById('timeline-diary-context-menu')?.addEventListener('click', (event) => event.stopPropagation());
+document.getElementById('timeline-todo-context-menu')?.addEventListener('click', (event) => event.stopPropagation());
 document.addEventListener('click', (event) => {
     if (Date.now() < suppressContextMenuHideUntil) return;
     if (event.target.closest('.preview-image-resizer')) return;
@@ -21516,6 +22722,8 @@ window.addEventListener('blur', () => {
     hidePreviewImageContextMenu();
     hideTabContextMenu();
     hideTimelineDayContextMenu();
+    hideTimelineDiaryContextMenu();
+    hideTimelineTodoContextMenu();
     hideWorkspaceContextMenu();
     hideEditorLinkContextMenu();
     hideHeadingToolbarSubmenu();
@@ -21526,22 +22734,14 @@ window.addEventListener('blur', () => {
 });
 
 window.__codexConfirmBeforeClose = async function () {
-    const shouldClose = await confirmAllTabsBeforeClose();
-    if (shouldClose) {
-        for (const tab of editorTabs) {
-            if (tab.path) {
-                cleanupRecoveryDir(tab.path);
-            }
-        }
-    }
-    return shouldClose;
+    return await confirmAllTabsBeforeClose();
 };
 
 function updateOutline(force = false) {
     if (!window.editor) return;
 
-    const content = typeof window.editor.getValue === 'function' ? window.editor.getValue() : '';
-    renderTodoList(content);
-    renderAttachmentList(content, force);
-    renderOutlineList(content);
+    const snapshot = getActiveEditorSnapshot();
+    renderTodoList(snapshot);
+    renderAttachmentList(snapshot, force);
+    renderOutlineList(snapshot);
 }
